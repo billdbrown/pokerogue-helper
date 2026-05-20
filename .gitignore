@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller build output
+build/
+dist/
+
+# Embedded browser profile (cookies, cache, local storage) — per-user
+browser_data/
+
+# Runtime caches (regenerated on first run)
+stats_cache.json
+moves_cache.json
+tier_cache.json
+
+# Per-user UI state and OCR tuning
+box_positions.json
+window_state.json
+
+# Logs and debug artifacts
+*.log
+embedded_console.log
+debug/
+
+# IDE / editor
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

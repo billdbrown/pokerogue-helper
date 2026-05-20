@@ -1,0 +1,11 @@
+PyQt6
+PyQt6-WebEngine
+mss
+pytesseract
+# tesserocr — Windows Python 3.10 requires a pre-built wheel:
+# pip install https://github.com/simonflueckiger/tesserocr-windows_build/releases/download/tesserocr-v2.6.2-tesseract-5.3.1/tesserocr-2.6.2-cp310-cp310-win_amd64.whl
+# If that fails, pytesseract fallback is used automatically (slower but functional).
+Pillow
+requests
+pyinstaller
+pyinstaller-hooks-contrib
