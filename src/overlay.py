@@ -8,7 +8,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QObject
 from PyQt6.QtGui import QPainter, QColor
 
-from pokemon_api import fetch_pokemon, fetch_final_evolutions, PokemonData
+from pokemon_api import fetch_pokemon, fetch_final_evolutions, fetch_ability, fetch_move, nature_mod_str, MoveData, PokemonData
+from damage_calc import damage_range, pct_color as dmg_pct_color
 from weakness_calc import calculate_weaknesses
 import stats_db
 import tier_db
@@ -163,13 +164,15 @@ def _best_matchup(weaknesses: dict, team: list) -> list[tuple]:
 
 
 class _Signals(QObject):
-    result_ready  = pyqtSignal(object)
-    evo_ready     = pyqtSignal(object)
-    error         = pyqtSignal(object)
-    status        = pyqtSignal(str)
-    db_status     = pyqtSignal(str)
-    slot1_visible = pyqtSignal(bool)
-    slot_cleared  = pyqtSignal(int)
+    result_ready          = pyqtSignal(object)
+    evo_ready             = pyqtSignal(object)
+    error                 = pyqtSignal(object)
+    status                = pyqtSignal(str)
+    db_status             = pyqtSignal(str)
+    slot1_visible         = pyqtSignal(bool)
+    slot_cleared          = pyqtSignal(int)
+    ability_tooltip_ready = pyqtSignal(int, str)
+    moves_ready           = pyqtSignal(object)  # (slot, list[MoveData | None])
 
 
 def _type_badge(type_name: str, small: bool = False) -> QLabel:
@@ -237,9 +240,20 @@ class OverlayPanel(QWidget):
         self._name_lbls        = [None] * NUM_SLOTS
         self._type_rows        = [None] * NUM_SLOTS
         self._bst_lbls         = [None] * NUM_SLOTS
+        self._pct_lbls         = [None] * NUM_SLOTS
         self._tier_badges      = [None] * NUM_SLOTS
         self._level_lbls       = [None] * NUM_SLOTS
+        self._level_vals: list[int | None] = [None] * NUM_SLOTS  # parsed opponent level per slot, for turn-order calc
         self._hp_lbls          = [None] * NUM_SLOTS
+        self._ability_lbls     = [None] * NUM_SLOTS
+        self._moves_containers = [None] * NUM_SLOTS
+        self._moves_rows       = [None] * NUM_SLOTS   # QHBoxLayout holding 4 move cells
+        self._moves_cells      = [[] for _ in range(NUM_SLOTS)]   # list[QFrame] per slot
+        self._enemy_moves      = [[] for _ in range(NUM_SLOTS)]   # list[MoveData] per slot
+        self._swap_lbls        = [None] * NUM_SLOTS
+        self._last_move_names  = [[] for _ in range(NUM_SLOTS)]
+        self._player_active_types: list = []
+        self._battle_type: int = 0   # 0=wild, 1=trainer
         self._weak_rows        = [None] * NUM_SLOTS
         self._no_weak_lbls     = [None] * NUM_SLOTS
         self._weak_containers  = [None] * NUM_SLOTS
@@ -256,6 +270,13 @@ class OverlayPanel(QWidget):
         self._vs_div          = None
         self._active_pokemon  = ""
 
+        self._last_abilities = [(None, None)] * NUM_SLOTS
+
+        # Damage calculation state
+        self._enemy_battle_stats: list[dict] = [{} for _ in range(NUM_SLOTS)]
+        self._player_battle_stats: dict = {}   # {def, spd, max_hp}
+        self._moves_dmg_lbls: list[list] = [[] for _ in range(NUM_SLOTS)]
+
         self._signals = _Signals()
         self._signals.result_ready.connect(self._on_result)
         self._signals.evo_ready.connect(self._on_evo)
@@ -264,6 +285,8 @@ class OverlayPanel(QWidget):
         self._signals.db_status.connect(self._set_db_status)
         self._signals.slot1_visible.connect(self._set_slot1_visible)
         self._signals.slot_cleared.connect(self._clear_slot_display)
+        self._signals.ability_tooltip_ready.connect(self._on_ability_tooltip)
+        self._signals.moves_ready.connect(self._on_moves_ready)
 
         if not embedded:
             self.setWindowFlags(
@@ -397,8 +420,9 @@ class OverlayPanel(QWidget):
             card_vbox.addWidget(_ResizeGrip(self))
 
     def _build_slot_section(self, inner: QVBoxLayout, slot: int):
+        # Row 1: name | BST | %ile | types
         name_row = QHBoxLayout()
-        name_row.setSpacing(4)
+        name_row.setSpacing(6)
 
         inp = QLineEdit()
         inp.setPlaceholderText(f"slot {slot + 1}…")
@@ -414,37 +438,75 @@ class OverlayPanel(QWidget):
         self._name_inputs[slot] = inp
         self._name_lbls[slot]   = None
 
+        bst_lbl = QLabel("")
+        bst_lbl.setStyleSheet("color:#a6adc8; font-size:14px;")
+        bst_lbl.setVisible(False)
+        name_row.addWidget(bst_lbl)
+        self._bst_lbls[slot] = bst_lbl
+
+        pct_lbl = QLabel("")
+        pct_lbl.setStyleSheet("color:#a6adc8; font-size:14px;")
+        pct_lbl.setVisible(False)
+        name_row.addWidget(pct_lbl)
+        self._pct_lbls[slot] = pct_lbl
+
         type_row = QHBoxLayout()
         type_row.setSpacing(3)
         name_row.addLayout(type_row)
-        inner.addLayout(name_row)
         self._type_rows[slot] = type_row
 
-        bst_row = QHBoxLayout()
-        bst_row.setSpacing(6)
-        bst_lbl = QLabel("")
-        bst_lbl.setStyleSheet("color:#a6adc8; font-size:21px;")
-        bst_lbl.setVisible(False)
-        tier_badge = QLabel("")
-        tier_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tier_badge.setFixedHeight(26)
-        tier_badge.setVisible(False)
+        self._tier_badges[slot] = None  # removed from layout
+
+        inner.addLayout(name_row)
+
+        # Row 2: level (left) | HP (right)
+        lv_hp_row = QHBoxLayout()
+        lv_hp_row.setSpacing(4)
+        lv_hp_row.setContentsMargins(0, 0, 0, 0)
+
         level_lbl = QLabel("")
-        level_lbl.setStyleSheet("color:#89b4fa; font-size:18px;")
+        level_lbl.setStyleSheet("color:#89b4fa; font-size:13px;")
         level_lbl.setVisible(False)
+        lv_hp_row.addWidget(level_lbl)
+        self._level_lbls[slot] = level_lbl
+
+        lv_hp_row.addStretch()
+
         hp_lbl = QLabel("")
-        hp_lbl.setStyleSheet("color:#a6e3a1; font-size:18px;")
+        hp_lbl.setStyleSheet("color:#a6e3a1; font-size:13px;")
+        hp_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         hp_lbl.setVisible(False)
-        bst_row.addWidget(bst_lbl)
-        bst_row.addStretch()
-        bst_row.addWidget(hp_lbl)
-        bst_row.addWidget(tier_badge)
-        bst_row.addWidget(level_lbl)
-        inner.addLayout(bst_row)
-        self._bst_lbls[slot]    = bst_lbl
-        self._tier_badges[slot] = tier_badge
-        self._level_lbls[slot]  = level_lbl
-        self._hp_lbls[slot]     = hp_lbl
+        lv_hp_row.addWidget(hp_lbl)
+        self._hp_lbls[slot] = hp_lbl
+
+        inner.addLayout(lv_hp_row)
+
+        ability_lbl = QLabel("")
+        ability_lbl.setStyleSheet("color:#cba6f7; font-size:15px;")
+        ability_lbl.setWordWrap(True)
+        ability_lbl.setVisible(False)
+        inner.addWidget(ability_lbl)
+        self._ability_lbls[slot] = ability_lbl
+
+        moves_container = QWidget()
+        moves_container.setStyleSheet("background: transparent;")
+        moves_vbox = QVBoxLayout(moves_container)
+        moves_vbox.setContentsMargins(0, 2, 0, 0)
+        moves_vbox.setSpacing(2)
+        moves_vbox.addWidget(self._section_hdr("MOVES"))
+        moves_row = QHBoxLayout()
+        moves_row.setSpacing(3)
+        moves_row.setContentsMargins(0, 0, 0, 0)
+        moves_vbox.addLayout(moves_row)
+        swap_lbl = QLabel("")
+        swap_lbl.setStyleSheet("color:#6c7086; font-size:13px;")
+        swap_lbl.setVisible(False)
+        moves_vbox.addWidget(swap_lbl)
+        moves_container.setVisible(False)
+        inner.addWidget(moves_container)
+        self._moves_containers[slot] = moves_container
+        self._moves_rows[slot] = moves_row
+        self._swap_lbls[slot] = swap_lbl
 
         inner.addWidget(self._divider())
 
@@ -526,6 +588,17 @@ class OverlayPanel(QWidget):
         self._clear_slot_display(1)
         self._set_slot1_visible(False)
 
+    def refresh_matchups(self):
+        """Re-render the SEND IN list for every active opponent slot. Called when
+        the team's moves change so the recommendations don't go stale until the
+        next opponent swap."""
+        for slot in range(NUM_SLOTS):
+            data = self._slot_data[slot]
+            if data is None:
+                continue
+            _, weaknesses = data
+            self._display_matchup(slot, weaknesses)
+
     def _clear_slot_display(self, slot: int):
         if self._slot_data[slot] is None:
             return
@@ -536,6 +609,23 @@ class OverlayPanel(QWidget):
         self._sampled_types[slot] = [None, None]
         self._last_ocr_name[slot] = ""
         self._form_lookup_pending.discard(slot)
+        self._level_vals[slot] = None
+        self._last_abilities[slot] = (None, None)
+        self._last_move_names[slot] = []
+        self._enemy_moves[slot] = []
+        self._moves_cells[slot] = []
+        self._moves_dmg_lbls[slot] = []
+        self._enemy_battle_stats[slot] = {}
+        if self._swap_lbls[slot] is not None:
+            self._swap_lbls[slot].setVisible(False)
+        if self._moves_containers[slot] is not None:
+            self._moves_containers[slot].setVisible(False)
+        if self._moves_rows[slot] is not None:
+            row = self._moves_rows[slot]
+            while row.count():
+                item = row.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
 
         self._name_inputs[slot].clear()
 
@@ -546,9 +636,14 @@ class OverlayPanel(QWidget):
                 w.deleteLater()
 
         self._bst_lbls[slot].setVisible(False)
-        self._tier_badges[slot].setVisible(False)
+        if self._pct_lbls[slot] is not None:
+            self._pct_lbls[slot].setVisible(False)
+        if self._tier_badges[slot] is not None:
+            self._tier_badges[slot].setVisible(False)
         self._level_lbls[slot].setVisible(False)
         self._hp_lbls[slot].setVisible(False)
+        if self._ability_lbls[slot] is not None:
+            self._ability_lbls[slot].setVisible(False)
 
         rows = self._weak_rows[slot]
         for key in rows:
@@ -634,7 +729,7 @@ class OverlayPanel(QWidget):
             row.addStretch()
             vbox.addLayout(row)
 
-    # ── OCR result receiver (called by OCRService on main thread) ────────────────
+    # ── Opponent name receiver (called by JS-state dispatcher) ────────────────
 
     def receive_ocr_result(self, slot: int, text: str) -> None:
         if self._user_input_active[slot]:
@@ -670,22 +765,309 @@ class OverlayPanel(QWidget):
                     self._signals.slot1_visible.emit(False)
 
     def receive_opponent_level(self, slot: int, text: str) -> None:
-        """Called by OCRService on main thread with raw digit text for opponent level."""
+        """Called by JS-state dispatcher with opponent level as digit text."""
         digits = "".join(c for c in text if c.isdigit())
         lbl = self._level_lbls[slot]
         if lbl is None:
             return
-        if digits and self._slot_data[slot] is not None:
+        if digits:
             lbl.setText(f"Lv.{digits}")
             lbl.setVisible(True)
+            try:
+                lv = int(digits)
+            except ValueError:
+                return
+            if self._level_vals[slot] != lv:
+                self._level_vals[slot] = lv
+
+    def receive_opponent_abilities(self, slot: int, ability: str | None, passive: str | None,
+                                   ability_index: int | None = None, nature=None) -> None:
+        """Called by JS-state dispatcher with the opponent's current ability + passive."""
+        lbl = self._ability_lbls[slot]
+        if lbl is None:
+            return
+        ab_parts = []
+        if ability:
+            hidden = ability_index == 2
+            h_mark = " <span style='color:#f9e2af;font-size:11px;'>[H]</span>" if hidden else ""
+            ab_parts.append(f"<span style='color:#cba6f7;'>⚡ {ability}{h_mark}</span>")
+        if passive:
+            ab_parts.append(f"<span style='color:#89b4fa;'>✦ {passive}</span>")
+        nat = nature_mod_str(nature)
+        if ab_parts or nat:
+            left = "  ".join(ab_parts)
+            right = (f"<span style='color:#a6adc8;font-size:13px;'>{nat}</span>"
+                     if nat else "")
+            html = (
+                f"<table width='100%' cellpadding='0' cellspacing='0'><tr>"
+                f"<td>{left}</td>"
+                f"<td align='right'>{right}</td>"
+                f"</tr></table>"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+            if (ability, passive) != self._last_abilities[slot]:
+                self._last_abilities[slot] = (ability, passive)
+                threading.Thread(
+                    target=self._fetch_ability_tooltips,
+                    args=(slot, ability, passive),
+                    daemon=True,
+                ).start()
+        else:
+            lbl.setVisible(False)
+
+    def _fetch_ability_tooltips(self, slot: int, ability: str | None, passive: str | None):
+        lines = []
+        if ability:
+            desc = fetch_ability(ability)
+            lines.append(f"⚡ {ability}: {desc}" if desc else f"⚡ {ability}")
+        if passive:
+            desc = fetch_ability(passive)
+            lines.append(f"✦ {passive}: {desc}" if desc else f"✦ {passive}")
+        self._signals.ability_tooltip_ready.emit(slot, "\n\n".join(lines))
+
+    def _on_ability_tooltip(self, slot: int, tooltip: str):
+        lbl = self._ability_lbls[slot]
+        if lbl is not None:
+            lbl.setToolTip(tooltip)
+
+    def receive_opponent_moves(self, slot: int, move_names: list) -> None:
+        """Called by JS-state dispatcher with the opponent's moveset (list of names)."""
+        names = [n for n in (move_names or []) if n]
+        if not names:
+            return
+        if names == self._last_move_names[slot]:
+            return
+        self._last_move_names[slot] = list(names)
+        threading.Thread(
+            target=self._fetch_moves,
+            args=(slot, names),
+            daemon=True,
+        ).start()
+
+    def _fetch_moves(self, slot: int, names: list):
+        results = []
+        for name in names:
+            try:
+                results.append(fetch_move(name))
+            except Exception:
+                results.append(None)
+        self._signals.moves_ready.emit((slot, results))
+
+    def _on_moves_ready(self, payload):
+        slot, moves = payload
+        row = self._moves_rows[slot]
+        container = self._moves_containers[slot]
+        if row is None or container is None:
+            return
+        while row.count():
+            item = row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        valid = [m for m in moves if m is not None]
+        cells, dmg_lbls = [], []
+        for move in valid:
+            cell, dmg_lbl = self._make_move_cell(move)
+            row.addWidget(cell, 1)
+            cells.append(cell)
+            dmg_lbls.append(dmg_lbl)
+        self._enemy_moves[slot] = valid
+        self._moves_cells[slot] = cells
+        self._moves_dmg_lbls[slot] = dmg_lbls
+        container.setVisible(bool(valid))
+        self._update_move_damage_labels(slot)
+        self._run_prediction(slot)
+
+    def set_player_battle_stats(self, def_: int, spd: int, max_hp: int) -> None:
+        """Called each snapshot with the active player Pokémon's defensive stats."""
+        self._player_battle_stats = {"def": def_, "spd": spd, "max_hp": max_hp}
+        for slot in range(NUM_SLOTS):
+            self._update_move_damage_labels(slot)
+
+    def receive_enemy_battle_stats(self, slot: int, atk: int, spa: int,
+                                    level: int, types: list, status) -> None:
+        """Called each snapshot with the enemy's offensive stats."""
+        new = {"atk": atk, "spa": spa, "level": level, "types": types,
+               "burned": status == 6}
+        if new != self._enemy_battle_stats[slot]:
+            self._enemy_battle_stats[slot] = new
+            self._update_move_damage_labels(slot)
+
+    def _update_move_damage_labels(self, slot: int) -> None:
+        moves    = self._enemy_moves[slot]
+        dmg_lbls = self._moves_dmg_lbls[slot]
+        if not moves or not dmg_lbls:
+            return
+        es = self._enemy_battle_stats[slot]
+        ps = self._player_battle_stats
+        if not es or not ps:
+            return
+        atk     = es.get("atk") or 0
+        spa     = es.get("spa") or 0
+        level   = es.get("level") or 1
+        etypes  = es.get("types") or []
+        burned  = es.get("burned", False)
+        def_    = ps.get("def") or 0
+        spd     = ps.get("spd") or 0
+        max_hp  = ps.get("max_hp") or 0
+        if not (atk and level and def_ and max_hp):
+            return
+        ptypes = self._player_active_types
+        pw = calculate_weaknesses(ptypes) if ptypes else {}
+        for move, lbl in zip(moves, dmg_lbls):
+            if move.category == "status" or not move.power:
+                lbl.setText("—")
+                lbl.setStyleSheet("color:#6c7086; font-size:10px; background:transparent;")
+                continue
+            is_phys = move.category == "physical"
+            off = atk if is_phys else (spa or atk)
+            def_stat = def_ if is_phys else (spd or def_)
+            is_stab = move.type in etypes
+            eff = pw.get(move.type, 1.0)
+            result = damage_range(level, move.power, off, def_stat, eff, is_stab, burned, is_phys)
+            if result is None:
+                lbl.setText("")
+                continue
+            lo, hi = result
+            if max_hp:
+                plo = round(lo / max_hp * 100)
+                phi = round(hi / max_hp * 100)
+                pct_str = f"{plo}%" if plo == phi else f"{plo}-{phi}%"
+                text = f"{lo}-{hi} ({pct_str})"
+            else:
+                text = f"{lo}-{hi}"
+            color = dmg_pct_color(hi / max_hp * 100 if max_hp else 0)
+            lbl.setText(text)
+            lbl.setStyleSheet(f"color:{color}; font-size:10px; background:transparent;")
+
+    def set_battle_context(self, player_types: list, battle_type: int) -> None:
+        """Called each snapshot tick with the primary player's live types and battle type."""
+        new_types = list(player_types) if player_types else []
+        changed = new_types != self._player_active_types or battle_type != self._battle_type
+        self._player_active_types = new_types
+        self._battle_type = battle_type or 0
+        if changed:
+            for slot in range(NUM_SLOTS):
+                self._run_prediction(slot)
+
+    def _run_prediction(self, slot: int):
+        moves = self._enemy_moves[slot]
+        cells = self._moves_cells[slot]
+        swap_lbl = self._swap_lbls[slot]
+        if not moves or not cells:
+            if swap_lbl:
+                swap_lbl.setVisible(False)
+            return
+
+        player_types = self._player_active_types
+
+        # Score each move: type_effectiveness × power.
+        # Status moves score 0 so a damaging move always wins when available.
+        if player_types:
+            player_weaknesses = calculate_weaknesses(player_types)
+            scores = [
+                (player_weaknesses.get(m.type, 1.0) * (m.power or 0))
+                if m.category != "status" else 0.0
+                for m in moves
+            ]
+            # If the enemy only has status moves, score by raw type effectiveness instead.
+            if max(scores) == 0:
+                scores = [player_weaknesses.get(m.type, 1.0) for m in moves]
+        else:
+            scores = [(m.power or 0) if m.category != "status" else 0 for m in moves]
+
+        best_idx = scores.index(max(scores))
+
+        # Highlight cells — use #movecell so the border only targets the outer frame,
+        # not any child QFrames inside the cell.
+        for i, cell in enumerate(cells):
+            if i == best_idx:
+                cell.setStyleSheet(
+                    "QFrame#movecell { background: #2a1515; border-radius: 3px;"
+                    " border: 2px solid #f38ba8; }"
+                )
+            else:
+                cell.setStyleSheet("QFrame#movecell { background: #11111b; border-radius: 3px; }")
+
+        # Swap likelihood — only meaningful in trainer battles (battleType == 1)
+        if swap_lbl is None:
+            return
+        if self._battle_type != 1:
+            swap_lbl.setVisible(False)
+            return
+        slot_data = self._slot_data[slot]
+        if slot_data is None:
+            swap_lbl.setVisible(False)
+            return
+
+        _, enemy_weaknesses = slot_data
+        if player_types:
+            # How hard does the player's typing hit the enemy?
+            player_threat = max(
+                (enemy_weaknesses.get(pt, 1.0) for pt in player_types),
+                default=1.0,
+            )
+        else:
+            player_threat = 1.0
+
+        if player_threat >= 4.0:
+            pct, color = 65, "#f38ba8"
+        elif player_threat >= 2.0:
+            pct, color = 40, "#fab387"
+        elif player_threat <= 0.5:
+            pct, color = 5,  "#a6e3a1"
+        else:
+            pct, color = 15, "#6c7086"
+
+        swap_lbl.setText(f"⟲ Swap: ~{pct}%")
+        swap_lbl.setStyleSheet(f"color:{color}; font-size:13px;")
+        swap_lbl.setVisible(True)
+
+    def _make_move_cell(self, move: MoveData) -> tuple:
+        cell = QFrame()
+        cell.setObjectName("movecell")
+        cell.setStyleSheet("QFrame#movecell { background: #11111b; border-radius: 3px; }")
+        vbox = QVBoxLayout(cell)
+        vbox.setContentsMargins(3, 3, 3, 3)
+        vbox.setSpacing(2)
+
+        # Line 1: type badge
+        bg, fg = TYPE_COLORS.get(move.type, ("#888", "#fff"))
+        badge = QLabel(move.type[:4].upper())
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedHeight(15)
+        badge.setStyleSheet(
+            f"background:{bg}; color:{fg}; border-radius:2px;"
+            f"font-size:10px; font-weight:bold;"
+        )
+        vbox.addWidget(badge)
+
+        # Line 2: move name (left) + damage (right)
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(2)
+
+        name_lbl = QLabel(move.name.replace("-", " ").title())
+        name_lbl.setStyleSheet("color:#cdd6f4; font-size:11px; background:transparent;")
+        if move.description:
+            name_lbl.setToolTip(move.description)
+        bottom.addWidget(name_lbl, 1)
+
+        dmg_lbl = QLabel("")
+        dmg_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        dmg_lbl.setStyleSheet("color:#a6adc8; font-size:10px; background:transparent;")
+        bottom.addWidget(dmg_lbl)
+
+        vbox.addLayout(bottom)
+        return cell, dmg_lbl
 
     def receive_opponent_hp(self, slot: int, text: str) -> None:
-        """Called by OCRService on main thread with raw HP text, e.g. '324/369'."""
+        """Called by JS-state dispatcher with opponent HP text, e.g. '324/369'."""
         cleaned = "".join(c for c in text if c.isdigit() or c == "/")
         lbl = self._hp_lbls[slot]
         if lbl is None:
             return
-        if "/" in cleaned and self._slot_data[slot] is not None:
+        if "/" in cleaned:
             lbl.setText(cleaned)
             lbl.setVisible(True)
 
@@ -790,27 +1172,16 @@ class OverlayPanel(QWidget):
             type_row.addWidget(_type_badge(t))
 
         bst = sum(pokemon.stats.values())
+        self._bst_lbls[slot].setText(f"BST {bst}")
+        self._bst_lbls[slot].setVisible(True)
         if stats_db.is_ready():
             pct = stats_db.bst_percentile(bst)
             color = _pct_color(pct)
-            self._bst_lbls[slot].setText(
-                f'BST {bst}  ·  <span style="color:{color}">{_ordinal(pct)} %ile</span>'
-            )
+            self._pct_lbls[slot].setText(f"{_ordinal(pct)}%")
+            self._pct_lbls[slot].setStyleSheet(f"color:{color}; font-size:14px;")
+            self._pct_lbls[slot].setVisible(True)
         else:
-            self._bst_lbls[slot].setText(f"BST {bst}")
-        self._bst_lbls[slot].setVisible(True)
-
-        t = tier_db.get_tier(pokemon.name) if tier_db.is_ready() else None
-        if t:
-            bg, fg = tier_db.tier_color(t)
-            self._tier_badges[slot].setText(t)
-            self._tier_badges[slot].setStyleSheet(
-                f"background:{bg}; color:{fg}; border-radius:3px;"
-                f"padding:1px 6px; font-size:18px; font-weight:bold;"
-            )
-            self._tier_badges[slot].setVisible(True)
-        else:
-            self._tier_badges[slot].setVisible(False)
+            self._pct_lbls[slot].setVisible(False)
 
         rows = self._weak_rows[slot]
         w4     = sorted(t for t, m in weaknesses.items() if m >= 4.0)
@@ -926,7 +1297,7 @@ class OverlayPanel(QWidget):
             if c is not None:
                 c.setVisible(visible)
 
-    # ── Type color override (from TypeColorService) ───────────────────────────
+    # ── Type override (from JS-state dispatcher) ─────────────────────────────
 
     def receive_type_sample(self, slot: int, type_index: int, type_name: str | None) -> None:
         if type_index == 0:  # primary badge drives the gate

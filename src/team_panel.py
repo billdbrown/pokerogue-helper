@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPointF
 from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor, QPen, QPolygonF
 
-from pokemon_api import fetch_pokemon, fetch_move, MoveData, PokemonData
+from pokemon_api import fetch_pokemon, fetch_move, fetch_ability, nature_mod_str, MoveData, PokemonData
 from weakness_calc import (
     calculate_weaknesses, detailed_coverage,
     coverage_suggestions, redundancy_suggestions, dangerous_combos, slot_coverage, ALL_TYPES,
@@ -94,10 +94,12 @@ def _cat_icon(category: str, size: int = 16) -> QPixmap:
 
 
 class _Signals(QObject):
-    result_ready   = pyqtSignal(object)  # (slot, PokemonData, weaknesses)
-    move_ready     = pyqtSignal(object)  # (slot, mi, MoveData)
-    analysis_ready = pyqtSignal(object)  # (full, partial, gaps, suggestions, danger, slot_stats, weakest_slot, replace_sugg, pref_type)
-    error          = pyqtSignal(object)
+    result_ready          = pyqtSignal(object)  # (slot, PokemonData, weaknesses)
+    move_ready            = pyqtSignal(object)  # (slot, mi, MoveData)
+    analysis_ready        = pyqtSignal(object)  # (full, partial, gaps, suggestions, danger, slot_stats, weakest_slot, replace_sugg, pref_type)
+    team_changed          = pyqtSignal()        # fires whenever the team file is rewritten — listeners can refresh derived displays
+    error                 = pyqtSignal(object)
+    ability_tooltip_ready = pyqtSignal(int, str)
 
 
 class TeamPanel(QWidget):
@@ -113,29 +115,46 @@ class TeamPanel(QWidget):
         self._name_inputs    = [None] * TEAM_SIZE
         self._type_rows      = [None] * TEAM_SIZE
         self._stats_lbls     = [None] * TEAM_SIZE
+        self._ability_lbls   = [None] * TEAM_SIZE
         self._level_lbls     = [None] * TEAM_SIZE
+        self._level_vals: list[int | None] = [None] * TEAM_SIZE  # parsed level per slot, for turn-order calc
         self._hp_bars        = [None] * TEAM_SIZE
         self._move_widgets   = [[None] * MOVE_SLOTS for _ in range(TEAM_SIZE)]
         self._slot_frames    = [None] * TEAM_SIZE
+        self._last_abilities: list[tuple] = [(None, None)] * TEAM_SIZE
         self._analysis_panel = None
         self._active_slot_idx: int | None  = None
         self._active_slot_idx2: int | None = None
         self._pending_active  = ""           # last name from active OCR, for matching after auto-add
-        self._pending_lookups: set = set()   # slots currently being auto-fetched
-        self._last_hp_cur: int | None = None
-        self._last_hp_max: int | None = None
+        self._pending_lookups: set = set()        # slots currently being fetched
+        self._pending_lookup_names: dict = {}     # slot → name being fetched
         self._player_sampled_types   = [None, None]
         self._player_sampled_types2  = [None, None]
         self._player_form_pending    = False
         self._player_form_pending2   = False
-        # Per-slot, per-move debounce: (last_text, consecutive_count)
-        self._move_ocr_buf   = [[("", 0)] * MOVE_SLOTS for _ in range(TEAM_SIZE)]
+        # Per-slot form-override state — used by set_party for all 6 party members
+        # (not just the active ones). Tracks the JS in-battle types we expect for
+        # each slot so _on_result can apply the override after auto-fetch.
+        self._party_target_types: list[list] = [[] for _ in range(TEAM_SIZE)]
+        self._form_pending_slots: set = set()
+        # Move-OCR debounce keyed by move_idx only (not team slot) — in 2v2 the
+        # same on-screen move boxes can belong to either active Pokémon, so the
+        # owning slot is decided at commit time, not at debounce time.
+        self._move_ocr_buf: list[tuple[str, int]] = [("", 0)] * MOVE_SLOTS
+        # Which active position (0 or 1) was most recently filled — used as the
+        # tiebreaker when 2v2 move attribution is ambiguous (both candidate slots
+        # score equally for an OCR'd move).
+        self._last_active_position: int = 0
 
         self._signals = _Signals()
         self._signals.result_ready.connect(self._on_result)
         self._signals.move_ready.connect(self._on_move_ready)
         self._signals.analysis_ready.connect(self._on_analysis_ready)
-        self._signals.error.connect(lambda p: self._pending_lookups.discard(p[0]))
+        self._signals.error.connect(lambda p: (
+            self._pending_lookups.discard(p[0]),
+            self._pending_lookup_names.pop(p[0], None),
+        ))
+        self._signals.ability_tooltip_ready.connect(self._on_ability_tooltip)
 
         if not self._embedded:
             self.setWindowFlags(
@@ -148,10 +167,15 @@ class TeamPanel(QWidget):
         else:
             self.setMinimumWidth(0)
 
-        QApplication.instance().setStyleSheet(
+        app = QApplication.instance()
+        app.setStyleSheet(
             "QToolTip { background:#313244; color:#cdd6f4; border:1px solid #45475a;"
             " font-size:12px; padding:4px; border-radius:4px; }"
         )
+        try:
+            app.setAttribute(Qt.ApplicationAttribute.AA_AlwaysShowToolTips)
+        except AttributeError:
+            pass  # removed in Qt6
 
         self._build_ui()
 
@@ -281,33 +305,56 @@ class TeamPanel(QWidget):
 
     def set_active_slot(self, name: str, position: int = 0) -> None:
         name = name.strip().lower()
+        target_base = _SLUG_TO_BASE.get(name, name) if name else ""
+
+        def _find_slot() -> int | None:
+            # 1) exact name match
+            for slot in range(TEAM_SIZE):
+                pokemon = self._team_data[slot]
+                if pokemon and name and pokemon.name.lower() == name:
+                    return slot
+            # 2) base-species fallback (handles regional/form mismatch:
+            # JS may report "ninetales" while team_data has "ninetales-alola")
+            if name:
+                for slot in range(TEAM_SIZE):
+                    pokemon = self._team_data[slot]
+                    if not pokemon:
+                        continue
+                    pkm_norm = pokemon.name.lower()
+                    pkm_base = _SLUG_TO_BASE.get(pkm_norm, pkm_norm)
+                    if pkm_base == target_base:
+                        return slot
+            return None
+
         if position == 0:
             self._pending_active = name
-            self._active_slot_idx = None
+            self._active_slot_idx = _find_slot()
             self._last_hp_cur = None
             self._last_hp_max = None
             self._player_sampled_types = [None, None]
             self._player_form_pending  = False
-            for slot in range(TEAM_SIZE):
-                pokemon = self._team_data[slot]
-                if pokemon and name and pokemon.name.lower() == name:
-                    self._active_slot_idx = slot
-            if name and self._active_slot_idx is None:
+            already_pending = name in self._pending_lookup_names.values()
+            if name and self._active_slot_idx is None and not already_pending:
                 for slot in range(TEAM_SIZE):
                     if self._team_data[slot] is None and slot not in self._pending_lookups:
                         self._pending_lookups.add(slot)
+                        self._pending_lookup_names[slot] = name
                         threading.Thread(
                             target=self._lookup, args=(slot, name), daemon=True
                         ).start()
                         break
+            if name:
+                self._last_active_position = 0
         else:
-            self._active_slot_idx2 = None
+            self._active_slot_idx2 = _find_slot()
             self._player_sampled_types2 = [None, None]
             self._player_form_pending2  = False
-            for slot in range(TEAM_SIZE):
-                pokemon = self._team_data[slot]
-                if pokemon and name and pokemon.name.lower() == name:
-                    self._active_slot_idx2 = slot
+            if name:
+                self._last_active_position = 1
+            else:
+                # Position 1 cleared (e.g. exiting 2v2) — fall back to position 0
+                # as the default tiebreaker for ambiguous move attribution.
+                self._last_active_position = 0
         self._refresh_slot_highlights()
 
     def _refresh_slot_highlights(self):
@@ -323,7 +370,7 @@ class TeamPanel(QWidget):
             )
 
     def receive_player_level(self, text: str, position: int = 0) -> None:
-        """Called by OCRService on main thread with digit text for the active player Pokémon level."""
+        """Called by JS-state dispatcher with the active player Pokémon level as digit text."""
         digits = "".join(c for c in text if c.isdigit())
         slot = self._active_slot_idx if position == 0 else self._active_slot_idx2
         if not digits or slot is None:
@@ -332,52 +379,290 @@ class TeamPanel(QWidget):
         if lbl is not None:
             lbl.setText(f"L{digits}")
             lbl.setVisible(True)
-
-    def receive_player_hp_cur(self, text: str) -> None:
-        digits = "".join(c for c in text if c.isdigit())
-        if not digits:
-            return
         try:
-            self._last_hp_cur = int(digits)
+            lv = int(digits)
         except ValueError:
             return
-        self._update_hp_bar()
+        if self._level_vals[slot] != lv:
+            self._level_vals[slot] = lv
 
-    def receive_player_hp_max(self, text: str) -> None:
-        digits = "".join(c for c in text if c.isdigit())
-        if not digits:
+    def receive_player_abilities(self, position: int, ability: str | None, passive: str | None,
+                                  ability_index: int | None = None, nature=None) -> None:
+        """Called by JS-state dispatcher with the active player Pokémon's ability + passive."""
+        slot = self._active_slot_idx if position == 0 else self._active_slot_idx2
+        if slot is None:
             return
-        try:
-            self._last_hp_max = int(digits)
-        except ValueError:
-            return
-        self._update_hp_bar()
+        self._set_slot_abilities(slot, ability, passive, ability_index, nature)
 
-    def _update_hp_bar(self) -> None:
-        pass  # HP tracking disabled
+    def _set_slot_abilities(self, slot: int, ability: str | None, passive: str | None,
+                             ability_index: int | None = None, nature=None) -> None:
+        lbl = self._ability_lbls[slot]
+        if lbl is None:
+            return
+        ab_parts = []
+        if ability:
+            hidden = ability_index == 2
+            h_mark = " <span style='color:#f9e2af;font-size:9px;'>[H]</span>" if hidden else ""
+            ab_parts.append(f"<span style='color:#cba6f7;'>⚡ {ability}{h_mark}</span>")
+        if passive:
+            ab_parts.append(f"<span style='color:#89b4fa;'>✦ {passive}</span>")
+        nat = nature_mod_str(nature)
+        if ab_parts or nat:
+            left = "  ".join(ab_parts)
+            right = (f"<span style='color:#a6adc8;font-size:9px;'>{nat}</span>"
+                     if nat else "")
+            html = (
+                f"<table width='100%' cellpadding='0' cellspacing='0'><tr>"
+                f"<td>{left}</td>"
+                f"<td align='right'>{right}</td>"
+                f"</tr></table>"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+            if (ability, passive) != self._last_abilities[slot]:
+                self._last_abilities[slot] = (ability, passive)
+                threading.Thread(
+                    target=self._fetch_ability_tooltips,
+                    args=(slot, ability, passive),
+                    daemon=True,
+                ).start()
+        else:
+            lbl.setVisible(False)
+
+    def _fetch_ability_tooltips(self, slot: int, ability: str | None, passive: str | None):
+        lines = []
+        if ability:
+            desc = fetch_ability(ability)
+            lines.append(f"⚡ {ability}: {desc}" if desc else f"⚡ {ability}")
+        if passive:
+            desc = fetch_ability(passive)
+            lines.append(f"✦ {passive}: {desc}" if desc else f"✦ {passive}")
+        self._signals.ability_tooltip_ready.emit(slot, "\n\n".join(lines))
+
+    def _on_ability_tooltip(self, slot: int, tooltip: str):
+        lbl = self._ability_lbls[slot]
+        if lbl is not None:
+            lbl.setToolTip(tooltip)
+
+    def set_party(self, party: list) -> None:
+        """Pre-populate all 6 team slots from JS-state party data. Each entry:
+        {name, level, hp, maxHp, fainted, types, ability, passive, moves}.
+
+        Slots are 1:1 with Pokerogue's party order. For any slot whose team_data
+        is empty or a different base species, triggers an async PokeAPI fetch.
+        For slots whose stored types disagree with JS in-battle types (form
+        mismatch — e.g. Alolan Ninetales), triggers a form-override fetch."""
+        def _norm(s: str) -> str:
+            return s.lower().replace(" ", "-").replace(".", "").replace("'", "")
+
+        for slot in range(TEAM_SIZE):
+            if slot >= len(party):
+                self._party_target_types[slot] = []
+                if self._team_data[slot] is not None:
+                    self._clear_slot(slot)
+                elif self._hp_bars[slot] is not None:
+                    self._hp_bars[slot].setVisible(False)
+                continue
+            member = party[slot] or {}
+            name = _norm(member.get('name') or '')
+            if not name:
+                self._party_target_types[slot] = []
+                if self._team_data[slot] is not None:
+                    self._clear_slot(slot)
+                elif self._hp_bars[slot] is not None:
+                    self._hp_bars[slot].setVisible(False)
+                continue
+
+            # HP bar — always render, even before fetch completes
+            self._render_hp_bar(slot, member.get('hp', 0), member.get('maxHp', 0),
+                                bool(member.get('fainted')))
+
+            # Level — push immediately
+            lv = member.get('level')
+            if lv is not None:
+                self._level_vals[slot] = lv
+                lbl = self._level_lbls[slot]
+                if lbl is not None:
+                    lbl.setText(f"L{lv}")
+                    lbl.setVisible(True)
+
+            # Abilities
+            self._set_slot_abilities(slot, member.get('ability'), member.get('passive'),
+                                     member.get('abilityIndex'), member.get('nature'))
+
+            # Track JS types for form-override on this slot
+            types = list(member.get('types') or [])
+            self._party_target_types[slot] = types
+
+            current = self._team_data[slot]
+            new_base = _SLUG_TO_BASE.get(name, name)
+            need_fetch = False
+            if current is None:
+                need_fetch = True
+            else:
+                cur_norm = _norm(current.name)
+                cur_base = _SLUG_TO_BASE.get(cur_norm, cur_norm)
+                if cur_base != new_base:
+                    need_fetch = True
+
+            if need_fetch:
+                if slot not in self._pending_lookups:
+                    self._pending_lookups.add(slot)
+                    self._pending_lookup_names[slot] = name
+                    threading.Thread(target=self._lookup, args=(slot, name), daemon=True).start()
+            elif types and set(types) != set(current.types):
+                # Same base species, different form — fetch the matching variant
+                self._try_form_override_for_slot(slot, types)
+
+            # Moves — push each by slot directly (no OCR attribution needed)
+            for mi, move in enumerate(member.get('moves') or []):
+                if mi >= MOVE_SLOTS or not move:
+                    continue
+                existing = self._team_moves[slot][mi]
+                if existing and existing.name.lower() == move.lower():
+                    continue
+                threading.Thread(
+                    target=self._do_lookup_move, args=(slot, mi, move.lower()), daemon=True
+                ).start()
+
+    def _try_form_override_for_slot(self, slot: int, sampled: list) -> None:
+        """Slot-keyed form override: fetch the form variant whose PokeAPI types
+        match the JS in-battle types and re-emit result_ready for this slot."""
+        pokemon = self._team_data[slot]
+        if pokemon is None:
+            return
+        pkm_norm = pokemon.name.lower()
+        base = _SLUG_TO_BASE.get(pkm_norm, pkm_norm)
+        variants = _FORM_VARIANTS.get(base)
+        if not variants or slot in self._form_pending_slots:
+            return
+        self._form_pending_slots.add(slot)
+
+        def _check():
+            try:
+                for _label, slug in variants:
+                    if slug == pkm_norm:
+                        continue
+                    try:
+                        form = fetch_pokemon(slug)
+                        if set(form.types) == set(sampled):
+                            weaknesses = calculate_weaknesses(form.types)
+                            self._signals.result_ready.emit((slot, form, weaknesses))
+                            return
+                    except Exception:
+                        pass
+            finally:
+                self._form_pending_slots.discard(slot)
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _render_hp_bar(self, slot: int, hp: int, max_hp: int, fainted: bool) -> None:
+        bar = self._hp_bars[slot]
+        if bar is None or max_hp <= 0:
+            return
+        pct = max(0, min(100, int(round(hp / max_hp * 100))))
+        if fainted or hp <= 0:
+            color = "#45475a"
+            text = "FAINTED"
+        elif pct <= 20:
+            color = "#f38ba8"
+            text = f"{hp}/{max_hp}"
+        elif pct <= 50:
+            color = "#f9e2af"
+            text = f"{hp}/{max_hp}"
+        else:
+            color = "#a6e3a1"
+            text = f"{hp}/{max_hp}"
+        bar.setStyleSheet(_HP_BAR_STYLE.format(color=color))
+        bar.setValue(pct if not fainted else 100)
+        bar.setFormat(text)
+        bar.setVisible(True)
 
     def receive_move_ocr(self, move_idx: int, text: str) -> None:
-        """Called by OCRService on main thread with a detected move name."""
-        if self._active_slot_idx is None:
+        """Called by JS-state dispatcher with a move name. In 2v2 either active
+        Pokémon may own a given move slot, so we debounce on the move text alone
+        and decide the owning team slot at commit time by scoring each candidate
+        against what we already know."""
+        candidates = self._active_team_slots()
+        if not candidates:
             return
         cleaned = " ".join(text.strip().split())
         cleaned = "".join(c for c in cleaned if c.isalpha() or c == " ").strip()
         if len(cleaned) < 3 or len(cleaned) > 22:
             return
-        # Debounce: only commit after 2 consecutive identical readings
-        slot = self._active_slot_idx
-        last_text, count = self._move_ocr_buf[slot][move_idx]
+        # Debounce: only commit after 2 consecutive identical readings at this move_idx.
+        last_text, count = self._move_ocr_buf[move_idx]
         if cleaned.lower() == last_text.lower():
             count += 1
-            self._move_ocr_buf[slot][move_idx] = (cleaned, count)
+            self._move_ocr_buf[move_idx] = (cleaned, count)
             if count != 2:
                 return
         else:
-            self._move_ocr_buf[slot][move_idx] = (cleaned, 1)
+            self._move_ocr_buf[move_idx] = (cleaned, 1)
+            return
+        target_slot = self._choose_slot_for_move(candidates, cleaned.lower())
+        if target_slot is None:
             return
         threading.Thread(
-            target=self._do_lookup_move, args=(slot, move_idx, cleaned.lower()), daemon=True
+            target=self._do_lookup_move, args=(target_slot, move_idx, cleaned.lower()), daemon=True
         ).start()
+
+    def _active_team_slots(self) -> list[int]:
+        """Currently-active team slot indices (1 entry in 1v1, up to 2 in 2v2)."""
+        result: list[int] = []
+        if self._active_slot_idx is not None:
+            result.append(self._active_slot_idx)
+        if self._active_slot_idx2 is not None and self._active_slot_idx2 not in result:
+            result.append(self._active_slot_idx2)
+        return result
+
+    def _last_active_slot(self) -> int | None:
+        """Whichever active slot was most recently filled — tiebreaker for ambiguous moves."""
+        if self._active_slot_idx2 is None:
+            return self._active_slot_idx
+        if self._active_slot_idx is None:
+            return self._active_slot_idx2
+        return self._active_slot_idx if self._last_active_position == 0 else self._active_slot_idx2
+
+    def _score_move_for_slot(self, slot: int, move_name: str, all_candidates: list[int]) -> int:
+        """Score how well `move_name` fits being attributed to `slot`. Higher = better fit.
+        +10  this slot's known moveset already contains the move (confirms existing)
+         -10  another active slot has the move but this one doesn't (almost certainly theirs)
+         +5  bootstrap: no slot has it, but this slot still has empty move rows
+          0  default
+        """
+        slot_known = {m.name.lower() for m in self._team_moves[slot] if m is not None}
+        if move_name in slot_known:
+            return 10
+        others_have = any(
+            move_name in {m.name.lower() for m in self._team_moves[o] if m is not None}
+            for o in all_candidates if o != slot
+        )
+        if others_have:
+            return -10
+        has_empty = any(m is None for m in self._team_moves[slot])
+        if has_empty:
+            return 5
+        return 0
+
+    def _choose_slot_for_move(self, candidates: list[int], move_name: str) -> int | None:
+        """Pick the best-scoring candidate slot. Tie-break by most-recently-active.
+        Lenient fallback: if no candidate scores positive (true ambiguity, no signal),
+        attribute to the last-active slot rather than dropping the read."""
+        if len(candidates) == 1:
+            return candidates[0]
+        scores = {s: self._score_move_for_slot(s, move_name, candidates) for s in candidates}
+        best = max(scores.values())
+        if best <= 0:
+            # Pure ambiguity (bootstrap with both fully-known, or other edge cases) —
+            # fall through to last-active so unknown moves still attach somewhere.
+            last = self._last_active_slot()
+            return last if last in candidates else candidates[0]
+        winners = [s for s, sc in scores.items() if sc == best]
+        if len(winners) == 1:
+            return winners[0]
+        last = self._last_active_slot()
+        return last if last in winners else winners[0]
 
     def _build_slot_frame(self, slot: int) -> QFrame:
         frame = QFrame()
@@ -448,6 +733,15 @@ class TeamPanel(QWidget):
         hp_bar.setVisible(False)
         self._hp_bars[slot] = hp_bar
         layout.addWidget(hp_bar)
+
+        ability_lbl = QLabel("")
+        ability_lbl.setStyleSheet(
+            "color:#cba6f7; font-size:9px;" if self._strip
+            else "color:#cba6f7; font-size:12px;"
+        )
+        ability_lbl.setVisible(False)
+        self._ability_lbls[slot] = ability_lbl
+        layout.addWidget(ability_lbl)
 
         if not self._strip:
             layout.addWidget(self._divider())
@@ -644,7 +938,6 @@ class TeamPanel(QWidget):
         self._team_data[slot]       = None
         self._team_weaknesses[slot] = None
         self._team_moves[slot]      = [None] * MOVE_SLOTS
-        self._move_ocr_buf[slot]    = [("", 0)] * MOVE_SLOTS
         self._name_inputs[slot].clear()
         self._clear_type_badges(slot)
         for mi in range(MOVE_SLOTS):
@@ -654,9 +947,16 @@ class TeamPanel(QWidget):
         if self._hp_bars[slot] is not None:
             self._hp_bars[slot].setValue(0)
             self._hp_bars[slot].setVisible(False)
+        if self._ability_lbls[slot] is not None:
+            self._ability_lbls[slot].setVisible(False)
+            self._ability_lbls[slot].setToolTip("")
+        if self._level_lbls[slot] is not None:
+            self._level_lbls[slot].setVisible(False)
+        self._last_abilities[slot] = (None, None)
 
     def _clear_slot(self, slot: int):
         self._clear_slot_data(slot)
+        self._level_vals[slot] = None
         if not self._embedded:
             self._rebuild_weakness_grid()
         self._trigger_analysis_rebuild()
@@ -666,6 +966,10 @@ class TeamPanel(QWidget):
         """Wipe every team slot. Used by New Run."""
         for slot in range(TEAM_SIZE):
             self._clear_slot_data(slot)
+            self._level_vals[slot] = None
+        self._pending_lookups.clear()
+        self._pending_lookup_names.clear()
+        self._move_ocr_buf = [("", 0)] * MOVE_SLOTS
         if not self._embedded:
             self._rebuild_weakness_grid()
         self._trigger_analysis_rebuild()
@@ -699,6 +1003,7 @@ class TeamPanel(QWidget):
     def _on_result(self, payload):
         slot, pokemon, weaknesses = payload
         self._pending_lookups.discard(slot)
+        self._pending_lookup_names.pop(slot, None)
         self._team_data[slot]       = pokemon
         self._team_weaknesses[slot] = weaknesses
         self._name_inputs[slot].setText(pokemon.name)
@@ -707,31 +1012,39 @@ class TeamPanel(QWidget):
             self._type_rows[slot].addWidget(self._make_type_badge(t))
         if not self._embedded:
             self._rebuild_weakness_grid()
-        # If the newly-added pokemon matches what OCR currently sees, activate immediately
-        # without waiting for the next OCR cycle.
-        if self._pending_active and pokemon.name.lower() == self._pending_active:
-            self._active_slot_idx = slot
-            self._refresh_slot_highlights()
-        # If color samples are already in for an active slot, check for form mismatch now.
-        if slot == self._active_slot_idx and any(t is not None for t in self._player_sampled_types):
-            self._apply_player_type_override(0)
-        if slot == self._active_slot_idx2 and any(t is not None for t in self._player_sampled_types2):
-            self._apply_player_type_override(1)
+        # If the newly-added pokemon matches what JS currently has active, activate
+        # immediately without waiting for the next snapshot.
+        pkm_norm = pokemon.name.lower()
+        pkm_base = _SLUG_TO_BASE.get(pkm_norm, pkm_norm)
+        if self._pending_active:
+            pa_base = _SLUG_TO_BASE.get(self._pending_active, self._pending_active)
+            if pkm_norm == self._pending_active or pkm_base == pa_base:
+                self._active_slot_idx = slot
+                self._refresh_slot_highlights()
+        # Form override: if JS tracked target types for this slot disagree with the
+        # PokeAPI types we just fetched, kick off a form-variant fetch.
+        target = self._party_target_types[slot]
+        if target and set(target) != set(pokemon.types):
+            self._try_form_override_for_slot(slot, target)
         self._trigger_analysis_rebuild()
         self._save_team()
 
-    # ── Player type color override (from TypeColorService) ───────────────────
+    # ── Player type override (from JS-state dispatcher) ──────────────────────
 
-    def receive_player_type_sample(self, type_index: int, type_name: str | None, position: int = 0) -> None:
-        if position == 0:
-            if self._player_sampled_types[type_index] == type_name:
-                return
-            self._player_sampled_types[type_index] = type_name
-        else:
-            if self._player_sampled_types2[type_index] == type_name:
-                return
-            self._player_sampled_types2[type_index] = type_name
-        self._apply_player_type_override(position)
+    def set_player_types(self, types: list, position: int = 0) -> None:
+        """Atomic two-type push from the JS-state dispatcher. Avoids a race
+        where pushing types one-by-one fires the form-override on incomplete
+        sampled data, marking _player_form_pending and silently dropping the
+        second push."""
+        sampled = self._player_sampled_types if position == 0 else self._player_sampled_types2
+        changed = False
+        for i in range(2):
+            new_val = types[i] if i < len(types) else None
+            if sampled[i] != new_val:
+                sampled[i] = new_val
+                changed = True
+        if changed:
+            self._apply_player_type_override(position)
 
     def _apply_player_type_override(self, position: int = 0):
         if position == 0:
@@ -1141,6 +1454,11 @@ class TeamPanel(QWidget):
             else:
                 team.append(None)
         window_state.save_key("team", team)
+        self._signals.team_changed.emit()
+
+    @property
+    def team_changed(self):
+        return self._signals.team_changed
 
     def load_saved_team(self):
         state = window_state.load()
@@ -1148,6 +1466,8 @@ class TeamPanel(QWidget):
             if not (entry and isinstance(entry, dict)):
                 continue
             if entry.get("name"):
+                self._pending_lookups.add(i)
+                self._pending_lookup_names[i] = entry["name"].lower()
                 threading.Thread(
                     target=self._lookup, args=(i, entry["name"]), daemon=True
                 ).start()

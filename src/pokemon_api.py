@@ -3,11 +3,52 @@ import requests
 
 BASE_URL = "https://pokeapi.co/api/v2"
 
-_pokemon_cache:   dict = {}
-_type_cache:      dict = {}
-_evo_cache:       dict = {}
-_move_cache:      dict = {}
-_move_fail_cache: set  = set()   # keys that 404'd so we don't retry
+# Nature index → "+Boost/-Drop" string. Empty string = neutral.
+_NATURE_MODS = [
+    "",               # 0  Hardy
+    "+Atk/-Def",     # 1  Lonely
+    "+Atk/-Spd",     # 2  Brave
+    "+Atk/-SpAtk",   # 3  Adamant
+    "+Atk/-SpDef",   # 4  Naughty
+    "+Def/-Atk",     # 5  Bold
+    "",               # 6  Docile
+    "+Def/-Spd",     # 7  Relaxed
+    "+Def/-SpAtk",   # 8  Impish
+    "+Def/-SpDef",   # 9  Lax
+    "+Spd/-Atk",     # 10 Timid
+    "+Spd/-Def",     # 11 Hasty
+    "",               # 12 Serious
+    "+Spd/-SpAtk",   # 13 Jolly
+    "+Spd/-SpDef",   # 14 Naive
+    "+SpAtk/-Atk",   # 15 Modest
+    "+SpAtk/-Def",   # 16 Mild
+    "+SpAtk/-Spd",   # 17 Quiet
+    "",               # 18 Bashful
+    "+SpAtk/-SpDef", # 19 Rash
+    "+SpDef/-Atk",   # 20 Calm
+    "+SpDef/-Def",   # 21 Gentle
+    "+SpDef/-Spd",   # 22 Sassy
+    "+SpDef/-SpAtk", # 23 Careful
+    "",               # 24 Quirky
+]
+
+
+def nature_mod_str(nature_idx) -> str:
+    """'+Boost/-Drop' string for the given nature index. Empty for neutral natures."""
+    if nature_idx is None:
+        return ""
+    try:
+        return _NATURE_MODS[int(nature_idx)]
+    except (IndexError, TypeError, ValueError):
+        return ""
+
+_pokemon_cache:    dict = {}
+_type_cache:       dict = {}
+_evo_cache:        dict = {}
+_move_cache:       dict = {}
+_move_fail_cache:  set  = set()   # keys that 404'd so we don't retry
+_ability_cache:    dict = {}
+_ability_fail_cache: set = set()
 
 _REGION_MAP = {
     "galarian": "galar",  "galar":  "galar",
@@ -116,6 +157,31 @@ def fetch_move(name: str) -> MoveData:
     )
     _move_cache[key] = result
     return result
+
+
+def fetch_ability(name: str) -> str:
+    """Returns the English flavor text for an ability, or '' on failure/miss."""
+    key = name.lower().strip().replace(" ", "-")
+    if key in _ability_cache:
+        return _ability_cache[key]
+    if key in _ability_fail_cache:
+        return ""
+    try:
+        resp = requests.get(f"{BASE_URL}/ability/{key}", timeout=10)
+        if resp.status_code == 404:
+            _ability_fail_cache.add(key)
+            return ""
+        resp.raise_for_status()
+        d = resp.json()
+        desc = next(
+            (e["flavor_text"] for e in d.get("flavor_text_entries", [])
+             if e["language"]["name"] == "en"),
+            "",
+        ).replace("\n", " ").replace("\f", " ")
+        _ability_cache[key] = desc
+        return desc
+    except Exception:
+        return ""
 
 
 def fetch_type_relations(type_name: str) -> dict:
