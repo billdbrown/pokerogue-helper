@@ -13,7 +13,9 @@ from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor, QPen, QPolygonF
 from pokemon_api import fetch_pokemon, fetch_move, fetch_ability, nature_mod_str, MoveData, PokemonData
 from weakness_calc import (
     calculate_weaknesses, detailed_coverage,
-    coverage_suggestions, redundancy_suggestions, dangerous_combos, slot_coverage, ALL_TYPES,
+    coverage_suggestions, coverage_suggestions_from_gaps,
+    redundancy_suggestions, dangerous_combos, slot_coverage, ALL_TYPES,
+    covered_gaps,
 )
 from overlay import _resolve_name, _FORM_VARIANTS, _SLUG_TO_BASE
 import stats_db
@@ -145,6 +147,7 @@ class TeamPanel(QWidget):
         # tiebreaker when 2v2 move attribution is ambiguous (both candidate slots
         # score equally for an OCR'd move).
         self._last_active_position: int = 0
+        self._avg_lbl = None
 
         self._signals = _Signals()
         self._signals.result_ready.connect(self._on_result)
@@ -290,9 +293,17 @@ class TeamPanel(QWidget):
         root.setContentsMargins(6, 4, 6, 4)
         root.setSpacing(3)
 
+        hdr_row = QHBoxLayout()
+        hdr_row.setContentsMargins(0, 0, 0, 0)
         hdr = QLabel("My Team")
         hdr.setStyleSheet("color:#cdd6f4; font-size:13px; font-weight:bold;")
-        root.addWidget(hdr)
+        hdr_row.addWidget(hdr)
+        hdr_row.addStretch()
+        self._avg_lbl = QLabel("")
+        self._avg_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._avg_lbl.setStyleSheet("font-size:11px;")
+        hdr_row.addWidget(self._avg_lbl)
+        root.addLayout(hdr_row)
 
         slots_row = QHBoxLayout()
         slots_row.setContentsMargins(0, 0, 0, 0)
@@ -959,6 +970,7 @@ class TeamPanel(QWidget):
         self._level_vals[slot] = None
         if not self._embedded:
             self._rebuild_weakness_grid()
+        self._update_avg_lbl()
         self._trigger_analysis_rebuild()
         self._save_team()
 
@@ -972,6 +984,7 @@ class TeamPanel(QWidget):
         self._move_ocr_buf = [("", 0)] * MOVE_SLOTS
         if not self._embedded:
             self._rebuild_weakness_grid()
+        self._update_avg_lbl()
         self._trigger_analysis_rebuild()
         self._save_team()
 
@@ -1026,6 +1039,7 @@ class TeamPanel(QWidget):
         target = self._party_target_types[slot]
         if target and set(target) != set(pokemon.types):
             self._try_form_override_for_slot(slot, target)
+        self._update_avg_lbl()
         self._trigger_analysis_rebuild()
         self._save_team()
 
@@ -1164,10 +1178,10 @@ class TeamPanel(QWidget):
 
             if all_move_types:
                 full, partial, gaps = detailed_coverage(all_move_types)
-                suggestions = coverage_suggestions(all_move_types, n=2)
+                suggestions = coverage_suggestions_from_gaps(gaps, n=2)
                 danger      = dangerous_combos(all_move_types, team_weaknesses, n=3)
                 if gaps:
-                    s = coverage_suggestions(all_move_types, n=4)
+                    s = coverage_suggestions_from_gaps(gaps, n=4)
                     pref_type = [(t, c, "gap") for t, c in s]
                 else:
                     s = redundancy_suggestions(all_move_types, n=4)
@@ -1193,8 +1207,17 @@ class TeamPanel(QWidget):
             if filled:
                 weakest_slot, _ = min(filled, key=lambda x: (x[1][3], x[1][2], x[1][1]))
                 other_types = [t for s, st in enumerate(move_types_by_slot) if s != weakest_slot for t in st]
-                suggs = coverage_suggestions(other_types, n=1) if other_types else []
-                replace_sugg = suggs[0] if suggs else None
+                if other_types:
+                    _, _, weakest_gaps = detailed_coverage(other_types)
+                    suggs = coverage_suggestions_from_gaps(weakest_gaps, n=1)
+                    if suggs:
+                        type_name, count = suggs[0]
+                        specific = covered_gaps(type_name, weakest_gaps)
+                        replace_sugg = (type_name, count, specific)
+                    else:
+                        replace_sugg = None
+                else:
+                    replace_sugg = None
 
             team_names = [p.name if p else None for p in team_data]
             self._signals.analysis_ready.emit(
@@ -1218,16 +1241,18 @@ class TeamPanel(QWidget):
 
         if suggestions:
             for type_name, count in suggestions:
+                covered = covered_gaps(type_name, gaps) if gaps else []
                 row = QHBoxLayout()
                 row.setSpacing(4)
-                arr = QLabel("→")
-                arr.setFixedWidth(10)
-                arr.setStyleSheet(f"color:#89b4fa; font-size:{fs};")
-                row.addWidget(arr)
+                add_lbl = QLabel("Add")
+                add_lbl.setStyleSheet(f"color:#89b4fa; font-size:{fs};")
+                row.addWidget(add_lbl)
                 row.addWidget(self._make_type_badge(type_name))
-                desc = QLabel(f"covers {count} gap{'s' if count != 1 else ''}")
-                desc.setStyleSheet(f"color:#a6adc8; font-size:{fs};")
-                row.addWidget(desc)
+                count_lbl = QLabel(f"({count})")
+                count_lbl.setStyleSheet(f"color:#a6adc8; font-size:{fs};")
+                row.addWidget(count_lbl)
+                for gap_type in covered:
+                    row.addWidget(self._make_type_badge(gap_type))
                 row.addStretch()
                 self._tips_area.addLayout(row)
         else:
@@ -1320,17 +1345,18 @@ class TeamPanel(QWidget):
 
         if weakest_slot is not None:
             row = QHBoxLayout()
-            row.setSpacing(6)
-            arr = QLabel("→")
-            arr.setFixedWidth(12)
-            arr.setStyleSheet("color:#89b4fa; font-size:12px;")
-            row.addWidget(arr)
+            row.setSpacing(4)
             if replace_sugg:
-                type_name, gain = replace_sugg
+                type_name, gain, specific_gaps = replace_sugg
+                add_lbl = QLabel("Add")
+                add_lbl.setStyleSheet("color:#89b4fa; font-size:12px;")
+                row.addWidget(add_lbl)
                 row.addWidget(self._make_type_badge(type_name))
-                desc = QLabel(f"gains {gain} type{'s' if gain != 1 else ''}")
-                desc.setStyleSheet("color:#a6adc8; font-size:12px;")
-                row.addWidget(desc)
+                count_lbl = QLabel(f"({gain})")
+                count_lbl.setStyleSheet("color:#a6adc8; font-size:12px;")
+                row.addWidget(count_lbl)
+                for gap_type in specific_gaps:
+                    row.addWidget(self._make_type_badge(gap_type))
             else:
                 desc = QLabel("Coverage unchanged without them")
                 desc.setStyleSheet("color:#6c7086; font-size:12px;")
@@ -1428,6 +1454,28 @@ class TeamPanel(QWidget):
                 item.widget().deleteLater()
             elif item.layout():
                 self._clear_layout(item.layout())
+
+    # ── team average ──────────────────────────────────────────────────────────
+
+    def _update_avg_lbl(self):
+        if self._avg_lbl is None:
+            return
+        bsts = [sum(p.stats.values()) for p in self._team_data if p is not None]
+        if not bsts:
+            self._avg_lbl.setText("")
+            return
+        avg = int(sum(bsts) / len(bsts))
+        if stats_db.is_ready():
+            pct = stats_db.bst_percentile(avg)
+            color = "#a6e3a1" if pct >= 75 else "#f9e2af" if pct >= 50 else "#fab387" if pct >= 25 else "#f38ba8"
+            self._avg_lbl.setText(
+                f"<span style='color:#6c7086'>avg </span>"
+                f"<span style='color:#a6adc8'>{avg}</span>"
+                f"<span style='color:{color}'> {pct}th%</span>"
+            )
+        else:
+            self._avg_lbl.setText(f"<span style='color:#6c7086'>avg </span>"
+                                   f"<span style='color:#a6adc8'>{avg}</span>")
 
     # ── persistence ───────────────────────────────────────────────────────────
 

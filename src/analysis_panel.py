@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from weakness_calc import ALL_TYPES
+from weakness_calc import ALL_TYPES, covered_gaps
 
 TEAM_SIZE = 6
 
@@ -169,16 +169,17 @@ class AnalysisPanel(QWidget):
         if weakest_slot is not None:
             row = QHBoxLayout()
             row.setSpacing(4)
-            arr = QLabel("→")
-            arr.setFixedWidth(12)
-            arr.setStyleSheet("color:#89b4fa; font-size:18px;")
-            row.addWidget(arr)
             if replace_sugg:
-                type_name, gain = replace_sugg
+                type_name, gain, specific_gaps = replace_sugg
+                add_lbl = QLabel("Add")
+                add_lbl.setStyleSheet("color:#89b4fa; font-size:18px;")
+                row.addWidget(add_lbl)
                 row.addWidget(self._make_type_badge(type_name))
-                desc = QLabel(f"gains {gain} type{'s' if gain != 1 else ''}")
-                desc.setStyleSheet("color:#a6adc8; font-size:18px;")
-                row.addWidget(desc)
+                count_lbl = QLabel(f"({gain})")
+                count_lbl.setStyleSheet("color:#a6adc8; font-size:18px;")
+                row.addWidget(count_lbl)
+                for gap_type in specific_gaps:
+                    row.addWidget(self._make_type_badge(gap_type))
             else:
                 desc = QLabel("Coverage unchanged without them")
                 desc.setStyleSheet("color:#6c7086; font-size:18px;")
@@ -197,16 +198,18 @@ class AnalysisPanel(QWidget):
 
         if suggestions:
             for type_name, count in suggestions:
+                gap_types = covered_gaps(type_name, gaps) if gaps else []
                 row = QHBoxLayout()
                 row.setSpacing(4)
-                arr = QLabel("→")
-                arr.setFixedWidth(10)
-                arr.setStyleSheet("color:#89b4fa; font-size:18px;")
-                row.addWidget(arr)
+                add_lbl = QLabel("Add")
+                add_lbl.setStyleSheet("color:#89b4fa; font-size:18px;")
+                row.addWidget(add_lbl)
                 row.addWidget(self._make_type_badge(type_name))
-                desc = QLabel(f"covers {count} gap{'s' if count != 1 else ''}")
-                desc.setStyleSheet("color:#a6adc8; font-size:18px;")
-                row.addWidget(desc)
+                count_lbl = QLabel(f"({count})")
+                count_lbl.setStyleSheet("color:#a6adc8; font-size:18px;")
+                row.addWidget(count_lbl)
+                for gap_type in gap_types:
+                    row.addWidget(self._make_type_badge(gap_type))
                 row.addStretch()
                 self._tips_area.addLayout(row)
         else:

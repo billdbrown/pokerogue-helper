@@ -84,6 +84,14 @@ EXTRACTOR_JS = r"""
                 passive: tryGet(() => p.hasPassive() && p.getPassiveAbility() && p.getPassiveAbility().name) || null,
                 nature: p.nature,
                 moves: (p.moveset || []).map(m => m && m.getName ? m.getName() : null),
+                stats: {
+                    hp:  tryGet(() => p.getStat(0)),
+                    atk: tryGet(() => p.getStat(1)),
+                    def: tryGet(() => p.getStat(2)),
+                    spa: tryGet(() => p.getStat(3)),
+                    spd: tryGet(() => p.getStat(4)),
+                    spe: tryGet(() => p.getStat(5)),
+                },
             };
         } catch(e) { return null; }
     };

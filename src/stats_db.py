@@ -11,7 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-CACHE_FILE = "stats_cache.json"
+from app_dirs import data_path
+CACHE_FILE = data_path("stats_cache.json")
 CACHE_VERSION = 3   # bump to force a rebuild when cache schema changes
 
 _db: dict = {}
@@ -70,6 +71,12 @@ def top_stat_percentiles(stats: dict, threshold: int = 66) -> dict:
 def is_fully_evolved(name: str) -> bool:
     with _lock:
         return _db.get(name, {}).get("fully_evolved", False)
+
+
+def is_legendary(name: str) -> bool:
+    with _lock:
+        v = _db.get(name, {})
+        return bool(v.get("legendary") or v.get("mythical"))
 
 
 def all_names() -> list:

@@ -10,7 +10,8 @@ import threading
 
 import requests
 
-CACHE_FILE = "tier_cache.json"
+from app_dirs import data_path
+CACHE_FILE = data_path("tier_cache.json")
 PS_URL = "https://raw.githubusercontent.com/smogon/pokemon-showdown/master/config/formats-data.ts"
 
 # Tiers we surface, in strength order. Anything not in this set is hidden.

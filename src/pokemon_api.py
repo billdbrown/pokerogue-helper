@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import requests
 
 BASE_URL = "https://pokeapi.co/api/v2"
@@ -73,6 +73,7 @@ class PokemonData:
     name: str
     types: list[str]
     stats: dict[str, int]
+    move_names: list[str] = field(default_factory=list)  # all learnable move names
 
 
 @dataclass
@@ -96,8 +97,9 @@ def fetch_pokemon(name: str) -> PokemonData:
 
     types = [t["type"]["name"] for t in sorted(data["types"], key=lambda t: t["slot"])]
     stats = {s["stat"]["name"]: s["base_stat"] for s in data["stats"]}
+    move_names = [m["move"]["name"] for m in data.get("moves", [])]
 
-    result = PokemonData(name=data["name"], types=types, stats=stats)
+    result = PokemonData(name=data["name"], types=types, stats=stats, move_names=move_names)
     _pokemon_cache[key] = result
     return result
 
@@ -126,6 +128,28 @@ def _leaf_names(node: dict) -> set[str]:
     for child in node["evolves_to"]:
         result.update(_leaf_names(child))
     return result
+
+
+def fetch_learnable_coverage(pokemon_name: str) -> frozenset[str]:
+    """Return the set of move types in a Pokemon's full learnable moveset.
+
+    Runs through every move name stored on PokemonData, resolving types via the
+    cached fetch_move. Cache misses result in network calls; already-seen moves
+    are instant. Intended for background-thread use only.
+    """
+    try:
+        pdata = fetch_pokemon(pokemon_name)
+    except Exception:
+        return frozenset()
+    types: set[str] = set()
+    for move_name in pdata.move_names:
+        try:
+            mdata = fetch_move(move_name)
+            if mdata.type and mdata.category != "status" and (mdata.power or 0) > 0:
+                types.add(mdata.type)
+        except Exception:
+            pass
+    return frozenset(types)
 
 
 def fetch_move(name: str) -> MoveData:

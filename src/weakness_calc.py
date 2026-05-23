@@ -81,16 +81,26 @@ def redundancy_suggestions(move_types: list[str], n: int = 1) -> list[tuple[str,
     return scored[:n]
 
 
+def covered_gaps(candidate_type: str, gaps: set) -> list[str]:
+    """Returns the gap types that candidate_type covers with SE damage, sorted."""
+    return sorted(gap for gap in gaps if _effectiveness(candidate_type, [gap]) >= 2.0)
+
+
+def coverage_suggestions_from_gaps(gaps: set, n: int = 2) -> list[tuple[str, int]]:
+    """Top n types to add that cover the most gap types — takes a pre-computed gaps set."""
+    scored = [
+        (c, sum(1 for g in gaps if _effectiveness(c, [g]) >= 2.0))
+        for c in ALL_TYPES
+    ]
+    scored = [(c, count) for c, count in scored if count > 0]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:n]
+
+
 def coverage_suggestions(move_types: list[str], n: int = 2) -> list[tuple[str, int]]:
     """Top n types to add that cover the most current gap types with SE damage."""
     _, _, gaps = detailed_coverage(move_types)
-    scored = []
-    for candidate in ALL_TYPES:
-        count = sum(1 for gap in gaps if _effectiveness(candidate, [gap]) >= 2.0)
-        if count > 0:
-            scored.append((candidate, count))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:n]
+    return coverage_suggestions_from_gaps(gaps, n)
 
 
 def dangerous_combos(

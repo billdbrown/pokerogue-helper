@@ -9,7 +9,8 @@ import threading
 
 import requests
 
-CACHE_FILE    = "moves_cache.json"
+from app_dirs import data_path
+CACHE_FILE = data_path("moves_cache.json")
 CACHE_VERSION = 1
 
 _names: list = []

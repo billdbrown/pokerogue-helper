@@ -1,7 +1,8 @@
 import json
 import os
+from app_dirs import data_path
 
-_FILE = "window_state.json"
+_FILE = data_path("window_state.json")
 
 
 def load() -> dict:

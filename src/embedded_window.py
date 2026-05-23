@@ -39,7 +39,7 @@ _VERSION = _read_version()
 
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QSplitter, QSizePolicy,
+    QMainWindow, QSizePolicy,
     QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QLabel,
     QDialog, QCheckBox, QDialogButtonBox,
 )
@@ -51,6 +51,8 @@ from PyQt6.QtCore import Qt, QUrl, QPoint, QTimer
 
 from overlay import OverlayPanel
 from team_panel import TeamPanel
+from impact_table import ImpactTableDialog
+import impact_db
 from wave_panel import WavePanel
 from analysis_panel import AnalysisPanel
 from turn_order import make_fighter
@@ -69,8 +71,9 @@ _FIXED_W    = 1600
 _FIXED_H    = 900
 
 _JS_LEVELS    = {0: "Info", 1: "Warning", 2: "Error"}
-_LOG_PATH     = "embedded_console.log"
-_PROFILE_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
+from app_dirs import data_path
+_LOG_PATH    = data_path("embedded_console.log")
+_PROFILE_DIR = data_path("browser_data")
 
 
 # ── JS console capture ────────────────────────────────────────────────────────
@@ -119,10 +122,6 @@ class SettingsDialog(QDialog):
         self._weak_check.toggled.connect(self._enemy.set_weaknesses_visible)
         layout.addWidget(self._weak_check)
 
-        self._moves_check = QCheckBox("Show enemy moves")
-        self._moves_check.setChecked(False)
-        self._moves_check.toggled.connect(self._enemy.set_moves_visible)
-        layout.addWidget(self._moves_check)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(self.hide)
@@ -197,19 +196,13 @@ class EmbeddedMainWindow(QMainWindow):
         title_lbl.setToolTip(f"Pokerogue Helper v{_VERSION}")
         title_hl.addWidget(title_lbl)
 
+        self._battle_badge = QLabel()
+        self._battle_badge.setVisible(False)
+        title_hl.addWidget(self._battle_badge)
+
         title_hl.addStretch()
 
-        # ── Left panel: title + enemy/analysis splitter ──────────────────
-        splitter_h = _FIXED_H - _NAVBAR_H - _TEAM_H
-        left_split = QSplitter(Qt.Orientation.Vertical)
-        left_split.setStyleSheet("QSplitter::handle { background: #313244; height: 2px; }")
-        left_split.addWidget(self._enemy)
-        left_split.addWidget(self._analysis)
-        left_split.setStretchFactor(0, 2)
-        left_split.setStretchFactor(1, 3)
-        left_split.setSizes([int(splitter_h * 0.4), int(splitter_h * 0.6)])
-        self._left_splitter = left_split
-
+        # ── Left panel: title + enemy (fills remaining space) + analysis (natural height) ──
         left_panel = QWidget()
         left_panel.setFixedWidth(_LEFT_WIDTH)
         left_panel.setStyleSheet("QWidget { background: #181825; }")
@@ -217,7 +210,8 @@ class EmbeddedMainWindow(QMainWindow):
         left_vl.setContentsMargins(0, 0, 0, 0)
         left_vl.setSpacing(0)
         left_vl.addWidget(title_bar)
-        left_vl.addWidget(left_split, 1)
+        left_vl.addWidget(self._enemy, 1)
+        left_vl.addWidget(self._analysis, 0)
 
         # ── Right panel: navbar + browser ────────────────────────────────
         right_panel = QWidget()
@@ -249,6 +243,10 @@ class EmbeddedMainWindow(QMainWindow):
         cv.addWidget(self._team)
         self.setCentralWidget(central)
 
+        # ── Impact score browser ─────────────────────────────────────────
+        self._impact_dlg: ImpactTableDialog | None = None
+        impact_db.init(on_ready=self._on_impact_ready)
+
         # ── Settings dialog (single checkbox: opponent weaknesses) ───────
         self._settings_dlg = SettingsDialog(self, self._enemy)
 
@@ -261,11 +259,6 @@ class EmbeddedMainWindow(QMainWindow):
 
         # Focus the web view on launch so keyboard input goes straight to the game.
         QTimer.singleShot(800, self._web.setFocus)
-
-        saved = state.get("embedded_splitter_state")
-        if saved:
-            from PyQt6.QtCore import QByteArray
-            self._left_splitter.restoreState(QByteArray.fromBase64(saved.encode()))
 
         self._push_debug_state()
 
@@ -385,6 +378,11 @@ class EmbeddedMainWindow(QMainWindow):
         self._status_lbl.setObjectName("status")
         row.addWidget(self._status_lbl)
 
+        impact_btn = QPushButton("Impact")
+        impact_btn.setToolTip("Browse Impact Scores")
+        impact_btn.clicked.connect(self._open_impact_table)
+        row.addWidget(impact_btn)
+
         settings_btn = QPushButton("⚙")
         settings_btn.setFixedSize(34, 28)
         settings_btn.setToolTip("Settings")
@@ -401,6 +399,19 @@ class EmbeddedMainWindow(QMainWindow):
             self._settings_dlg.move(p)
             self._settings_dlg.show()
             self._settings_dlg.raise_()
+
+    def _open_impact_table(self):
+        if self._impact_dlg is None:
+            self._impact_dlg = ImpactTableDialog(self)
+        if self._impact_dlg.isVisible():
+            self._impact_dlg.hide()
+        else:
+            self._impact_dlg.show()
+            self._impact_dlg.raise_()
+
+    def _on_impact_ready(self):
+        if self._impact_dlg is not None:
+            self._impact_dlg.refresh()
 
     def _navigate_to_url(self):
         text = self._url_bar.text().strip()
@@ -431,6 +442,7 @@ class EmbeddedMainWindow(QMainWindow):
             self._enemy._signals.slot_cleared.emit(1)
             self._team.set_party([])
             self._turn_order_panel.update_fighters([])
+            self._battle_badge.setVisible(False)
             if self._in_fight:
                 self._in_fight = False
                 self._push_debug_state()
@@ -465,8 +477,11 @@ class EmbeddedMainWindow(QMainWindow):
                 players[0].get('maxHp') or 0,
             )
 
-        # Fight mode + 2v2 ↔ 1v1
+        # Battle type badge
         enemies = snap.get('enemies') or []
+        self._update_battle_badge(snap.get('battleType', 0), len(enemies) > 0)
+
+        # Fight mode + 2v2 ↔ 1v1
         want_2v2 = len(enemies) >= 2
         desired_mode = '2v2' if want_2v2 else '1v1'
         if self._ui_state.fight_mode != desired_mode:
@@ -490,9 +505,15 @@ class EmbeddedMainWindow(QMainWindow):
                                                        e.get('abilityIndex'), e.get('nature'))
                 self._enemy.receive_opponent_moves(slot, e.get('moves') or [])
                 ebs = e.get('battleStats') or {}
+                _ebs_vals = [ebs.get(k) for k in ('atk', 'def', 'spa', 'spd')]
+                _enemy_total = (
+                    sum(v for v in _ebs_vals if v) +
+                    (e.get('speed') or 0) + (e.get('maxHp') or 0)
+                ) or None
                 self._enemy.receive_enemy_battle_stats(
                     slot, ebs.get('atk') or 0, ebs.get('spa') or 0,
                     e.get('level') or 1, e.get('types') or [], e.get('status'),
+                    stat_total=_enemy_total,
                 )
                 was_boss = slot in self._ui_state.boss_mask
                 is_boss = bool(e.get('isBoss'))
@@ -528,11 +549,31 @@ class EmbeddedMainWindow(QMainWindow):
             self._in_fight = in_fight
             self._push_debug_state()
 
+    # ── Battle badge ──────────────────────────────────────────────────────────
+
+    def _update_battle_badge(self, battle_type: int, has_enemies: bool):
+        if not has_enemies:
+            self._battle_badge.setVisible(False)
+            return
+        if battle_type == 0:
+            self._battle_badge.setText("  Wild  ")
+            self._battle_badge.setStyleSheet(
+                "QLabel { background:#a6e3a1; color:#1e1e2e; padding:2px 6px;"
+                " margin:5px 0; border-radius:8px; font-size:11px; font-weight:bold; }"
+            )
+        else:
+            self._battle_badge.setText("  Trainer  ")
+            self._battle_badge.setStyleSheet(
+                "QLabel { background:#fab387; color:#1e1e2e; padding:2px 6px;"
+                " margin:5px 0; border-radius:8px; font-size:11px; font-weight:bold; }"
+            )
+        self._battle_badge.setVisible(True)
+
     # ── Rival warning ─────────────────────────────────────────────────────────
 
     def _check_rival_warning(self, wave: int):
         """Fire a notification on the rising edge of the two waves before a rival."""
-        if self._prev_wave is None or wave == self._prev_wave:
+        if wave == self._prev_wave:
             return
         for rival_wave in _RIVAL_WAVES:
             if wave == rival_wave - 2:
@@ -566,10 +607,6 @@ class EmbeddedMainWindow(QMainWindow):
         self._js_state.stop()
         g = self.geometry()
         window_state.save_key("embedded_window", {"x": g.x(), "y": g.y()})
-        window_state.save_key(
-            "embedded_splitter_state",
-            self._left_splitter.saveState().toBase64().data().decode(),
-        )
         self._turn_order_panel.close()
         self._notif_panel.close()
         super().closeEvent(event)
