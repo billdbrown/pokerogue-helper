@@ -1,51 +1,49 @@
 # Pokerogue Helper
 
 A Windows desktop overlay for [pokerogue.net](https://pokerogue.net). Embeds the
-game in a native window, OCRs game state (wave, opponent, your team) from the
-screen in real time, and shows type weaknesses, base stats, and team analysis
-pulled live from PokéAPI.
+game in a native window and reads live battle state directly from the running
+Phaser scene via JavaScript injection — no OCR required.
 
-Single-developer hobby tool. Built with PyQt6, QtWebEngine, mss, and Tesseract.
+Single-developer hobby tool. Built with PyQt6 and QtWebEngine.
 
 ## Features
 
-- **Embedded browser** — pokerogue.net runs in a 1600×900 native window so the
-  helper panels can sit alongside the game without Alt-Tabbing.
-- **Opponent analysis** — reads the opposing Pokémon's name and level via OCR,
-  fetches type/stats/moves from PokéAPI, computes effectiveness against your
-  team and shows dangerous dual-type combos.
-- **Team management** — track your 6-Pokémon party, including known moves;
-  surface coverage gaps and weak links.
-- **Wave tracker** — OCRs the current wave number and shows upcoming boss /
-  rival / Elite Four milestones. Robust against the red boss-wave font color
-  and pixel-font confusables; supports manual override and an explicit "New
-  Run" reset.
-- **2v2 and boss detection** — automatically reshapes OCR window positions when
-  a second opponent appears or a boss plaque is detected by color.
-- **Calibration UI** — a debug mode lets you drag OCR capture windows to
-  fine-tune positions for your monitor and DPI scale.
+- **Embedded browser** — pokerogue.net runs inside a native window so the helper
+  panels sit alongside the game without Alt-Tabbing.
+- **Live state reading** — hooks into the Phaser scene via `runJavaScript` to
+  read the active Pokémon, party, moves, HP, types, and stat stages in real time.
+- **Opponent analysis** — shows type effectiveness, base stats, and an Impact
+  Score percentile for the wild/trainer Pokémon. Flags great catches and
+  recommends beneficial team swaps.
+- **Team management** — tracks your 6-Pokémon party with moves, HP bars, levels,
+  abilities, and natures. Surfaces coverage gaps, dangerous dual-type combos, and
+  matchup share per slot.
+- **Impact Score** — pre-computed offensive threat score for every final-evolution
+  Pokémon form, derived from their level-up learnset (sourced from the Pokerogue
+  repo), weighted by speed. Browseable via the Impact tab with filters for
+  legendaries, paradox Pokémon, and starters.
+- **Team score** — tracks your team's combined offensive coverage across all 171
+  type pairings; recommends which member to swap for any encountered wild Pokémon.
+- **Wave tracker** — displays current wave and upcoming boss / rival / Elite Four
+  milestones.
+- **Analysis tabs** — WEAKEST (matchup share ranking), TIPS (coverage gaps),
+  TYPING (preferred next type), DANGER (shared weaknesses), WEAKNESS (team
+  defensive holes).
 
 ## Requirements
 
 - **OS:** Windows 10/11
-- **Python:** 3.10 (other 3.x may work but the OCR wheel is pinned)
-- **Tesseract OCR:** install separately from
-  [UB-Mannheim/tesseract](https://github.com/UB-Mannheim/tesseract/wiki) — the
-  app auto-discovers it via the registry or common paths.
+- **Python:** 3.11+
 
 ## Install
 
 ```powershell
 # 1. Clone and enter the project
-git clone https://github.com/<your-username>/pokerogue-helper.git
+git clone https://github.com/billdbrown/pokerogue-helper.git
 cd pokerogue-helper
 
 # 2. Install Python dependencies
 pip install -r requirements.txt
-
-# 3. (Optional, faster OCR) Install the prebuilt tesserocr wheel for Python 3.10:
-pip install https://github.com/simonflueckiger/tesserocr-windows_build/releases/download/tesserocr-v2.10.0-tesseract-5.5.2/tesserocr-2.10.0-cp310-cp310-win_amd64.whl
-# pytesseract is used as a fallback if tesserocr isn't available.
 ```
 
 ## Run
@@ -54,8 +52,11 @@ pip install https://github.com/simonflueckiger/tesserocr-windows_build/releases/
 python main.py
 ```
 
-The first launch builds the base-stats cache in the background (~60s); after
-that it's instant.
+First launch builds two background caches:
+- **Stats cache** (~30s) — base stats for all Pokémon from PokéAPI
+- **Impact cache** (~3 min) — offensive threat scores for all final-evolution forms,
+  fetching level-up learnsets from the Pokerogue GitHub repo and move data from
+  PokéAPI. Cached to disk; subsequent launches load instantly.
 
 ## Building a distributable bundle
 
@@ -64,43 +65,43 @@ that it's instant.
 .\build.ps1 -Clean     # clean build
 ```
 
-Output: `dist\PokerogueHelper_v<version>\PokerogueHelper_v<version>.exe`. The
-script auto-bundles Tesseract from your local install so the end user doesn't
-need a separate install.
+Output: `dist\PokerogueHelper_v<version>\PokerogueHelper_v<version>.exe`.
 
 ## Project layout
 
 ```
 .
-├── main.py                  # entry point
-├── src/                     # all source modules
-│   ├── embedded_window.py   # 1600x900 main window, OCR wiring, UI state
-│   ├── overlay.py           # opponent analysis (name OCR → PokéAPI)
-│   ├── team_panel.py        # 6-slot team roster
-│   ├── wave_panel.py        # wave tracker + manual entry
-│   ├── ocr_service.py       # centralized Tesseract OCR worker
-│   ├── type_color_service.py# pixel-color sampling for type / boss detection
-│   ├── ui_state.py          # 1v1/2v2 + boss state model
-│   ├── box_positions.py     # OCR window position persistence
-│   ├── pokemon_api.py       # PokéAPI client + name normalization
-│   ├── weakness_calc.py     # type effectiveness math
-│   ├── stats_db.py          # background base-stat cache
-│   ├── tier_db.py           # Smogon tier data (graceful failure)
-│   ├── moves_db.py          # move data lookup
-│   ├── active_tracker.py    # active Pokémon detection per slot
-│   ├── analysis_panel.py    # team analytics tabs
-│   ├── capture_box.py       # draggable OCR capture overlays
-│   ├── ocr_debug_window.py  # debug view of OCR pipeline
-│   ├── tesseract_path.py    # auto-detect Tesseract install
-│   └── window_state.py      # JSON persistence for geometry / wave
+├── main.py                   # entry point
+├── src/
+│   ├── embedded_window.py    # main window; Phaser hook injection; navbar
+│   ├── js_state.py           # live battle state reader (JS → Python)
+│   ├── overlay.py            # opponent analysis panel
+│   ├── team_panel.py         # 6-slot team roster + move editor
+│   ├── analysis_panel.py     # tabbed analytics (WEAKEST/TIPS/TYPING/DANGER/WEAKNESS)
+│   ├── notification_panel.py # great-catch / swap recommendation cards
+│   ├── impact_db.py          # Impact Score cache build + runtime API
+│   ├── impact_table.py       # Impact Score browser dialog
+│   ├── wave_panel.py         # wave tracker
+│   ├── turn_order_panel.py   # turn order display
+│   ├── damage_calc.py        # damage calculation helpers
+│   ├── scoring.py            # type coverage scoring
+│   ├── pokemon_api.py        # PokéAPI client + caching
+│   ├── weakness_calc.py      # type effectiveness math
+│   ├── stats_db.py           # base-stat cache (stats_cache.json)
+│   ├── moves_db.py           # move data lookup
+│   ├── tier_db.py            # Smogon tier data (optional)
+│   ├── app_dirs.py           # cross-platform user data directory
+│   ├── window_state.py       # JSON persistence for geometry / team
+│   ├── ui_state.py           # 1v1/2v2 + boss state model
+│   └── turn_order.py         # turn order calculation
 ├── docs/
-│   └── CLAUDE.md            # architecture notes
-├── resources/               # icons and other bundled assets
+│   ├── CLAUDE.md             # architecture notes for Claude Code
+│   └── impact_score.md       # Impact Score methodology writeup
+├── resources/                # icons and bundled assets
 ├── requirements.txt
 ├── version.txt
-├── pokerogue_helper.spec    # PyInstaller config
-├── build.ps1                # build orchestrator (also bundles Tesseract)
-└── LICENSE                  # MIT
+├── pokerogue_helper.spec     # PyInstaller config
+└── build.ps1                 # build + Tesseract bundling script
 ```
 
 ## License

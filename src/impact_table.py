@@ -10,6 +10,30 @@ from PyQt6.QtGui import QColor
 import impact_db
 from scoring import OFFENSIVE_CHART
 
+# Final-evolution starters across all generations (including Hisuian forms)
+_STARTER_POKEMON: frozenset[str] = frozenset({
+    # Gen 1
+    "venusaur", "charizard", "blastoise",
+    # Gen 2
+    "meganium", "typhlosion", "feraligatr",
+    # Gen 3
+    "sceptile", "blaziken", "swampert",
+    # Gen 4
+    "torterra", "infernape", "empoleon",
+    # Gen 5
+    "serperior", "emboar", "samurott",
+    # Gen 6
+    "chesnaught", "delphox", "greninja",
+    # Gen 7
+    "decidueye", "incineroar", "primarina",
+    # Gen 8
+    "rillaboom", "cinderace", "inteleon",
+    # Gen 9
+    "meowscarada", "skeledirge", "quaquaval",
+    # Hisuian forms
+    "typhlosion-hisui", "samurott-hisui", "decidueye-hisui",
+})
+
 TYPE_COLORS = {
     "normal":   ("#A8A878", "#000"), "fire":     ("#F08030", "#fff"),
     "water":    ("#6890F0", "#fff"), "electric": ("#F8D030", "#000"),
@@ -56,9 +80,9 @@ _STYLE = """
 _SORTABLE = {
     0: ("rank",    True),
     1: ("display", True),
-    2: ("score",   False),
-    3: ("pct",     False),
-    4: ("impact",  False),
+    2: ("impact",   False),
+    3: ("pct",      False),
+    4: ("coverage", False),
     5: ("speed",   False),
 }
 
@@ -138,12 +162,18 @@ class ImpactTableDialog(QDialog):
         self._hide_leg = QCheckBox("Hide legendaries")
         self._hide_leg.toggled.connect(self._apply_filter)
         top.addWidget(self._hide_leg)
+        self._hide_paradox = QCheckBox("Hide paradox")
+        self._hide_paradox.toggled.connect(self._apply_filter)
+        top.addWidget(self._hide_paradox)
+        self._only_starters = QCheckBox("Starters only")
+        self._only_starters.toggled.connect(self._apply_filter)
+        top.addWidget(self._only_starters)
         layout.addLayout(top)
 
         self._table = QTableWidget()
         self._table.setColumnCount(8)
         self._table.setHorizontalHeaderLabels(
-            ["Rank", "Name", "Score", "%ile", "Impact", "Spd", "Types", "Moveset"]
+            ["Rank", "Name", "Impact", "%ile", "Coverage", "Spd", "Types", "Moveset"]
         )
         self._table.setSortingEnabled(False)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -183,7 +213,7 @@ class ImpactTableDialog(QDialog):
 
     def _load_data(self):
         entries = impact_db.all_entries()
-        sorted_entries = sorted(entries.items(), key=lambda x: x[1]["score"], reverse=True)
+        sorted_entries = sorted(entries.items(), key=lambda x: x[1]["impact"], reverse=True)
         self._all_rows = []
         for rank, (name, data) in enumerate(sorted_entries, 1):
             types = data.get("types", [])
@@ -195,12 +225,14 @@ class ImpactTableDialog(QDialog):
                 "rank":      rank,
                 "name":      name,
                 "display":   name.replace("-", " ").title(),
-                "score":     data["score"],
-                "impact":    data.get("impact", data["score"]),
+                "impact":    data["impact"],
+                "coverage":  data.get("coverage", data["impact"]),
                 "speed":     data.get("speed", 0),
                 "pct":       data["percentile"],
                 "types":     types,
                 "legendary": data.get("legendary", False),
+                "paradox":   data.get("paradox", False),
+                "starter":   name in _STARTER_POKEMON,
                 "stab_cov":  sorted(stab_cov),
                 "moves":     raw_moves,
             })
@@ -208,11 +240,15 @@ class ImpactTableDialog(QDialog):
 
     def _apply_filter(self):
         q = self._search.text().strip().lower()
-        hide_leg = self._hide_leg.isChecked()
+        hide_leg     = self._hide_leg.isChecked()
+        hide_paradox = self._hide_paradox.isChecked()
+        only_starters = self._only_starters.isChecked()
         rows = [
             r for r in self._all_rows
             if (not q or q in r["name"])
             and (not hide_leg or not r["legendary"])
+            and (not hide_paradox or not r["paradox"])
+            and (not only_starters or r["starter"])
         ]
         if self._sort_col in _SORTABLE:
             field, asc_default = _SORTABLE[self._sort_col]
@@ -254,7 +290,7 @@ class ImpactTableDialog(QDialog):
             self._table.setItem(i, 1, name_item)
 
             # Score
-            score_item = QTableWidgetItem(f"{row['score']:,.0f}")
+            score_item = QTableWidgetItem(f"{row['impact']:,.0f}")
             score_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
@@ -268,12 +304,12 @@ class ImpactTableDialog(QDialog):
             self._table.setItem(i, 3, pct_item)
 
             # Impact (raw, before speed weighting)
-            impact_item = QTableWidgetItem(f"{row['impact']:,.0f}")
+            impact_item = QTableWidgetItem(f"{row['coverage']:,.0f}")
             impact_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
             impact_item.setForeground(QColor("#6c7086"))
-            impact_item.setToolTip("Raw damage score before speed weighting")
+            impact_item.setToolTip("Raw type coverage score before speed weighting")
             self._table.setItem(i, 4, impact_item)
 
             # Speed

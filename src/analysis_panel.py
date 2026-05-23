@@ -135,8 +135,8 @@ class AnalysisPanel(QWidget):
             self._weak_link_area.addWidget(self._placeholder("Add Pokémon to see weakest link"))
             return
 
-        ranked = sorted(filled, key=lambda x: (x[1][3], x[1][2], x[1][1]))
-        for s, (bst, bst_pct, breadth, unique) in ranked:
+        ranked = sorted(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
+        for s, (bst, bst_pct, matchup, unique) in ranked:
             name = (team_names[s] or f"Slot {s + 1}").capitalize()
             is_weakest = s == weakest_slot
 
@@ -155,9 +155,10 @@ class AnalysisPanel(QWidget):
             stat_lbl = QLabel(f"{bst} {bst_pct}th%")
             stat_lbl.setStyleSheet(f"color:{pct_color}; font-size:18px;")
 
-            uniq_color = "#f38ba8" if unique == 0 and breadth > 0 else "#6c7086"
-            cov_lbl = QLabel(f"{breadth}t/{unique}u")
-            cov_lbl.setStyleSheet(f"color:{uniq_color}; font-size:18px;")
+            mu_pct = round(matchup / 171 * 100)
+            mu_color = "#a6e3a1" if mu_pct >= 20 else "#f9e2af" if mu_pct >= 10 else "#f38ba8"
+            cov_lbl = QLabel(f"{matchup}/171")
+            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px;")
 
             row.addWidget(warn)
             row.addWidget(name_lbl)

@@ -11,6 +11,7 @@ Cached to impact_cache.json in the user data dir.
 
 import json
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,7 +22,31 @@ from weakness_calc import ALL_TYPES, _effectiveness
 
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE = data_path("impact_cache.json")
-CACHE_VERSION = 5
+CACHE_VERSION = 11
+
+# Paradox Pokémon (Gen 9 Scarlet/Violet + DLC) — not flagged in PokéAPI
+_PARADOX_POKEMON: frozenset[str] = frozenset({
+    # Past paradox (Scarlet)
+    "great-tusk", "scream-tail", "brute-bonnet", "flutter-mane",
+    "slither-wing", "sandy-shocks", "roaring-moon",
+    "walking-wake", "gouging-fire", "raging-bolt",
+    # Future paradox (Violet)
+    "iron-treads", "iron-bundle", "iron-hands", "iron-jugulis",
+    "iron-moth", "iron-thorns", "iron-valiant",
+    "iron-leaves", "iron-boulder", "iron-crown",
+})
+
+# Damaging moves that hurt the user — excluded from scoring regardless of recoil field.
+# PokéAPI's drain field only covers %-of-damage recoil; these use fixed-HP or faint mechanics.
+_SELF_DAMAGING_MOVES: frozenset[str] = frozenset({
+    "mind-blown", "steel-beam", "chloroblast",  # lose 50% max HP
+    "explosion", "self-destruct", "final-gambit",  # user faints
+})
+
+_POKEROGUE_LEARNSET_URL = (
+    "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
+    "/src/data/balance/pokemon-level-moves.ts"
+)
 
 # All 171 unordered type pairings: 18 single + C(18,2)=153 dual
 ALL_PAIRINGS: list[tuple[str, ...]] = []
@@ -60,7 +85,7 @@ def get(name: str) -> dict | None:
 def top_n(n: int = 20, exclude_legendary: bool = False) -> list[tuple[str, float]]:
     with _lock:
         items = [
-            (name, v["score"]) for name, v in _db.items()
+            (name, v["impact"]) for name, v in _db.items()
             if not (exclude_legendary and v.get("legendary"))
         ]
     items.sort(key=lambda x: x[1], reverse=True)
@@ -70,7 +95,7 @@ def top_n(n: int = 20, exclude_legendary: bool = False) -> list[tuple[str, float
 def impact_percentile(score: float, exclude_legendary: bool = False) -> int:
     with _lock:
         values = [
-            v["score"] for v in _db.values()
+            v["impact"] for v in _db.values()
             if not (exclude_legendary and v.get("legendary"))
         ]
     if not values:
@@ -226,6 +251,35 @@ def _is_legendary(species: str, form: str, legendary_set: set[str]) -> bool:
     return False
 
 
+# ── Pokerogue learnset ────────────────────────────────────────────────────────
+
+def _fetch_pokerogue_learnset() -> dict[str, set[str]]:
+    """Parse Pokerogue's level-up learnset TS file into {species_slug: {move_slug}}.
+
+    Converts SpeciesId.MR_MIME → 'mr-mime' and MoveId.THUNDER_PUNCH → 'thunder-punch'.
+    All three level-tag types (numeric level, EVOLVE_MOVE, RELEARN_MOVE) are included —
+    the user asked for the full level-up source, not TMs or egg moves.
+    """
+    r = requests.get(_POKEROGUE_LEARNSET_URL, timeout=30)
+    r.raise_for_status()
+
+    learnset: dict[str, set[str]] = {}
+    current: str | None = None
+
+    for line in r.text.splitlines():
+        sm = re.search(r'\[SpeciesId\.(\w+)\]', line)
+        if sm:
+            current = sm.group(1).lower().replace("_", "-")
+            learnset.setdefault(current, set())
+        if current:
+            for mm in re.finditer(r'MoveId\.(\w+)', line):
+                slug = mm.group(1).lower().replace("_", "-")
+                if slug != "none":
+                    learnset[current].add(slug)
+
+    return learnset
+
+
 # ── cache build ───────────────────────────────────────────────────────────────
 
 def _build_or_load(on_progress, on_ready):
@@ -311,6 +365,23 @@ def _build_or_load(on_progress, on_ready):
             if completed % 100 == 0:
                 _prog(on_progress, f"Fetching pokemon data… {completed}/{len(all_forms)}")
 
+    # Step 3.5: fetch Pokerogue level-up learnset and filter move lists
+    _prog(on_progress, "Fetching Pokerogue level-up learnsets…")
+    try:
+        pokerogue_learnset = _fetch_pokerogue_learnset()
+        _prog(on_progress, f"Learnset loaded — {len(pokerogue_learnset)} species entries.")
+        filtered = 0
+        for form, pd in pokemon_data.items():
+            species = pd.get("species", form)
+            allowed = pokerogue_learnset.get(species) or pokerogue_learnset.get(form)
+            if allowed is not None:
+                before = len(pd["move_names"])
+                pd["move_names"] = [m for m in pd["move_names"] if m in allowed]
+                filtered += before - len(pd["move_names"])
+        _prog(on_progress, f"Filtered {filtered} non-level-up moves from learnsets.")
+    except Exception as e:
+        _prog(on_progress, f"Warning: could not fetch Pokerogue learnset ({e}) — using full PokéAPI movesets.")
+
     # Step 4: collect unique move names and fetch details
     all_move_names: set[str] = set()
     for pd in pokemon_data.values():
@@ -331,6 +402,7 @@ def _build_or_load(on_progress, on_ready):
                 "power": d["power"],
                 "accuracy": d["accuracy"],
                 "category": d["damage_class"]["name"],
+                "drain": (d.get("meta") or {}).get("drain") or 0,
             }
         except Exception:
             return move_name, None
@@ -355,15 +427,19 @@ def _build_or_load(on_progress, on_ready):
         atk    = pd["stats"].get("attack", 0)
         sp_atk = pd["stats"].get("special-attack", 0)
         speed  = pd["stats"].get("speed", 0)
-        moves  = [move_cache[mn] for mn in pd["move_names"] if move_cache.get(mn)]
+        moves  = [move_cache[mn] for mn in pd["move_names"]
+                  if move_cache.get(mn)
+                  and (move_cache[mn].get("drain") or 0) >= 0
+                  and mn not in _SELF_DAMAGING_MOVES]
         impact, selected = _compute_score(pd["types"], atk, sp_atk, moves)
         db[form] = {
-            "impact":  impact,
+            "coverage": impact,
             "atk":     atk,
             "sp_atk":  sp_atk,
             "speed":   speed,
             "types":   pd["types"],
             "legendary": _is_legendary(pd.get("species", form), form, legendary_set),
+            "paradox":   form in _PARADOX_POKEMON,
             "moves": [
                 {
                     "name":     m["name"],
@@ -383,18 +459,18 @@ def _build_or_load(on_progress, on_ready):
         sp = entry["speed"]
         entry["speed_pct"] = round(sum(1 for x in all_speeds if x < sp) / n * 100)
 
-    _SPEED_THRESHOLD = 30  # percentile below which a penalty applies
+    _SPEED_THRESHOLD = 50  # percentile below which a penalty applies
     for entry in db.values():
         sp = entry["speed_pct"]
         if sp >= _SPEED_THRESHOLD:
             factor = 1.0
         else:
-            factor = 0.75 + 0.25 * (sp / _SPEED_THRESHOLD)
-        entry["score"] = entry["impact"] * factor
+            factor = 0.6 + 0.4 * (sp / _SPEED_THRESHOLD)
+        entry["impact"] = entry["coverage"] * factor
 
-    all_scores = [v["score"] for v in db.values()]
+    all_scores = [v["impact"] for v in db.values()]
     for entry in db.values():
-        s = entry["score"]
+        s = entry["impact"]
         entry["percentile"] = round(sum(1 for x in all_scores if x < s) / n * 100)
 
     _prog(on_progress, "Saving impact cache…")

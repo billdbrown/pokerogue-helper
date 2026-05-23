@@ -20,9 +20,35 @@ from weakness_calc import (
 from overlay import _resolve_name, _FORM_VARIANTS, _SLUG_TO_BASE
 import stats_db
 import moves_db
+import impact_db
 
 TEAM_SIZE  = 6
 MOVE_SLOTS = 4
+_TOTAL_PAIRINGS = 171
+
+
+def _moves_pairing_vector(pokemon, moves: list) -> dict:
+    """Per-pairing best SE damage using the player's actual equipped moves."""
+    if not impact_db.is_ready():
+        return {}
+    atk    = pokemon.stats.get("attack", 0)
+    sp_atk = pokemon.stats.get("special-attack", 0)
+    types  = pokemon.types
+    result: dict = {}
+    for move in moves:
+        if move is None or not move.power or move.category == "status":
+            continue
+        stat = atk if move.category == "physical" else sp_atk
+        stab = 1.5 if move.type in types else 1.0
+        acc  = (move.accuracy or 100) / 100.0
+        base = stat * move.power * acc * stab
+        for pairing in impact_db.ALL_PAIRINGS:
+            se = impact_db._EFF.get((move.type, pairing), 0.0)
+            if se > 1.0:
+                val = base * se
+                if val > result.get(pairing, 0.0):
+                    result[pairing] = val
+    return result
 
 TYPE_COLORS = {
     "normal":   ("#A8A878", "#000"),
@@ -114,7 +140,8 @@ class TeamPanel(QWidget):
         self._team_moves      = [[None] * MOVE_SLOTS for _ in range(TEAM_SIZE)]
         self._drag_pos        = None
 
-        self._name_inputs    = [None] * TEAM_SIZE
+        self._name_lbls      = [None] * TEAM_SIZE
+        self._matchup_lbls   = [None] * TEAM_SIZE
         self._type_rows      = [None] * TEAM_SIZE
         self._stats_lbls     = [None] * TEAM_SIZE
         self._ability_lbls   = [None] * TEAM_SIZE
@@ -687,10 +714,6 @@ class TeamPanel(QWidget):
         header = QHBoxLayout()
         header.setSpacing(3)
 
-        num_lbl = QLabel(f"{slot + 1}:")
-        num_lbl.setFixedWidth(14)
-        num_lbl.setStyleSheet("color:#6c7086; font-size:12px; font-weight:bold;")
-
         level_lbl = QLabel("")
         level_lbl.setStyleSheet("color:#89b4fa; font-size:14px;")
         level_lbl.setFixedWidth(44)
@@ -706,16 +729,17 @@ class TeamPanel(QWidget):
         type_layout.setSpacing(3)
         self._type_rows[slot] = type_layout
 
-        inp = QLineEdit()
-        inp.setPlaceholderText("pokemon…")
-        inp.setMinimumWidth(0)
-        inp.setStyleSheet(
-            "QLineEdit{background:#313244;color:#cdd6f4;border:1px solid #45475a;"
-            "border-radius:4px;padding:1px 5px;font-size:16px;}"
-            "QLineEdit:focus{border:1px solid #89b4fa;}"
-        )
-        inp.returnPressed.connect(lambda s=slot: self._lookup_from_input(s))
-        self._name_inputs[slot] = inp
+        name_lbl = QLabel("pokemon…")
+        name_lbl.setMinimumWidth(0)
+        name_lbl.setStyleSheet("color:#45475a; font-size:16px;")
+        self._name_lbls[slot] = name_lbl
+
+        matchup_lbl = QLabel("")
+        matchup_lbl.setTextFormat(Qt.TextFormat.RichText)
+        matchup_lbl.setStyleSheet("font-size:11px;")
+        matchup_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        matchup_lbl.setVisible(False)
+        self._matchup_lbls[slot] = matchup_lbl
 
         clear_btn = QPushButton("✕")
         clear_btn.setFixedSize(13, 13)
@@ -725,10 +749,10 @@ class TeamPanel(QWidget):
         )
         clear_btn.clicked.connect(lambda _, s=slot: self._clear_slot(s))
 
-        header.addWidget(num_lbl)
         header.addWidget(level_lbl)
         header.addWidget(type_container)
-        header.addWidget(inp, 1)
+        header.addWidget(name_lbl, 1)
+        header.addWidget(matchup_lbl)
         header.addWidget(clear_btn)
         layout.addLayout(header)
 
@@ -869,11 +893,6 @@ class TeamPanel(QWidget):
 
     # ── Pokemon lookup ────────────────────────────────────────────────────────
 
-    def _lookup_from_input(self, slot: int):
-        name = self._name_inputs[slot].text().strip().lower()
-        if name:
-            threading.Thread(target=self._lookup, args=(slot, name), daemon=True).start()
-
     def _lookup(self, slot: int, name: str):
         try:
             pokemon = None
@@ -949,7 +968,12 @@ class TeamPanel(QWidget):
         self._team_data[slot]       = None
         self._team_weaknesses[slot] = None
         self._team_moves[slot]      = [None] * MOVE_SLOTS
-        self._name_inputs[slot].clear()
+        lbl = self._name_lbls[slot]
+        if lbl is not None:
+            lbl.setText("pokemon…")
+            lbl.setStyleSheet("color:#45475a; font-size:16px;")
+        if self._matchup_lbls[slot] is not None:
+            self._matchup_lbls[slot].setVisible(False)
         self._clear_type_badges(slot)
         for mi in range(MOVE_SLOTS):
             self._reset_move_row(slot, mi)
@@ -1019,7 +1043,10 @@ class TeamPanel(QWidget):
         self._pending_lookup_names.pop(slot, None)
         self._team_data[slot]       = pokemon
         self._team_weaknesses[slot] = weaknesses
-        self._name_inputs[slot].setText(pokemon.name)
+        lbl = self._name_lbls[slot]
+        if lbl is not None:
+            lbl.setText(pokemon.name.capitalize())
+            lbl.setStyleSheet("color:#cdd6f4; font-size:16px; font-weight:bold;")
         self._clear_type_badges(slot)
         for t in pokemon.types:
             self._type_rows[slot].addWidget(self._make_type_badge(t))
@@ -1159,6 +1186,7 @@ class TeamPanel(QWidget):
             [m.type for m in self._team_moves[s] if m is not None and m.category != "status"]
             for s in range(TEAM_SIZE)
         ]
+        team_moves = [list(self._team_moves[s]) for s in range(TEAM_SIZE)]
         if not any(d is not None for d in self._team_data):
             empty = [None] * TEAM_SIZE
             self._signals.analysis_ready.emit(
@@ -1168,11 +1196,11 @@ class TeamPanel(QWidget):
             return
         threading.Thread(
             target=self._compute_analysis,
-            args=(move_types_by_slot, list(self._team_data), list(self._team_weaknesses)),
+            args=(move_types_by_slot, team_moves, list(self._team_data), list(self._team_weaknesses)),
             daemon=True,
         ).start()
 
-    def _compute_analysis(self, move_types_by_slot: list, team_data: list, team_weaknesses: list):
+    def _compute_analysis(self, move_types_by_slot: list, team_moves: list, team_data: list, team_weaknesses: list):
         try:
             all_move_types = [t for slot in move_types_by_slot for t in slot]
 
@@ -1190,6 +1218,24 @@ class TeamPanel(QWidget):
                 full = partial = gaps = suggestions = danger = None
                 pref_type = []
 
+            # Matchup share: for each of the 171 type pairings, which slot's
+            # actual equipped moves deal the most SE damage?
+            slot_pvs = [
+                _moves_pairing_vector(pokemon, team_moves[s]) if pokemon else {}
+                for s, pokemon in enumerate(team_data)
+            ]
+            matchup_counts = [0] * TEAM_SIZE
+            unique_counts  = [0] * TEAM_SIZE
+            if impact_db.is_ready():
+                for pairing in impact_db.ALL_PAIRINGS:
+                    covered = [(s, pv[pairing]) for s, pv in enumerate(slot_pvs) if pairing in pv]
+                    if not covered:
+                        continue
+                    if len(covered) == 1:
+                        unique_counts[covered[0][0]] += 1
+                    winner = max(covered, key=lambda x: x[1])[0]
+                    matchup_counts[winner] += 1
+
             slot_stats = []
             for s, pokemon in enumerate(team_data):
                 if pokemon is None:
@@ -1197,15 +1243,12 @@ class TeamPanel(QWidget):
                     continue
                 bst     = sum(pokemon.stats.values())
                 bst_pct = stats_db.bst_percentile(bst)
-                my_types    = move_types_by_slot[s]
-                other_types = [t for i, st in enumerate(move_types_by_slot) if i != s for t in st]
-                breadth, unique = slot_coverage(my_types, other_types)
-                slot_stats.append((bst, bst_pct, breadth, unique))
+                slot_stats.append((bst, bst_pct, matchup_counts[s], unique_counts[s]))
 
             filled = [(s, st) for s, st in enumerate(slot_stats) if st is not None]
             weakest_slot = replace_sugg = None
             if filled:
-                weakest_slot, _ = min(filled, key=lambda x: (x[1][3], x[1][2], x[1][1]))
+                weakest_slot, _ = min(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
                 other_types = [t for s, st in enumerate(move_types_by_slot) if s != weakest_slot for t in st]
                 if other_types:
                     _, _, weakest_gaps = detailed_coverage(other_types)
@@ -1285,24 +1328,30 @@ class TeamPanel(QWidget):
 
     def _update_slot_stats(self, slot_stats: list):
         for s, stat in enumerate(slot_stats):
-            lbl = self._stats_lbls[s]
-            if lbl is None:
-                continue
+            mu_lbl = self._matchup_lbls[s]
+            stats_lbl = self._stats_lbls[s]
             if stat is None:
-                lbl.setVisible(False)
+                if mu_lbl is not None:
+                    mu_lbl.setVisible(False)
+                if stats_lbl is not None:
+                    stats_lbl.setVisible(False)
                 continue
-            bst, bst_pct, breadth, unique = stat
-            pct_color  = "#a6e3a1" if bst_pct >= 66 else "#f9e2af" if bst_pct >= 33 else "#f38ba8"
-            uniq_color = "#f38ba8" if unique == 0 and breadth > 0 else "#6c7086"
-            lbl.setText(
-                f'<span style="color:#6c7086">BST </span>'
-                f'<span style="color:#a6adc8">{bst}</span>'
-                f'<span style="color:{pct_color}"> {bst_pct}th%</span>'
-                f'<span style="color:#313244"> · </span>'
-                f'<span style="color:#6c7086">{breadth} types · </span>'
-                f'<span style="color:{uniq_color}">{unique} unique</span>'
-            )
-            lbl.setVisible(True)
+            bst, bst_pct, matchup, unique = stat
+            mu_pct = round(matchup / _TOTAL_PAIRINGS * 100)
+            mu_color = "#a6e3a1" if mu_pct >= 20 else "#f9e2af" if mu_pct >= 10 else "#f38ba8"
+            if mu_lbl is not None:
+                mu_lbl.setText(
+                    f"<span style='color:{mu_color}'>{matchup}/{_TOTAL_PAIRINGS}</span>"
+                )
+                mu_lbl.setVisible(True)
+            if stats_lbl is not None:
+                pct_color = "#a6e3a1" if bst_pct >= 66 else "#f9e2af" if bst_pct >= 33 else "#f38ba8"
+                stats_lbl.setText(
+                    f'<span style="color:#6c7086">BST </span>'
+                    f'<span style="color:#a6adc8">{bst}</span>'
+                    f'<span style="color:{pct_color}"> {bst_pct}th%</span>'
+                )
+                stats_lbl.setVisible(True)
 
     def _rebuild_weakest_link(self, slot_stats: list, weakest_slot, replace_sugg):
         self._clear_layout(self._weak_link_area)
@@ -1311,8 +1360,8 @@ class TeamPanel(QWidget):
             self._weak_link_area.addWidget(self._placeholder("Add Pokemon to see weakest link"))
             return
 
-        ranked = sorted(filled, key=lambda x: (x[1][3], x[1][2], x[1][1]))
-        for s, (bst, bst_pct, breadth, unique) in ranked:
+        ranked = sorted(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
+        for s, (bst, bst_pct, matchup, unique) in ranked:
             pokemon    = self._team_data[s]
             name       = pokemon.name.capitalize() if pokemon else f"Slot {s + 1}"
             is_weakest = s == weakest_slot
@@ -1332,9 +1381,10 @@ class TeamPanel(QWidget):
             stat_lbl  = QLabel(f"{bst} {bst_pct}th%")
             stat_lbl.setStyleSheet(f"color:{pct_color}; font-size:12px;")
 
-            uniq_color = "#f38ba8" if unique == 0 and breadth > 0 else "#6c7086"
-            cov_lbl    = QLabel(f"{breadth}t/{unique}u")
-            cov_lbl.setStyleSheet(f"color:{uniq_color}; font-size:12px;")
+            mu_pct = round(matchup / _TOTAL_PAIRINGS * 100)
+            mu_color = "#a6e3a1" if mu_pct >= 20 else "#f9e2af" if mu_pct >= 10 else "#f38ba8"
+            cov_lbl = QLabel(f"{matchup}/{_TOTAL_PAIRINGS}")
+            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:12px;")
 
             row.addWidget(warn)
             row.addWidget(name_lbl)
@@ -1460,22 +1510,24 @@ class TeamPanel(QWidget):
     def _update_avg_lbl(self):
         if self._avg_lbl is None:
             return
-        bsts = [sum(p.stats.values()) for p in self._team_data if p is not None]
-        if not bsts:
+        names = [p.name.lower() for p in self._team_data if p is not None]
+        if not names or not impact_db.is_ready():
             self._avg_lbl.setText("")
             return
-        avg = int(sum(bsts) / len(bsts))
-        if stats_db.is_ready():
-            pct = stats_db.bst_percentile(avg)
-            color = "#a6e3a1" if pct >= 75 else "#f9e2af" if pct >= 50 else "#fab387" if pct >= 25 else "#f38ba8"
-            self._avg_lbl.setText(
-                f"<span style='color:#6c7086'>avg </span>"
-                f"<span style='color:#a6adc8'>{avg}</span>"
-                f"<span style='color:{color}'> {pct}th%</span>"
-            )
+        score = impact_db.team_score(names)
+        if score <= 0:
+            self._avg_lbl.setText("")
+            return
+        if score >= 1_000_000:
+            score_str = f"{score / 1_000_000:.1f}M"
+        elif score >= 1_000:
+            score_str = f"{score / 1_000:.0f}k"
         else:
-            self._avg_lbl.setText(f"<span style='color:#6c7086'>avg </span>"
-                                   f"<span style='color:#a6adc8'>{avg}</span>")
+            score_str = f"{score:.0f}"
+        self._avg_lbl.setText(
+            f"<span style='color:#6c7086'>impact </span>"
+            f"<span style='color:#a6e3a1'>{score_str}</span>"
+        )
 
     # ── persistence ───────────────────────────────────────────────────────────
 

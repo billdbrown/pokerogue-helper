@@ -1,74 +1,105 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with this repository.
 
 ## Running the Application
 
-```bash
-# Install dependencies
+```powershell
 pip install -r requirements.txt
-
-# Run the app (1600x900 single window with built-in browser)
 python main.py
 ```
 
-There is no build step, test suite, or linter. This is a single-developer desktop tool; run it directly to verify changes.
+No build step, test suite, or linter. Run directly to verify changes.
 
 ## Architecture
 
-**`main.py`** → **`embedded_window.py`** — unified 1600×900 window with a left sidebar (wave/opponent/team panels) and a QtWebEngine view loading pokerogue.net on the right.
+**`main.py`** → **`embedded_window.py`** — a 1600×900 window with a left sidebar
+(wave / opponent / team / analysis panels) and a QtWebEngine view loading
+pokerogue.net on the right.
 
-### Core data flow (opponent analysis)
+### State reading — no OCR
 
-1. `CaptureBox` (`capture_box.py`) — frameless drag-to-position overlay; defines the screen region to OCR.
-2. `OverlayPanel` (`overlay.py`) — polls every ~500ms; captures that region with `mss`, **inverts the image** (white-on-dark → dark-on-white for Tesseract), runs `pytesseract` with `--psm 8 --oem 3`, fuzzy-matches the result against `stats_db.all_names()`.
-3. `pokemon_api.py` — fetches types, stats, moves from PokéAPI; caches in-memory dicts.
-4. `weakness_calc.py` — computes type effectiveness multipliers; provides full/partial coverage, gap analysis, dangerous dual-type combos.
-5. Results are rendered back into the overlay/team/analysis panels.
+The project reads live game state by injecting JavaScript into the QtWebEngine
+page. A `Function.prototype.bind` hook in `embedded_window._inject_phaser_capture`
+captures the Phaser game reference and stores it as `window.__pokerogue_game__`.
+`js_state.py` then polls `window.__pokerogue_game__` via `runJavaScript` every
+~500ms, extracting battle state (active Pokémon, party, moves, HP, types, stat
+stages) and emitting Python signals when anything changes.
+
+All OCR code has been removed. Tesseract is no longer used for state reading
+(it may still be bundled in the distributable for legacy reasons).
+
+### Core data flow
+
+```
+embedded_window._inject_phaser_capture()   # bind-hook on page load
+    └── js_state.JSStateReader (QTimer)    # polls every 500ms
+            ├── overlay.OverlayPanel       # opponent name → PokéAPI → analysis
+            ├── team_panel.TeamPanel       # party sync → moves → analysis
+            └── wave_panel                # wave number display
+```
 
 ### Module responsibilities
 
 | File | Purpose |
-|---|---|
-| `pokemon_api.py` | PokéAPI REST client; name normalization (e.g. "Alolan Raichu" → "raichu-alola"); caching |
-| `weakness_calc.py` | Type matchup math; `detailed_coverage()`, `dangerous_combos()`, `coverage_suggestions()` |
-| `stats_db.py` | Background-thread cache of all Pokémon base stats (`stats_cache.json`); percentile helpers |
-| `tier_db.py` | Smogon tier data from formats-data.ts → `tier_cache.json`; optional/graceful failure |
-| `team_panel.py` | 6-slot team roster; per-Pokémon move editor; team-wide weakness grid |
-| `wave_panel.py` | Wave counter OCR; upcoming boss schedule display |
-| `analysis_panel.py` | Tabbed analytics for embedded mode (WEAKEST / TIPS / TYPING / DANGER / WEAKNESS) |
-| `window_state.py` | JSON persistence for window geometry keyed by `box1`, `box2`, `panel`, etc. |
+|------|---------|
+| `embedded_window.py` | Main window; Phaser hook injection; navbar buttons |
+| `js_state.py` | JS extractor; emits signals on state change |
+| `overlay.py` | Opponent analysis: PokéAPI lookup, Impact Score display, recommendations |
+| `team_panel.py` | 6-slot party tracker; move editor; matchup share calculation |
+| `analysis_panel.py` | Tabbed analytics panel (embedded mode) |
+| `notification_panel.py` | Great-catch / swap recommendation cards |
+| `impact_db.py` | Impact Score: cache build, runtime API (`get`, `team_score`, `best_swap`, `pairing_vector`) |
+| `impact_table.py` | Impact Score browser dialog (searchable, sortable, filterable) |
+| `pokemon_api.py` | PokéAPI REST client; in-memory caching; name normalization |
+| `weakness_calc.py` | Type effectiveness math; coverage/gap analysis |
+| `stats_db.py` | Background base-stat cache (`stats_cache.json`) |
+| `moves_db.py` | Move name/data lookup |
+| `tier_db.py` | Smogon tier data; optional, graceful failure |
+| `app_dirs.py` | Cross-platform user data directory (`%LOCALAPPDATA%/PokerogueHelper`) |
+| `scoring.py` | Offensive type coverage chart |
+| `damage_calc.py` | Damage calculation helpers |
+| `turn_order.py` / `turn_order_panel.py` | Turn order prediction |
+| `window_state.py` | JSON persistence for geometry, team, wave |
+| `ui_state.py` | 1v1/2v2 + boss state model |
 
-## Platform-Specific Requirements
+## Impact Score System
 
-### Tesseract path (hardcoded)
+See `docs/impact_score.md` for full methodology. Key points:
 
-`overlay.py` and `wave_panel.py` both set:
-```python
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-```
-If Tesseract is installed elsewhere, update both files. Tesseract must be installed separately.
-
-### DPI scaling
-
-`mss` requires physical pixels; Qt reports logical pixels. All capture coordinates must be multiplied by `QApplication.primaryScreen().devicePixelRatio()` before passing to mss.
-
-### OCR inversion
-
-Pokerogue uses white text on dark backgrounds. All captured images must be inverted before OCR:
-```python
-inverted = ImageOps.invert(image.convert('L'))
-```
-
-### QtWebEngine sandbox (embedded mode)
-
-`embedded_app.py` disables the Chromium sandbox for Windows compatibility via environment variables set before Qt initializes.
+- **Coverage**: raw SE damage sum across all 171 type pairings from optimal 4-move selection
+- **Impact**: coverage × speed factor (penalty below p50 speed, minimum ×0.6)
+- **Learnset**: level-up moves only, sourced from Pokerogue's GitHub repo
+  (`src/data/balance/pokemon-level-moves.ts`). Recoil moves and self-damaging
+  moves (Mind Blown, Explosion, etc.) are excluded.
+- **Cache**: `impact_cache.json` in the user data dir. `CACHE_VERSION` in
+  `impact_db.py` must be bumped whenever the schema or scoring methodology changes.
+- **Rebuild**: run `python src/impact_db.py` standalone (~3 min, fetches from
+  PokéAPI and Pokerogue repo).
 
 ## Threading Model
 
-Background work uses `threading.Thread(daemon=True)`. Results are passed back to the Qt main thread via custom `QObject` subclasses (`_Signals`) emitting `pyqtSignal`. Never update Qt widgets directly from worker threads.
+Background work uses `threading.Thread(daemon=True)`. Results are passed to the
+Qt main thread via `QObject` subclasses (`_Signals`) emitting `pyqtSignal`. Never
+update Qt widgets directly from worker threads.
 
 ## Caching Strategy
 
-- **In-memory:** API responses cached in module-level dicts (`_pokemon_cache`, `_type_cache`, etc.) — cleared on restart.
-- **On-disk:** `stats_cache.json` (all Pokémon stats, built in background on first run ~60s), `tier_cache.json` (Smogon tiers). Both include a version field; corrupted caches are rebuilt automatically.
+| Cache | Location | Built by |
+|-------|----------|---------|
+| `stats_cache.json` | user data dir | `stats_db` on first run (~30s) |
+| `impact_cache.json` | user data dir | `impact_db` on first run (~3 min) |
+| API responses | in-memory dicts | `pokemon_api` per session |
+
+Both on-disk caches include a `_version` field. A version mismatch triggers an
+automatic background rebuild.
+
+## Key Invariants
+
+- `impact_db._EFF` must be warmed (via `_build_effectiveness_table()`) on both
+  the cache-load path and the cache-build path — it's used at runtime by
+  `pairing_vector()` and `team_score()`.
+- `team_panel._moves_pairing_vector()` uses the player's actual equipped moves
+  (not the impact cache's theoretical optimal set) for matchup share calculation.
+- Mega evolutions, GMax forms, and Totem forms are excluded from the impact cache.
+  Paradox Pokémon are included but flagged (`paradox: true`).

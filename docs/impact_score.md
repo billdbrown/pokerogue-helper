@@ -81,16 +81,16 @@ Raw Impact Score captures offensive power but ignores turn order. A faster Poké
 Speed is folded in as a soft floor penalty. Pokémon above the 30th speed percentile are unaffected; those below it receive a graduated penalty:
 
 ```
-speed_factor = 1.0                              if speed_pct >= 30
-speed_factor = 0.75 + 0.25 × (speed_pct / 30)  if speed_pct < 30
+speed_factor = 1.0                              if speed_pct >= 50
+speed_factor = 0.6 + 0.4 × (speed_pct / 50)    if speed_pct < 50
 
 Combined Score = Impact Score × speed_factor
 ```
 
 - Speed percentile is computed among all scored forms (0–100)
-- Pokémon at or above p30 speed suffer **no penalty** — score equals raw impact
-- Pokémon below p30 speed receive a penalty ranging from ×0.75 (slowest) to ×1.0 (p30)
-- The maximum penalty is 25%, meaning even the slowest Pokémon retains 75% of its impact score
+- Pokémon at or above p50 speed suffer **no penalty** — score equals raw impact
+- Pokémon below p50 speed receive a penalty ranging from ×0.6 (slowest) to ×1.0 (p50)
+- The maximum penalty is 40%, meaning even the slowest Pokémon retains 60% of its impact score
 
 Rationale: in practice you want to avoid Pokémon so slow they're KO'd before acting, but beyond a reasonable speed baseline extra speed matters far less than raw power. The score is always ≤ the raw impact — speed cannot inflate a Pokémon's ranking above what its offensive coverage earns.
 

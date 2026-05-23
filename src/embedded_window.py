@@ -7,9 +7,9 @@
   │              │        pokerogue.net               │
   ├──────────────┤        (Phaser canvas)             │
   │ Analysis     │                                    │
-  ├──────────────┴────────────────────────────────────┤
-  │ Team (6 slots)                                    │
-  └───────────────────────────────────────────────────┘
+  │ (fills down) ├────────────────────────────────────┤
+  │              │  Team (6 slots)                    │
+  └──────────────┴────────────────────────────────────┘
 
 All battle state comes from JSStateService, which polls the live Phaser scene
 via runJavaScript every 300ms. The Function.prototype.bind hook in
@@ -202,7 +202,7 @@ class EmbeddedMainWindow(QMainWindow):
 
         title_hl.addStretch()
 
-        # ── Left panel: title + enemy (fills remaining space) + analysis (natural height) ──
+        # ── Left panel: title + enemy (fills remaining space) + analysis (fills down) ──
         left_panel = QWidget()
         left_panel.setFixedWidth(_LEFT_WIDTH)
         left_panel.setStyleSheet("QWidget { background: #181825; }")
@@ -211,9 +211,9 @@ class EmbeddedMainWindow(QMainWindow):
         left_vl.setSpacing(0)
         left_vl.addWidget(title_bar)
         left_vl.addWidget(self._enemy, 1)
-        left_vl.addWidget(self._analysis, 0)
+        left_vl.addWidget(self._analysis, 1)
 
-        # ── Right panel: navbar + browser ────────────────────────────────
+        # ── Right panel: navbar + browser + team ─────────────────────────
         right_panel = QWidget()
         right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_vl = QVBoxLayout(right_panel)
@@ -221,26 +221,16 @@ class EmbeddedMainWindow(QMainWindow):
         right_vl.setSpacing(0)
         right_vl.addWidget(self._build_navbar())
         right_vl.addWidget(self._web, 1)
-
-        # ── Top section: left panel + right panel ─────────────────────────
-        top = QWidget()
-        top.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        top_hl = QHBoxLayout(top)
-        top_hl.setContentsMargins(0, 0, 0, 0)
-        top_hl.setSpacing(0)
-        top_hl.addWidget(left_panel)
-        top_hl.addWidget(right_panel, 1)
-
-        # ── Team strip (full width at bottom) ────────────────────────────
         self._team.setFixedHeight(_TEAM_H)
+        right_vl.addWidget(self._team)
 
-        # ── Central widget ────────────────────────────────────────────────
+        # ── Central widget: left panel + right panel ──────────────────────
         central = QWidget()
-        cv = QVBoxLayout(central)
-        cv.setContentsMargins(0, 0, 0, 0)
-        cv.setSpacing(0)
-        cv.addWidget(top, 1)
-        cv.addWidget(self._team)
+        ch = QHBoxLayout(central)
+        ch.setContentsMargins(0, 0, 0, 0)
+        ch.setSpacing(0)
+        ch.addWidget(left_panel)
+        ch.addWidget(right_panel, 1)
         self.setCentralWidget(central)
 
         # ── Impact score browser ─────────────────────────────────────────
