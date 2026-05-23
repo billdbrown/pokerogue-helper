@@ -55,7 +55,11 @@ from wave_panel import WavePanel
 from analysis_panel import AnalysisPanel
 from turn_order import make_fighter
 from turn_order_panel import TurnOrderPanel
+from notification_panel import NotificationPanel
 from js_state import JSStateService
+
+# Waves at which rival battles occur in Classic mode.
+_RIVAL_WAVES = [25, 55, 95, 145, 182]
 
 
 _LEFT_WIDTH = 390
@@ -114,6 +118,11 @@ class SettingsDialog(QDialog):
         self._weak_check.setChecked(False)
         self._weak_check.toggled.connect(self._enemy.set_weaknesses_visible)
         layout.addWidget(self._weak_check)
+
+        self._moves_check = QCheckBox("Show enemy moves")
+        self._moves_check.setChecked(False)
+        self._moves_check.toggled.connect(self._enemy.set_moves_visible)
+        layout.addWidget(self._moves_check)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btns.rejected.connect(self.hide)
@@ -245,6 +254,10 @@ class EmbeddedMainWindow(QMainWindow):
 
         # ── Turn-order slide-out (anchors to web-view top-left) ──────────
         self._turn_order_panel = TurnOrderPanel(self._web)
+
+        # ── Rival warning banner (slides down from web-view top) ──────────
+        self._notif_panel = NotificationPanel(self._web)
+        self._prev_wave: int | None = None
 
         # Focus the web view on launch so keyboard input goes straight to the game.
         QTimer.singleShot(800, self._web.setFocus)
@@ -427,10 +440,14 @@ class EmbeddedMainWindow(QMainWindow):
         wave = snap.get('wave')
         if wave is not None:
             self._wave.receive_wave_text(str(wave))
+            self._check_rival_warning(wave)
+            self._prev_wave = wave
 
         # Pre-populate the full team (all 6 slots) — HP, level, types, abilities,
         # moves, plus auto-fetch + form override per slot.
-        self._team.set_party(snap.get('party') or [])
+        party = snap.get('party') or []
+        self._team.set_party(party)
+        self._enemy.set_party_data(party)
 
         # Active highlights + enemy "send in" matchup target
         players = snap.get('player') or []
@@ -511,6 +528,24 @@ class EmbeddedMainWindow(QMainWindow):
             self._in_fight = in_fight
             self._push_debug_state()
 
+    # ── Rival warning ─────────────────────────────────────────────────────────
+
+    def _check_rival_warning(self, wave: int):
+        """Fire a notification on the rising edge of the two waves before a rival."""
+        if self._prev_wave is None or wave == self._prev_wave:
+            return
+        for rival_wave in _RIVAL_WAVES:
+            if wave == rival_wave - 2:
+                self._notif_panel.show_message(
+                    "⚔", "Rival in 2 levels", "#f9e2af"
+                )
+                break
+            elif wave == rival_wave - 1:
+                self._notif_panel.show_message(
+                    "⚔", "Rival next level!", "#fab387"
+                )
+                break
+
     # ── Title-bar badge updates ──────────────────────────────────────────────
 
     def _push_debug_state(self):
@@ -522,6 +557,8 @@ class EmbeddedMainWindow(QMainWindow):
         super().moveEvent(event)
         if hasattr(self, '_turn_order_panel'):
             self._turn_order_panel.reposition()
+        if hasattr(self, '_notif_panel'):
+            self._notif_panel.reposition()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -534,4 +571,5 @@ class EmbeddedMainWindow(QMainWindow):
             self._left_splitter.saveState().toBase64().data().decode(),
         )
         self._turn_order_panel.close()
+        self._notif_panel.close()
         super().closeEvent(event)

@@ -5,12 +5,14 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QScrollArea,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QPainter, QColor
+from PyQt6.QtWidgets import QGraphicsOpacityEffect
 
 from pokemon_api import fetch_pokemon, fetch_final_evolutions, fetch_ability, fetch_move, nature_mod_str, MoveData, PokemonData
 from damage_calc import damage_range, pct_color as dmg_pct_color
 from weakness_calc import calculate_weaknesses
+from scoring import offensive_coverage
 import stats_db
 import tier_db
 import moves_db
@@ -173,6 +175,7 @@ class _Signals(QObject):
     slot_cleared          = pyqtSignal(int)
     ability_tooltip_ready = pyqtSignal(int, str)
     moves_ready           = pyqtSignal(object)  # (slot, list[MoveData | None])
+    rec_ready             = pyqtSignal(object)  # (slot, dict | None)
 
 
 def _type_badge(type_name: str, small: bool = False) -> QLabel:
@@ -271,6 +274,15 @@ class OverlayPanel(QWidget):
         self._active_pokemon  = ""
 
         self._last_abilities = [(None, None)] * NUM_SLOTS
+        self._moves_enabled: bool = False   # hidden by default; toggled via Settings
+
+        # Catch recommendation
+        self._rec_lbls: list[QLabel | None]          = [None] * NUM_SLOTS
+        self._rec_effects: list                      = [None] * NUM_SLOTS
+        self._rec_anims: list                        = [None] * NUM_SLOTS
+        self._slot_bst_pcts: list[float | None]      = [None] * NUM_SLOTS
+        self._party_names: list[str]                 = []
+        self._team_type_groups: list[list[str]]      = []
 
         # Damage calculation state
         self._enemy_battle_stats: list[dict] = [{} for _ in range(NUM_SLOTS)]
@@ -287,6 +299,7 @@ class OverlayPanel(QWidget):
         self._signals.slot_cleared.connect(self._clear_slot_display)
         self._signals.ability_tooltip_ready.connect(self._on_ability_tooltip)
         self._signals.moves_ready.connect(self._on_moves_ready)
+        self._signals.rec_ready.connect(self._on_rec_ready)
 
         if not embedded:
             self.setWindowFlags(
@@ -488,6 +501,27 @@ class OverlayPanel(QWidget):
         inner.addWidget(ability_lbl)
         self._ability_lbls[slot] = ability_lbl
 
+        rec_lbl = QLabel("")
+        rec_lbl.setWordWrap(True)
+        rec_lbl.setTextFormat(Qt.TextFormat.RichText)
+        rec_lbl.setVisible(False)
+        inner.addWidget(rec_lbl)
+        self._rec_lbls[slot] = rec_lbl
+
+        effect = QGraphicsOpacityEffect(rec_lbl)
+        effect.setOpacity(1.0)
+        rec_lbl.setGraphicsEffect(effect)
+        self._rec_effects[slot] = effect
+
+        pulse = QPropertyAnimation(effect, b"opacity", rec_lbl)
+        pulse.setDuration(1400)
+        pulse.setKeyValueAt(0.0, 1.0)
+        pulse.setKeyValueAt(0.5, 0.45)
+        pulse.setKeyValueAt(1.0, 1.0)
+        pulse.setEasingCurve(QEasingCurve.Type.SineCurve)
+        pulse.setLoopCount(-1)
+        self._rec_anims[slot] = pulse
+
         moves_container = QWidget()
         moves_container.setStyleSheet("background: transparent;")
         moves_vbox = QVBoxLayout(moves_container)
@@ -638,6 +672,13 @@ class OverlayPanel(QWidget):
         self._bst_lbls[slot].setVisible(False)
         if self._pct_lbls[slot] is not None:
             self._pct_lbls[slot].setVisible(False)
+        if self._rec_anims[slot] is not None:
+            self._rec_anims[slot].stop()
+        if self._rec_effects[slot] is not None:
+            self._rec_effects[slot].setOpacity(1.0)
+        if self._rec_lbls[slot] is not None:
+            self._rec_lbls[slot].setVisible(False)
+        self._slot_bst_pcts[slot] = None
         if self._tier_badges[slot] is not None:
             self._tier_badges[slot].setVisible(False)
         self._level_lbls[slot].setVisible(False)
@@ -874,9 +915,12 @@ class OverlayPanel(QWidget):
         self._enemy_moves[slot] = valid
         self._moves_cells[slot] = cells
         self._moves_dmg_lbls[slot] = dmg_lbls
-        container.setVisible(bool(valid))
+        container.setVisible(bool(valid) and self._moves_enabled)
         self._update_move_damage_labels(slot)
         self._run_prediction(slot)
+        threading.Thread(
+            target=self._compute_recommendation, args=(slot,), daemon=True
+        ).start()
 
     def set_player_battle_stats(self, def_: int, spd: int, max_hp: int) -> None:
         """Called each snapshot with the active player Pokémon's defensive stats."""
@@ -940,15 +984,132 @@ class OverlayPanel(QWidget):
             lbl.setText(text)
             lbl.setStyleSheet(f"color:{color}; font-size:10px; background:transparent;")
 
+    def set_party_data(self, party: list[dict]) -> None:
+        """Called each snapshot with the live party. Refreshes catch recommendations."""
+        self._party_names      = [m.get('name') or '' for m in party]
+        self._team_type_groups = [m.get('types') or [] for m in party if m.get('types')]
+        for slot in range(NUM_SLOTS):
+            if self._enemy_moves[slot]:
+                threading.Thread(
+                    target=self._compute_recommendation, args=(slot,), daemon=True
+                ).start()
+
+    def _compute_recommendation(self, slot: int) -> None:
+        """Background thread: analyse enemy moves vs party, emit rec_ready."""
+        # Don't show catch advice for trainer battles
+        if self._battle_type != 0:
+            self._signals.rec_ready.emit((slot, None))
+            return
+
+        moves = self._enemy_moves[slot]
+        if not moves:
+            self._signals.rec_ready.emit((slot, None))
+            return
+
+        enemy_bst_pct = self._slot_bst_pcts[slot]
+        if enemy_bst_pct is None:
+            self._signals.rec_ready.emit((slot, None))
+            return
+
+        # Types of damaging moves the enemy has
+        enemy_move_types = [
+            m.type for m in moves
+            if m.type and m.category != 'status' and (m.power or 0) > 0
+        ]
+        enemy_cov = offensive_coverage(enemy_move_types)
+
+        # Combined coverage the current team already has (via their types as proxy)
+        team_cov: set[str] = set()
+        for types in self._team_type_groups:
+            team_cov |= offensive_coverage(types)
+
+        # ── "Great catch" check ───────────────────────────────────────────
+        new_types = sorted(enemy_cov - team_cov)
+        if len(new_types) > 2 and enemy_bst_pct >= 75:
+            self._signals.rec_ready.emit((slot, {
+                'kind': 'great',
+                'new_types': new_types,
+                'bst_pct': int(enemy_bst_pct),
+            }))
+            return
+
+        # ── "Replace X" check ─────────────────────────────────────────────
+        for i, name in enumerate(self._party_names):
+            if not name or i >= len(self._team_type_groups):
+                continue
+            member_cov = offensive_coverage(self._team_type_groups[i])
+            uncovered = member_cov - enemy_cov
+            if len(uncovered) > 1:
+                continue
+            try:
+                pdata = fetch_pokemon(name)
+                pbst = sum(pdata.stats.values())
+                pbst_pct = stats_db.bst_percentile(pbst) if stats_db.is_ready() else None
+                if pbst_pct is not None and enemy_bst_pct >= pbst_pct + 10:
+                    self._signals.rec_ready.emit((slot, {
+                        'kind': 'replace',
+                        'name': name.capitalize(),
+                        'covers_all': len(uncovered) == 0,
+                        'bst_diff': int(enemy_bst_pct - pbst_pct),
+                    }))
+                    return
+            except Exception:
+                pass
+
+        self._signals.rec_ready.emit((slot, None))
+
+    def _on_rec_ready(self, payload) -> None:
+        slot, rec = payload
+        lbl    = self._rec_lbls[slot]
+        effect = self._rec_effects[slot]
+        pulse  = self._rec_anims[slot]
+        if lbl is None:
+            return
+
+        if rec is None:
+            if pulse: pulse.stop()
+            if effect: effect.setOpacity(1.0)
+            lbl.setVisible(False)
+            return
+
+        if rec['kind'] == 'great':
+            type_list = ', '.join(t.capitalize() for t in rec['new_types'])
+            pct = _ordinal(rec['bst_pct'])
+            html = (
+                f"<b style='color:#a6e3a1'>Great catch!</b><br>"
+                f"<span style='color:#cdd6f4'>&nbsp;&nbsp;• Covers {type_list}</span><br>"
+                f"<span style='color:#a6adc8'>&nbsp;&nbsp;• BST {pct} percentile</span>"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+            if pulse: pulse.start()
+        else:  # replace — static, no pulse
+            if pulse: pulse.stop()
+            if effect: effect.setOpacity(1.0)
+            covers_line = "Covers all types" if rec['covers_all'] else "Covers all but 1 type"
+            html = (
+                f"<b style='color:#fab387'>Replace {rec['name']}!</b><br>"
+                f"<span style='color:#cdd6f4'>&nbsp;&nbsp;• {covers_line}</span><br>"
+                f"<span style='color:#a6adc8'>&nbsp;&nbsp;• {rec['bst_diff']}% higher BST</span>"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+
     def set_battle_context(self, player_types: list, battle_type: int) -> None:
         """Called each snapshot tick with the primary player's live types and battle type."""
         new_types = list(player_types) if player_types else []
+        prev_battle_type = self._battle_type
         changed = new_types != self._player_active_types or battle_type != self._battle_type
         self._player_active_types = new_types
         self._battle_type = battle_type or 0
         if changed:
             for slot in range(NUM_SLOTS):
                 self._run_prediction(slot)
+        # Hide catch recommendations immediately when entering a trainer battle
+        if battle_type != 0 and prev_battle_type == 0:
+            for slot in range(NUM_SLOTS):
+                if self._rec_lbls[slot] is not None:
+                    self._rec_lbls[slot].setVisible(False)
 
     def _run_prediction(self, slot: int):
         moves = self._enemy_moves[slot]
@@ -1180,8 +1341,10 @@ class OverlayPanel(QWidget):
             self._pct_lbls[slot].setText(f"{_ordinal(pct)}%")
             self._pct_lbls[slot].setStyleSheet(f"color:{color}; font-size:14px;")
             self._pct_lbls[slot].setVisible(True)
+            self._slot_bst_pcts[slot] = pct
         else:
             self._pct_lbls[slot].setVisible(False)
+            self._slot_bst_pcts[slot] = None
 
         rows = self._weak_rows[slot]
         w4     = sorted(t for t, m in weaknesses.items() if m >= 4.0)
@@ -1296,6 +1459,14 @@ class OverlayPanel(QWidget):
         for c in self._weak_containers:
             if c is not None:
                 c.setVisible(visible)
+
+    def set_moves_visible(self, visible: bool):
+        self._moves_enabled = visible
+        for slot in range(NUM_SLOTS):
+            c = self._moves_containers[slot]
+            if c is not None:
+                # Only reveal if moves are actually loaded for this slot
+                c.setVisible(visible and bool(self._enemy_moves[slot]))
 
     # ── Type override (from JS-state dispatcher) ─────────────────────────────
 

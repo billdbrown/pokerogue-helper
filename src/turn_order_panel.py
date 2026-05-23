@@ -23,7 +23,12 @@ _ANIM_MS      = 220
 
 class TurnOrderPanel(QWidget):
     def __init__(self, host: QWidget):
-        super().__init__(None)
+        # Pass host as parent so Windows establishes an owner HWND relationship.
+        # This keeps the panel tethered to the app (stays on top of it, minimizes
+        # with it, and doesn't drift off-screen on foreign monitor layouts).
+        # The Tool flag still prevents a taskbar entry; mapToGlobal positioning
+        # is unaffected because we override the geometry manually anyway.
+        super().__init__(host.window())
         self._host = host
         self._shown = False
         self._last_fighters: list[Fighter] = []
@@ -163,8 +168,12 @@ class TurnOrderPanel(QWidget):
     def _target_rect(self) -> QRect:
         origin = self._host.mapToGlobal(QPoint(0, 0))
         y_offset = int(self._host.height() * _VERTICAL_FRAC)
-        return QRect(origin.x(), origin.y() + y_offset,
-                     self.width(), self.height())
+        from PyQt6.QtWidgets import QApplication
+        screen = QApplication.screenAt(origin) or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        x = max(avail.left(), origin.x())
+        y = max(avail.top(), min(origin.y() + y_offset, avail.bottom() - self.height()))
+        return QRect(x, y, self.width(), self.height())
 
     def _clear_rows(self):
         while self._rows_layout.count():
