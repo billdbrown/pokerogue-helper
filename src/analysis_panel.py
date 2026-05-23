@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QSizePolicy,
 )
 from PyQt6.QtCore import Qt
 
@@ -65,6 +65,7 @@ class AnalysisPanel(QWidget):
         super().__init__()
         self.setMinimumWidth(0)
         self.setStyleSheet("background: #1e1e2e;")
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self._build_ui()
 
     # ── Construction ──────────────────────────────────────────────────────────
@@ -85,6 +86,7 @@ class AnalysisPanel(QWidget):
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet(_TAB_STYLE)
         self._tabs.setDocumentMode(True)
+        self._tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
         self._weak_link_area = self._add_tab("WEAKEST")
         self._tips_area      = self._add_tab("TIPS")
@@ -135,6 +137,7 @@ class AnalysisPanel(QWidget):
             self._weak_link_area.addWidget(self._placeholder("Add Pokémon to see weakest link"))
             return
 
+        total_covered = sum(st[2] for _, st in filled) or 1
         ranked = sorted(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
         for s, (bst, bst_pct, matchup, unique) in ranked:
             name = (team_names[s] or f"Slot {s + 1}").capitalize()
@@ -155,9 +158,9 @@ class AnalysisPanel(QWidget):
             stat_lbl = QLabel(f"{bst} {bst_pct}th%")
             stat_lbl.setStyleSheet(f"color:{pct_color}; font-size:18px;")
 
-            mu_pct = round(matchup / 171 * 100)
-            mu_color = "#a6e3a1" if mu_pct >= 20 else "#f9e2af" if mu_pct >= 10 else "#f38ba8"
-            cov_lbl = QLabel(f"{matchup}/171")
+            mu_pct = round(matchup / total_covered * 100)
+            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 17 else "#f38ba8"
+            cov_lbl = QLabel(f"{mu_pct}%")
             cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px;")
 
             row.addWidget(warn)

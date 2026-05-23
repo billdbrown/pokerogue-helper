@@ -1327,6 +1327,7 @@ class TeamPanel(QWidget):
             self._danger_area.addWidget(self._placeholder("No uncovered dual-type combos"))
 
     def _update_slot_stats(self, slot_stats: list):
+        total_covered = sum(st[2] for st in slot_stats if st is not None) or 1
         for s, stat in enumerate(slot_stats):
             mu_lbl = self._matchup_lbls[s]
             stats_lbl = self._stats_lbls[s]
@@ -1337,11 +1338,11 @@ class TeamPanel(QWidget):
                     stats_lbl.setVisible(False)
                 continue
             bst, bst_pct, matchup, unique = stat
-            mu_pct = round(matchup / _TOTAL_PAIRINGS * 100)
-            mu_color = "#a6e3a1" if mu_pct >= 20 else "#f9e2af" if mu_pct >= 10 else "#f38ba8"
+            mu_pct = round(matchup / total_covered * 100)
+            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 17 else "#f38ba8"
             if mu_lbl is not None:
                 mu_lbl.setText(
-                    f"<span style='color:{mu_color}'>{matchup}/{_TOTAL_PAIRINGS}</span>"
+                    f"<span style='color:{mu_color}'>{mu_pct}%</span>"
                 )
                 mu_lbl.setVisible(True)
             if stats_lbl is not None:
@@ -1360,6 +1361,7 @@ class TeamPanel(QWidget):
             self._weak_link_area.addWidget(self._placeholder("Add Pokemon to see weakest link"))
             return
 
+        total_covered = sum(st[2] for _, st in filled) or 1
         ranked = sorted(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
         for s, (bst, bst_pct, matchup, unique) in ranked:
             pokemon    = self._team_data[s]
@@ -1381,9 +1383,9 @@ class TeamPanel(QWidget):
             stat_lbl  = QLabel(f"{bst} {bst_pct}th%")
             stat_lbl.setStyleSheet(f"color:{pct_color}; font-size:12px;")
 
-            mu_pct = round(matchup / _TOTAL_PAIRINGS * 100)
-            mu_color = "#a6e3a1" if mu_pct >= 20 else "#f9e2af" if mu_pct >= 10 else "#f38ba8"
-            cov_lbl = QLabel(f"{matchup}/{_TOTAL_PAIRINGS}")
+            mu_pct = round(matchup / total_covered * 100)
+            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 17 else "#f38ba8"
+            cov_lbl = QLabel(f"{mu_pct}%")
             cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:12px;")
 
             row.addWidget(warn)
