@@ -10,7 +10,10 @@ Two caches: impact_cache.json (level-up moves only) and impact_cache_egg.json
 (level-up + egg moves). Toggle with set_include_egg().
 """
 
+from __future__ import annotations
+
 import json
+import math
 import os
 import re
 import threading
@@ -25,7 +28,27 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 15
+CACHE_VERSION  = 23
+
+# Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
+_EXCLUDED_FORMS: frozenset[str] = frozenset({
+    "greninja-ash",         # Battle Bond — mechanic not present in Pokerogue
+    "greninja-battle-bond", # alternate PokéAPI slug for the same form
+})
+
+
+def _is_excluded_form(form: str) -> bool:
+    """True for forms that should be omitted from all analysis and scoring."""
+    if form in _EXCLUDED_FORMS:
+        return True
+    if "-totem" in form:      # totem variants (incl. raticate-totem-alola)
+        return True
+    # Alternate ride/battle builds — same base stats, just mechanical variants.
+    # Keep base koraidon / miraidon; drop everything else.
+    if form.startswith("koraidon-") or form.startswith("miraidon-"):
+        return True
+    return False
+
 
 # Paradox Pokémon (Gen 9 Scarlet/Violet + DLC) — not flagged in PokéAPI
 _PARADOX_POKEMON: frozenset[str] = frozenset({
@@ -46,6 +69,8 @@ _EXCLUDED_MOVES: frozenset[str] = frozenset({
     "explosion", "self-destruct", "final-gambit",  # user faints
     "focus-punch",  # charge turn; negated by any hit
     "overheat",     # -2 sp.atk after use; effectively one-shot
+    "dream-eater",  # requires target to be asleep
+    "sky-drop",     # complex two-turn grounding mechanic
 })
 
 _POKEROGUE_LEARNSET_URL = (
@@ -87,6 +112,56 @@ _EFF: dict[tuple, float] = {}
 _db_noegg: dict[str, dict] = {}
 _db_egg:   dict[str, dict] = {}
 _use_egg:  bool = False
+
+_OHKO_K: float = 22.0 / 50.0  # level-50 game damage formula constant
+_IMMUNE_CAP: int = 50          # hits-to-KO cap for immune matchups in bulk scoring
+
+_move_adoptions_all:   dict[str, int] = {}  # move_name → # forms that selected it (all mode)
+_move_adoptions_clean: dict[str, int] = {}  # same, clean mode (no recoil/self-reducing)
+
+
+def _is_self_reducing(effect: str) -> bool:
+    """True if the move's effect text describes a user-side stat drop."""
+    import re as _re
+    e = effect.lower()
+    for pat in (r"lowers?\s+the\s+user", r"lower\s+the\s+user",
+                r"harshly\s+lower", r"the\s+user'?s\s+\w[\w\s-]+\s+(?:drop|lower|decreas|fall)"):
+        if _re.search(pat, e):
+            return True
+    return False
+
+
+# PokeAPI does not reliably set recharge_turn / min_turns — detect from effect text.
+_TWO_TURN_OVERRIDES: frozenset[str] = frozenset({
+    "meteor-beam",   # PokeAPI short_effect is generic; it IS a charge-turn move
+    "electro-shot",  # Gen 9; PokeAPI has no effect text yet
+})
+_TWO_TURN_PATTERNS = (
+    "hits next turn",          # Fly, Dig, Dive, Bounce, Phantom Force
+    "requires a turn to charge",  # Solar Beam, Solar Blade, Razor Wind, Ice Burn, Freeze Shock
+    "charges for one turn",    # Sky Attack, Skull Bash
+    "takes one turn to charge",   # (Geomancy; status so filtered anyway)
+)
+
+
+def _is_recharge(effect: str) -> bool:
+    """True for moves that force skipping the next turn (Hyper Beam class)."""
+    return "foregoes its next turn to recharge" in effect.lower()
+
+
+def _is_two_turn(move_name: str, effect: str, is_recharge: bool) -> bool:
+    """True for charge-turn moves (Solar Beam, Fly, Dig, etc.) that take 2 turns."""
+    if is_recharge:
+        return False
+    if move_name in _TWO_TURN_OVERRIDES:
+        return True
+    e = effect.lower()
+    return any(pat in e for pat in _TWO_TURN_PATTERNS)
+
+
+def _is_always_skip(effect: str) -> bool:
+    """True for delayed-hit moves (Future Sight, Doom Desire) — can't score reliably."""
+    return "hits the target two turns later" in effect.lower()
 
 _starters: dict[int, dict] = {}  # {national_dex_id: {name, cost, final_evo}}
 _ready:     bool = False          # noegg cache ready
@@ -267,8 +342,11 @@ def get_capped_moves(name: str, cap: int) -> list[dict]:
         stab  = 1.5 if mtype in types else 1.0
         acc   = (m["accuracy"] or 100) / 100.0
         base  = stat * m["power"] * acc * stab
-        pv    = {p: base * _EFF[(mtype, p)] for p in ALL_PAIRINGS
-                 if _EFF.get((mtype, p), 0.0) > 1.0}
+        pv: dict = {}
+        for p in ALL_PAIRINGS:
+            se = _EFF.get((mtype, p), 0.0)
+            if se > 1.0:
+                pv[p] = base * se
         return pv if pv else None
 
     lu_items = [(m, pv) for m in levelup_moves if (pv := _pv(m))]
@@ -294,6 +372,12 @@ def get_capped_moves(name: str, cap: int) -> list[dict]:
             best_score = score
             best_combo = combo
     return [all_items[idx][0] for idx in best_combo]
+
+
+def get_move_adoptions() -> tuple[dict[str, int], dict[str, int]]:
+    """Returns (adoptions_all, adoptions_clean): move_name → # forms that selected it."""
+    with _lock:
+        return dict(_move_adoptions_all), dict(_move_adoptions_clean)
 
 
 def get(name: str) -> dict | None:
@@ -621,8 +705,11 @@ def _best_capped_score(
         stab  = 1.5 if mtype in types else 1.0
         acc   = (m["accuracy"] or 100) / 100.0
         base  = stat * m["power"] * acc * stab
-        pv = {p: base * _EFF[(mtype, p)] for p in ALL_PAIRINGS
-              if _EFF.get((mtype, p), 0.0) > 1.0}
+        pv: dict = {}
+        for p in ALL_PAIRINGS:
+            se = _EFF.get((mtype, p), 0.0)
+            if se > 1.0:
+                pv[p] = base * se
         return pv if pv else None
 
     lu_pvs = [pv for m in levelup_moves if (pv := _pv(m))]
@@ -660,8 +747,14 @@ def _compute_score(
     atk: int,
     sp_atk: int,
     moves: list[dict],
+    targets: list[dict],
+    eff_memo: dict,
 ) -> tuple[float, list[dict]]:
-    """Returns (score, selected_moves) where selected_moves are the optimal 4."""
+    """Returns (coverage_score, selected_moves) via pairwise individual-target scoring.
+
+    coverage_score = Σ best P(OHKO) against each SE-vulnerable target in the pool.
+    Greedy submodular moveset selection picks up to 4 moves (≥63% of optimal).
+    """
     damaging = [
         m for m in moves
         if m.get("power") and m["power"] > 0 and m.get("category") != "status"
@@ -669,50 +762,219 @@ def _compute_score(
     if not damaging:
         return 0.0, []
 
-    # Pre-compute each move's value against every pairing, keeping move ref
-    move_pv: list[tuple[dict, dict[tuple, float]]] = []
+    move_pv: list[tuple[dict, dict[int, float]]] = []
     for m in damaging:
         mtype = m["type"]
-        stat = atk if m["category"] == "physical" else sp_atk
-        stab = 1.5 if mtype in pokemon_types else 1.0
-        acc = (m["accuracy"] or 100) / 100.0
-        base = stat * m["power"] * acc * stab
+        stat  = atk if m["category"] == "physical" else sp_atk
+        stab  = 1.5 if mtype in pokemon_types else 1.0
+        acc   = (m["accuracy"] or 100) / 100.0
+        pwr = float(m["power"] or 0)
+        if m.get("recharge") or m.get("two_turn"):
+            pwr /= 2.0
+        min_h, max_h = m.get("min_hits") or 0, m.get("max_hits") or 0
+        if min_h and max_h:
+            pwr *= (min_h + max_h) / 2.0
+        base  = stat * pwr * acc * stab
 
-        pv: dict[tuple, float] = {}
-        for pairing in ALL_PAIRINGS:
-            se = _EFF.get((mtype, pairing), 0.0)
-            if se > 1.0:
-                pv[pairing] = base * se
+        pv: dict[int, float] = {}
+        for t_idx, tgt in enumerate(targets):
+            types_key = (mtype, tuple(tgt["types"]))
+            eff = eff_memo.get(types_key)
+            if eff is None:
+                eff = _effectiveness(mtype, tgt["types"])
+                eff_memo[types_key] = eff
+            if eff > 1.0:
+                avg_def = tgt["def"] if m["category"] == "physical" else tgt["sp_def"]
+                pv[t_idx] = min(base * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
         if pv:
             move_pv.append((m, pv))
 
     if not move_pv:
         return 0.0, []
 
-    # Greedy moveset: pick 4 moves by marginal gain
-    current_best: dict[tuple, float] = {}
+    # Greedy moveset: pick up to 4 moves by marginal gain
+    current_best: dict[int, float] = {}
     selected: list[dict] = []
     for _ in range(min(4, len(move_pv))):
         best_gain = 0.0
-        best_idx = -1
+        best_idx  = -1
         for idx, (_, pv) in enumerate(move_pv):
-            gain = sum(
-                max(0.0, v - current_best.get(p, 0.0))
-                for p, v in pv.items()
-            )
+            gain = sum(max(0.0, v - current_best.get(t, 0.0)) for t, v in pv.items())
             if gain > best_gain:
                 best_gain = gain
-                best_idx = idx
+                best_idx  = idx
         if best_idx == -1:
             break
         m, pv = move_pv[best_idx]
-        for p, v in pv.items():
-            if v > current_best.get(p, 0.0):
-                current_best[p] = v
+        for t, v in pv.items():
+            if v > current_best.get(t, 0.0):
+                current_best[t] = v
         selected.append(m)
         move_pv.pop(best_idx)
 
     return sum(current_best.values()), selected
+
+
+def _compute_bulk_pairwise(
+    defender_types: list[str],
+    defender_hp: float,
+    defender_def: float,
+    defender_sp_def: float,
+    targets: list[dict],
+    eff_memo: dict,
+) -> float:
+    """Σ sqrt(hits-to-KO) from each non-legendary attacker in the target pool.
+
+    Each attacker uses its cached optimal 4 moves. Immune matchups are capped at
+    _IMMUNE_CAP hits. sqrt gives ~4-5x range across the population.
+    """
+    bulk = 0.0
+    for tgt in targets:
+        if not tgt.get("moves"):
+            continue
+        best_pohko = 0.0
+        for m in tgt["moves"]:
+            mtype = m["type"]
+            types_key = (mtype, tuple(defender_types))
+            eff = eff_memo.get(types_key)
+            if eff is None:
+                eff = _effectiveness(mtype, defender_types)
+                eff_memo[types_key] = eff
+            if eff == 0:
+                continue
+            stat = tgt["atk"] if m["category"] == "physical" else tgt["sp_atk"]
+            stab = 1.5 if mtype in tgt["types"] else 1.0
+            acc  = (m["accuracy"] or 100) / 100.0
+            base = stat * m["power"] * acc * stab
+            avg_def = defender_def if m["category"] == "physical" else defender_sp_def
+            pohko = min(base * eff * _OHKO_K / (defender_hp * avg_def), 1.0)
+            if pohko > best_pohko:
+                best_pohko = pohko
+        hits_to_ko = (1.0 / best_pohko) if best_pohko > 0 else _IMMUNE_CAP
+        bulk += math.sqrt(hits_to_ko)
+    return bulk
+
+
+def _simulate_battle(
+    pohko_a: float, pohko_b: float, speed_a: int, speed_b: int
+) -> tuple[float, float]:
+    """Discrete 1v1 battle sim. Returns (A_final_hp_frac, B_final_hp_frac) in [0, 1].
+
+    Turn order: A goes first if speed_a >= speed_b.
+    Each round the attacker-first fires, then (if defender survives) retaliates.
+    pohko_x = probability of one-hit-KO from x's best move, capped at 1.0.
+    """
+    if pohko_a <= 0 and pohko_b <= 0:
+        return 0.5, 0.5   # neither can damage the other
+    if pohko_a <= 0:
+        return 0.0, 1.0   # A can't fight back
+    if pohko_b <= 0:
+        return 1.0, 0.0   # B can't fight back
+
+    n_a = math.ceil(1.0 / pohko_a)  # hits A needs to KO B
+    n_b = math.ceil(1.0 / pohko_b)  # hits B needs to KO A
+
+    if speed_a >= speed_b:          # A goes first
+        if n_a <= n_b:              # A wins: fires n_a hits, takes n_a-1 in return
+            return max(0.0, 1.0 - (n_a - 1) * pohko_b), 0.0
+        else:                       # B wins: A fires n_b times before dying
+            return 0.0, max(0.0, 1.0 - n_b * pohko_a)
+    else:                           # B goes first
+        if n_a < n_b:               # A wins: fires n_a times, takes n_a hits from B
+            return max(0.0, 1.0 - n_a * pohko_b), 0.0
+        else:                       # B wins: fires n_b times, takes n_b-1 in return
+            return 0.0, max(0.0, 1.0 - (n_b - 1) * pohko_a)
+
+
+def _compute_battle_score(
+    attacker: dict,
+    targets: list[dict],
+    eff_memo: dict,
+    moves_override: list[dict] | None = None,
+) -> tuple[float, int, int, int, int, dict]:
+    """Σ (A_final_hp − B_final_hp + 1) / 2 across all target matchups.
+
+    Returns (total_score, zdw, dw, dl, zdl, move_usage) where:
+      ZDW = won without taking any damage
+      DW  = won but took some damage en route
+      DL  = hit B at least once but couldn't KO before B KO'd A
+      ZDL = A never dealt any damage to B before being KO'd
+      move_usage = {move_name: count} — how many targets each move was best against
+    attacker fields used: types, atk, sp_atk, speed, hp, defense, sp_def, moves.
+    target fields used:   types, atk, sp_atk, speed, hp, def, sp_def, moves.
+    """
+    a_types  = attacker["types"]
+    a_atk    = attacker["atk"]
+    a_sp_atk = attacker["sp_atk"]
+    a_speed  = attacker["speed"]
+    a_hp     = float(attacker["hp"])
+    a_def    = float(attacker["defense"])
+    a_sp_def = float(attacker["sp_def"])
+    a_moves  = moves_override if moves_override is not None else attacker.get("moves", [])
+
+    _EPS = 1e-9
+    zdw = dw = dl = zdl = 0
+    move_usage: dict[str, int] = {}
+    total = 0.0
+    for tgt in targets:
+        # Best P(OHKO) of A on B
+        pohko_a = 0.0
+        best_move: str | None = None
+        for m in a_moves:
+            mtype = m["type"]
+            k = (mtype, tuple(tgt["types"]))
+            eff = eff_memo.get(k)
+            if eff is None:
+                eff = _effectiveness(mtype, tgt["types"])
+                eff_memo[k] = eff
+            if eff > 0:
+                stat = a_atk if m["category"] == "physical" else a_sp_atk
+                stab = 1.5 if mtype in a_types else 1.0
+                acc  = (m["accuracy"] or 100) / 100.0
+                base = stat * m["power"] * acc * stab
+                avg_def = tgt["def"] if m["category"] == "physical" else tgt["sp_def"]
+                pohko = min(base * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
+                if pohko > pohko_a:
+                    pohko_a = pohko
+                    best_move = m["name"]
+        if best_move:
+            move_usage[best_move] = move_usage.get(best_move, 0) + 1
+
+        # Best P(OHKO) of B on A
+        pohko_b = 0.0
+        for m in tgt.get("moves", []):
+            mtype = m["type"]
+            k = (mtype, tuple(a_types))
+            eff = eff_memo.get(k)
+            if eff is None:
+                eff = _effectiveness(mtype, a_types)
+                eff_memo[k] = eff
+            if eff > 0:
+                stat = tgt["atk"] if m["category"] == "physical" else tgt["sp_atk"]
+                stab = 1.5 if mtype in tgt["types"] else 1.0
+                acc  = (m["accuracy"] or 100) / 100.0
+                base = stat * m["power"] * acc * stab
+                avg_def = a_def if m["category"] == "physical" else a_sp_def
+                pohko = min(base * eff * _OHKO_K / (a_hp * avg_def), 1.0)
+                if pohko > pohko_b:
+                    pohko_b = pohko
+
+        a_final, b_final = _simulate_battle(pohko_a, pohko_b, a_speed, tgt["speed"])
+        total += (a_final - b_final + 1.0) / 2.0
+
+        if b_final < _EPS:          # A wins (B KO'd)
+            if a_final >= 1.0 - _EPS:
+                zdw += 1
+            else:
+                dw += 1
+        elif a_final < _EPS:        # B wins (A KO'd)
+            if b_final >= 1.0 - _EPS:
+                zdl += 1
+            else:
+                dl += 1
+        # else: draw (0.5, 0.5) — both had no moves
+
+    return total, zdw, dw, dl, zdl, move_usage
 
 
 def _is_legendary(species: str, form: str, legendary_set: set[str]) -> bool:
@@ -813,7 +1075,7 @@ def _evo_finals(node: dict) -> list[str]:
 # ── cache build ───────────────────────────────────────────────────────────────
 
 def _build_or_load(on_progress, on_ready, include_egg: bool = False):
-    global _db_noegg, _db_egg, _ready, _ready_egg, _starters
+    global _db_noegg, _db_egg, _ready, _ready_egg, _starters, _move_adoptions_all, _move_adoptions_clean
 
     cache_file = CACHE_FILE_EGG if include_egg else CACHE_FILE
     label      = "egg" if include_egg else "standard"
@@ -825,13 +1087,18 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 data = json.load(f)
             if data.get("_version") == CACHE_VERSION:
                 data.pop("_version")
-                starters_raw = data.pop("_starters", {})
+                starters_raw    = data.pop("_starters", {})
+                adopt_all_raw   = data.pop("_adoptions_all",   {})
+                adopt_clean_raw = data.pop("_adoptions_clean", {})
+                data.pop("_pairing_def", None)  # compat: ignore old field if present
                 with _lock:
                     if include_egg:
                         _db_egg = data
                     else:
                         _db_noegg = data
                         _starters = {int(k): v for k, v in starters_raw.items()}
+                    _move_adoptions_all   = adopt_all_raw
+                    _move_adoptions_clean = adopt_clean_raw
                 if not _EFF:
                     _build_effectiveness_table()
                 _patch_nonleg_percentiles(data)
@@ -880,7 +1147,10 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
     with ThreadPoolExecutor(max_workers=20) as pool:
         for varieties in pool.map(fetch_varieties, sorted(fully_evolved)):
             all_forms.extend(varieties)
-    all_forms = sorted(f for f in set(all_forms) if "-mega" not in f)
+    all_forms = sorted(
+        f for f in set(all_forms)
+        if "-mega" not in f and not _is_excluded_form(f)
+    )
     _prog(on_progress, f"{len(all_forms)} total forms to score…")
 
     # Step 3: fetch pokemon data (types, stats, move list) for each form
@@ -966,13 +1236,32 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 return move_name, None
             r.raise_for_status()
             d = r.json()
+            meta       = d.get("meta") or {}
+            drain      = meta.get("drain") or 0
+            pp         = d.get("pp") or 0
+            min_hits   = meta.get("min_hits") or 0
+            max_hits   = meta.get("max_hits") or 0
+            effect     = next(
+                (e["short_effect"] for e in d.get("effect_entries", [])
+                 if e["language"]["name"] == "en"), ""
+            )
+            recharge    = _is_recharge(effect)
+            two_turn    = _is_two_turn(move_name, effect, recharge)
+            always_skip = _is_always_skip(effect)
             return move_name, {
-                "name": move_name,
-                "type": d["type"]["name"],
-                "power": d["power"],
-                "accuracy": d["accuracy"],
-                "category": d["damage_class"]["name"],
-                "drain": (d.get("meta") or {}).get("drain") or 0,
+                "name":          move_name,
+                "type":          d["type"]["name"],
+                "power":         d["power"],
+                "accuracy":      d["accuracy"],
+                "category":      d["damage_class"]["name"],
+                "drain":         drain,
+                "pp":            pp,
+                "recharge":      recharge,
+                "two_turn":      two_turn,
+                "always_skip":   always_skip,
+                "min_hits":      min_hits,
+                "max_hits":      max_hits,
+                "self_reducing": _is_self_reducing(effect),
             }
         except Exception:
             return move_name, None
@@ -987,39 +1276,95 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             if completed % 200 == 0:
                 _prog(on_progress, f"Fetching moves… {completed}/{total_moves}")
 
-    # Step 5: warm effectiveness table then compute scores
+    # Step 5: warm effectiveness table, build pairwise target list
     _prog(on_progress, "Warming type effectiveness table…")
     _build_effectiveness_table()
 
-    _prog(on_progress, "Computing impact scores…")
+    _prog(on_progress, "Building pairwise target list…")
+    targets_build: list[dict] = []
+    form_to_tidx: dict[str, int] = {}
+    for form, pd in pokemon_data.items():
+        if _is_legendary(pd.get("species", form), form, legendary_set):
+            continue
+        if form in _PARADOX_POKEMON:
+            continue
+        s = pd["stats"]
+        form_to_tidx[form] = len(targets_build)
+        targets_build.append({
+            "name":   form,
+            "types":  pd["types"],
+            "hp":     float(s.get("hp", 1)),
+            "def":    float(s.get("defense", 1)),
+            "sp_def": float(s.get("special-defense", 1)),
+            "atk":    float(s.get("attack", 1)),
+            "sp_atk": float(s.get("special-attack", 1)),
+            "speed":  s.get("speed", 0),
+        })
+    _prog(on_progress, f"  {len(targets_build)} pairwise targets.")
+    eff_memo: dict = {}  # memoize (mtype, types_tuple) → effectiveness
+
+    # Step 6a: Pass 1 — compute coverage scores and select optimal moves (two modes)
+    _prog(on_progress, "Computing coverage scores (pass 1)…")
+
+    def _is_eligible(m: dict) -> bool:
+        """Base filter: both modes exclude these moves."""
+        return (
+            m is not None
+            and (m.get("power") or 0) > 0
+            and (m.get("pp") or 0) > 1
+            and m.get("category") != "status"
+            and m["name"] not in _EXCLUDED_MOVES
+            and not m.get("always_skip", False)
+        )
+
+    def _is_adverse(m: dict) -> bool:
+        """True for recoil moves and self-reducing moves, excluded in clean mode."""
+        return (m.get("drain") or 0) < 0 or m.get("self_reducing", False)
+
+    def _to_move_dict(m: dict) -> dict:
+        """Stored move entry; power adjusted for recharge/two-turn and multi-hit."""
+        pwr = float(m["power"] or 0)
+        if m.get("recharge") or m.get("two_turn"):
+            pwr /= 2.0
+        min_h, max_h = m.get("min_hits") or 0, m.get("max_hits") or 0
+        if min_h and max_h:
+            pwr *= (min_h + max_h) / 2.0
+        return {
+            "name":     m["name"],
+            "type":     m["type"],
+            "power":    pwr,
+            "accuracy": m["accuracy"],
+            "category": m["category"],
+        }
+
     db: dict[str, dict] = {}
     for form, pd in pokemon_data.items():
         atk    = pd["stats"].get("attack", 0)
         sp_atk = pd["stats"].get("special-attack", 0)
         speed  = pd["stats"].get("speed", 0)
-        moves  = [move_cache[mn] for mn in pd["move_names"]
-                  if move_cache.get(mn)
-                  and (move_cache[mn].get("drain") or 0) >= 0
-                  and mn not in _EXCLUDED_MOVES]
-        impact, selected = _compute_score(pd["types"], atk, sp_atk, moves)
+
+        all_eligible = [
+            move_cache[mn] for mn in pd["move_names"]
+            if move_cache.get(mn) and _is_eligible(move_cache[mn])
+        ]
+        clean_eligible = [m for m in all_eligible if not _is_adverse(m)]
+
+        coverage_all,   selected_all   = _compute_score(pd["types"], atk, sp_atk, all_eligible,   targets_build, eff_memo)
+        coverage_clean, selected_clean = _compute_score(pd["types"], atk, sp_atk, clean_eligible, targets_build, eff_memo)
+
         entry: dict = {
-            "coverage": impact,
-            "atk":     atk,
-            "sp_atk":  sp_atk,
-            "speed":   speed,
-            "types":   pd["types"],
-            "legendary": _is_legendary(pd.get("species", form), form, legendary_set),
-            "paradox":   form in _PARADOX_POKEMON,
-            "moves": [
-                {
-                    "name":     m["name"],
-                    "type":     m["type"],
-                    "power":    m["power"],
-                    "accuracy": m["accuracy"],
-                    "category": m["category"],
-                }
-                for m in selected
-            ],
+            "coverage":     coverage_all,
+            "atk":          atk,
+            "sp_atk":       sp_atk,
+            "speed":        speed,
+            "hp":           pd["stats"].get("hp", 1),
+            "defense":      pd["stats"].get("defense", 1),
+            "sp_def":       pd["stats"].get("special-defense", 1),
+            "types":        pd["types"],
+            "legendary":    _is_legendary(pd.get("species", form), form, legendary_set),
+            "paradox":      form in _PARADOX_POKEMON,
+            "moves":        [_to_move_dict(m) for m in selected_all],
+            "moves_clean":  [_to_move_dict(m) for m in selected_clean],
         }
         if include_egg:
             egg_names = pd.get("_egg_move_set", set())
@@ -1031,25 +1376,59 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             ]
         db[form] = entry
 
-    # Step 6: speed percentiles → combined score → combined percentiles
+    # Populate targets with their optimal moves, then filter to those with moves
+    for form, t_idx in form_to_tidx.items():
+        targets_build[t_idx]["moves"] = db[form]["moves"]
+
+    no_move_forms = sorted(form for form, entry in db.items() if not entry.get("moves"))
+    filtered_targets = [tgt for tgt in targets_build if tgt.get("moves")]
+    _prog(on_progress,
+          f"  {len(filtered_targets)} battle targets "
+          f"({len(targets_build) - len(filtered_targets)} no-move forms excluded).")
+
+    # Step 6b: Pass 2 — compute bulk and battle scores against filtered targets
+    _prog(on_progress, "Computing bulk and battle scores (pass 2)…")
+    for form, entry in db.items():
+        entry["bulk"] = _compute_bulk_pairwise(
+            entry["types"],
+            float(entry["hp"]),
+            float(entry["defense"]),
+            float(entry["sp_def"]),
+            filtered_targets,
+            eff_memo,
+        )
+        score, zdw, dw, dl, zdl, move_usage = _compute_battle_score(entry, filtered_targets, eff_memo)
+        entry["impact"]     = score
+        entry["outcomes"]   = {"zdw": zdw, "dw": dw, "dl": dl, "zdl": zdl}
+        entry["move_usage"] = move_usage
+
+        score_clean, _, _, _, _, _ = _compute_battle_score(
+            entry, filtered_targets, eff_memo,
+            moves_override=entry.get("moves_clean", []),
+        )
+        entry["impact_clean"] = score_clean
+
+    # Count move adoptions across all forms (for Moves browser tab)
+    adoptions_all:   dict[str, int] = {}
+    adoptions_clean: dict[str, int] = {}
+    for entry in db.values():
+        for m in entry.get("moves", []):
+            adoptions_all[m["name"]] = adoptions_all.get(m["name"], 0) + 1
+        for m in entry.get("moves_clean", []):
+            adoptions_clean[m["name"]] = adoptions_clean.get(m["name"], 0) + 1
+    with _lock:
+        _move_adoptions_all   = adoptions_all
+        _move_adoptions_clean = adoptions_clean
+
+    # Step 7: speed percentiles (preserved for pairing_vector compatibility)
+    # impact is already set from battle simulation — no speed-factor adjustment.
     all_speeds = [v["speed"] for v in db.values()]
     n = len(all_speeds)
     for entry in db.values():
         sp = entry["speed"]
         entry["speed_pct"] = round(sum(1 for x in all_speeds if x < sp) / n * 100)
 
-    _SPEED_THRESHOLD = 70  # percentile below which a penalty applies
-    for entry in db.values():
-        sp = entry["speed_pct"]
-        if sp >= _SPEED_THRESHOLD:
-            factor = 1.0
-        else:
-            factor = 0.4 + 0.6 * (sp / _SPEED_THRESHOLD)
-        entry["impact"] = entry["coverage"] * factor
-
-    # Percentile is computed relative to non-legendary pool only so legendaries
-    # don't suppress non-legendary rankings. Legendaries that outperform all
-    # non-legendaries extrapolate past 100 (e.g. AI110 = 10% above the best non-leg).
+    # Percentile relative to non-legendary pool only.
     nonleg_scores_sorted = sorted(
         v["impact"] for v in db.values() if not v.get("legendary")
     )
@@ -1065,7 +1444,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
         else:
             entry["percentile"] = round(below / n_nonleg * 100)
 
-    # Step 6.5: brute-force cap scores for egg caps 1–4 (egg build only)
+    # Step 7.5: brute-force cap scores for egg caps 1–4 (egg build only)
     if include_egg:
         _prog(on_progress, "Computing egg-cap scores (1–4 egg moves)…")
         n_db = len(db)
@@ -1099,7 +1478,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 entry.setdefault("percentile_caps", [0, 0, 0, 0])
                 entry["percentile_caps"][cap_idx] = pct
 
-    # Step 7: Build starters index (only needed for the primary noegg cache)
+    # Step 8: Build starters index (only needed for the primary noegg cache)
     _si: dict[int, dict] = {}
     if not include_egg:
         _prog(on_progress, "Building starters index…")
@@ -1151,7 +1530,13 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
 
     _prog(on_progress, f"Saving {label} impact cache…")
     with open(cache_file, "w") as f:
-        json.dump({"_version": CACHE_VERSION, "_starters": _si, **db}, f)
+        json.dump({
+            "_version":        CACHE_VERSION,
+            "_starters":       _si,
+            "_adoptions_all":   adoptions_all,
+            "_adoptions_clean": adoptions_clean,
+            **db,
+        }, f)
 
     with _lock:
         if include_egg:
@@ -1165,6 +1550,11 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
     if on_ready:
         on_ready()
     _prog(on_progress, f"Done — {len(db)} forms scored ({label}).")
+    if no_move_forms:
+        _prog(on_progress,
+              f"Forms excluded (no scorable moves, {len(no_move_forms)} total):")
+        for f in no_move_forms:
+            _prog(on_progress, f"  {f}")
 
 
 def _prog(cb, msg: str):
