@@ -6,7 +6,8 @@ This file provides guidance to Claude Code when working with this repository.
 
 ```powershell
 pip install -r requirements.txt
-python main.py
+python main.py            # full app (embedded browser + all panels)
+python main.py --browser  # impact score browser only (no web engine)
 ```
 
 No build step, test suite, or linter. Run directly to verify changes.
@@ -50,7 +51,9 @@ embedded_window._inject_phaser_capture()   # bind-hook on page load
 | `analysis_panel.py` | Tabbed analytics panel (embedded mode) |
 | `notification_panel.py` | Great-catch / swap recommendation cards |
 | `impact_db.py` | Impact Score: cache build, runtime API (`get`, `team_score`, `best_swap`, `pairing_vector`) |
-| `impact_table.py` | Impact Score browser dialog (searchable, sortable, filterable) |
+| `impact_table.py` | Impact Score browser dialog (searchable, sortable, filterable); includes Bulk column |
+| `team_builder_panel.py` | Team builder panel — optimise team composition via impact scores |
+| `debug_score.py` | Dev tool: score a single Pokémon with move-by-move breakdown (`python src/debug_score.py <name>`) |
 | `pokemon_api.py` | PokéAPI REST client; in-memory caching; name normalization |
 | `weakness_calc.py` | Type effectiveness math; coverage/gap analysis |
 | `stats_db.py` | Background base-stat cache (`stats_cache.json`) |
@@ -76,6 +79,29 @@ See `docs/impact_score.md` for full methodology. Key points:
   `impact_db.py` must be bumped whenever the schema or scoring methodology changes.
 - **Rebuild**: run `python src/impact_db.py` standalone (~3 min, fetches from
   PokéAPI and Pokerogue repo).
+
+## Bulk (Defensive) Score — In Progress
+
+`impact_table.py` computes a **Bulk** score per Pokémon:
+
+```
+Bulk = Σ log(1 + hits_to_KO)  over all 18 attacking types
+hits_to_KO = hp × avg(def, sp_def) / (100 × type_effectiveness)
+Immune matchups (0×) are capped at 50 hits.
+```
+
+`avg(def, sp_def)` is a placeholder. The planned final form is a **category-weighted**
+effective defense: for each attacking type, weight physical-category vs special-category
+moves by their actual frequency in the game's move pool (fetched from PokéAPI `/type/{name}`
+and cached). This one-time fetch is not yet implemented.
+
+The goal is a combined **three-metric score** (offense, bulk, speed) — exact combination
+formula TBD. Use `src/visualize_scores.py` to inspect score distributions:
+
+```powershell
+python src/visualize_scores.py           # three-distribution plot (offense / bulk / speed)
+python src/visualize_scores.py --impact  # original impact histogram
+```
 
 ## Threading Model
 

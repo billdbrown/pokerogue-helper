@@ -52,7 +52,8 @@ pip install -r requirements.txt
 ## Run
 
 ```powershell
-python main.py
+python main.py            # full app
+python main.py --browser  # impact score browser only (no web engine required)
 ```
 
 First launch builds two background caches:
@@ -83,7 +84,10 @@ Output: `dist\PokerogueHelper_v<version>\PokerogueHelper_v<version>.exe`.
 │   ├── analysis_panel.py     # tabbed analytics (WEAKEST/TIPS/TYPING/DANGER/WEAKNESS)
 │   ├── notification_panel.py # great-catch / swap recommendation cards
 │   ├── impact_db.py          # Impact Score cache build + runtime API
-│   ├── impact_table.py       # Impact Score browser dialog
+│   ├── impact_table.py       # Impact Score browser dialog (sortable; includes Bulk score)
+│   ├── team_builder_panel.py # Team builder — optimise composition via impact scores
+│   ├── debug_score.py        # Dev tool: per-move score breakdown for one Pokémon
+│   ├── visualize_scores.py   # Score distribution plots (matplotlib)
 │   ├── wave_panel.py         # wave tracker
 │   ├── turn_order_panel.py   # turn order display
 │   ├── damage_calc.py        # damage calculation helpers
