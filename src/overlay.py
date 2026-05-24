@@ -153,20 +153,33 @@ def _impact_tooltip(entry: dict, evo_line: str = "") -> str:
     return "\n".join(lines)
 
 
-def _moves_html(moves: list) -> str:
+def _move_cell(m: dict, contributing: set | None = None) -> str:
+    bg, fg     = TYPE_COLORS.get(m["type"], ("#888", "#fff"))
+    name       = m["name"].replace("-", " ").title()
+    name_color = "#a6e3a1" if (contributing and m["name"] in contributing) else "#cdd6f4"
+    return (
+        f"<span style='background:{bg}; color:{fg}; border-radius:3px;"
+        f" padding:1px 6px; font-size:11px; font-weight:bold;'>"
+        f"&nbsp;{m['type'][:4].upper()}&nbsp;</span>"
+        f"<span style='font-size:13px; color:{name_color};'> {name}</span>"
+    )
+
+
+def _moves_html(moves: list, contributing: set | None = None) -> str:
+    """Render up to 4 moves in a 2×2 grid."""
     if not moves:
         return ""
-    parts = []
-    for m in moves:
-        bg, fg = TYPE_COLORS.get(m["type"], ("#888", "#fff"))
-        name   = m["name"].replace("-", " ").title()
-        parts.append(
-            f"<span style='background:{bg}; color:{fg}; border-radius:2px;"
-            f" padding:0 3px; font-size:11px; font-weight:bold;'>"
-            f"{m['type'][:4].upper()}</span>"
-            f"<span style='font-size:13px; color:#cdd6f4;'> {name}</span>"
-        )
-    return "&nbsp; ".join(parts)
+    cells = [_move_cell(m, contributing) for m in moves[:4]]
+    row1 = "&nbsp;&nbsp;".join(cells[:2])
+    if len(cells) > 2:
+        row2 = "&nbsp;&nbsp;".join(cells[2:])
+        return f"{row1}<br>{row2}"
+    return row1
+
+
+def _fmt_delta(val: float) -> str:
+    sign = "+" if val >= 0 else ""
+    return f"{sign}{int(val):,}"
 
 
 def _best_matchup(weaknesses: dict, team: list) -> list[tuple]:
@@ -316,7 +329,9 @@ class OverlayPanel(QWidget):
         self._party_names: list[str]                 = []
         self._party_current_moves: list[list[str]]   = []  # currently equipped move names
         self._party_stat_totals: list[int | None]    = []  # sum of all 6 live stats per member
+        self._party_snapshot: list[dict]             = []  # full party snapshot (live stats + nature)
         self._enemy_stat_totals: list[int | None]    = [None] * NUM_SLOTS
+        self._enemy_perm_stats: list[dict]           = [{} for _ in range(NUM_SLOTS)]
         self._team_type_groups: list[list[str]]      = []
 
         # Damage calculation state
@@ -555,7 +570,7 @@ class OverlayPanel(QWidget):
         self._rec_effects[slot] = effect
 
         pulse = QPropertyAnimation(effect, b"opacity", rec_lbl)
-        pulse.setDuration(1400)
+        pulse.setDuration(2800)
         pulse.setKeyValueAt(0.0, 1.0)
         pulse.setKeyValueAt(0.5, 0.45)
         pulse.setKeyValueAt(1.0, 1.0)
@@ -962,6 +977,8 @@ class OverlayPanel(QWidget):
         container.setVisible(bool(valid) and self._battle_type != 0)
         self._update_move_damage_labels(slot)
         self._run_prediction(slot)
+        # Trigger recommendation now that moves are available (handles turn-1 case
+        # where set_party_data ran before enemy moves were populated).
         threading.Thread(
             target=self._compute_recommendation, args=(slot,), daemon=True
         ).start()
@@ -1030,11 +1047,16 @@ class OverlayPanel(QWidget):
             lbl.setText(text)
             lbl.setStyleSheet(f"color:{color}; font-size:10px; background:transparent;")
 
+    def receive_enemy_perm_stats(self, slot: int, stats: dict) -> None:
+        """Permanent (getStat) atk/spa for the enemy — used in TI delta calculation."""
+        self._enemy_perm_stats[slot] = stats
+
     def set_party_data(self, party: list[dict]) -> None:
         """Called each snapshot with the live party. Refreshes catch recommendations."""
         self._party_names         = [m.get('name') or '' for m in party]
         self._party_current_moves = [m.get('moves') or [] for m in party]
         self._team_type_groups    = [m.get('types') or [] for m in party if m.get('types')]
+        self._party_snapshot      = list(party)
         self._party_stat_totals   = [
             sum(s for s in (m.get('stats') or {}).values() if s is not None) or None
             for m in party
@@ -1044,6 +1066,100 @@ class OverlayPanel(QWidget):
                 threading.Thread(
                     target=self._compute_recommendation, args=(slot,), daemon=True
                 ).start()
+
+    def _build_team_coverage(self, exclude_slot: int | None) -> dict:
+        """Per-pairing best SE damage for the current party, optionally skipping one slot."""
+        best: dict = {}
+        if not impact_db._EFF:
+            return best
+        for i, member in enumerate(self._party_snapshot):
+            if exclude_slot is not None and i == exclude_slot:
+                continue
+            if member.get("fainted"):
+                continue
+            live = member.get("stats") or {}
+            atk  = live.get("atk") or 0
+            spa  = live.get("spa") or 0
+            name = (member.get("name") or "").lower()
+            entry     = impact_db.get(name)
+            speed_pct = entry.get("speed_pct", 50) if entry else 50
+            factor    = 1.0 if speed_pct >= 70 else 0.4 + 0.6 * (speed_pct / 70)
+            types     = member.get("types") or []
+            moves_raw = (self._party_current_moves[i]
+                         if i < len(self._party_current_moves) else [])
+            for mn in moves_raw:
+                try:
+                    md = fetch_move(mn.lower().replace(" ", "-"))
+                    if not md or not md.power or md.category == "status":
+                        continue
+                    if md.name.lower() in impact_db._EXCLUDED_MOVES:
+                        continue
+                    stat = atk if md.category == "physical" else spa
+                    stab = 1.5 if md.type in types else 1.0
+                    acc  = (md.accuracy or 100) / 100.0
+                    base = stat * md.power * acc * stab * factor
+                    for pairing in impact_db.ALL_PAIRINGS:
+                        se = impact_db._EFF.get((md.type, pairing), 0.0)
+                        if se > 1.0:
+                            val = base * se
+                            if val > best.get(pairing, 0.0):
+                                best[pairing] = val
+                except Exception:
+                    pass
+        return best
+
+    def _ti_delta_for_swap(self, enemy_slot: int, party_slot: int,
+                            wild_entry: dict | None) -> float:
+        """TI change if party_slot is replaced by the enemy at enemy_slot."""
+        if not self._party_snapshot or not impact_db._EFF:
+            return 0.0
+        without = self._build_team_coverage(exclude_slot=party_slot)
+        current = self._build_team_coverage(exclude_slot=None)
+        current_ti = sum(current.values())
+
+        perm      = self._enemy_perm_stats[enemy_slot]
+        cand_atk  = perm.get("atk") or 0
+        cand_spa  = perm.get("spa") or 0
+        speed_pct = wild_entry.get("speed_pct", 50) if wild_entry else 50
+        factor    = 1.0 if speed_pct >= 70 else 0.4 + 0.6 * (speed_pct / 70)
+        slot_data = self._slot_data[enemy_slot]
+        cand_types = slot_data[0].types if slot_data else []
+
+        new_best = dict(without)
+        for md in self._enemy_moves[enemy_slot]:
+            if not md or not md.power or md.category == "status":
+                continue
+            if md.name.lower() in impact_db._EXCLUDED_MOVES:
+                continue
+            stat = cand_atk if md.category == "physical" else cand_spa
+            stab = 1.5 if md.type in cand_types else 1.0
+            acc  = (md.accuracy or 100) / 100.0
+            base = stat * md.power * acc * stab * factor
+            for pairing in impact_db.ALL_PAIRINGS:
+                se = impact_db._EFF.get((md.type, pairing), 0.0)
+                if se > 1.0:
+                    val = base * se
+                    if val > new_best.get(pairing, 0.0):
+                        new_best[pairing] = val
+        return sum(new_best.values()) - current_ti
+
+    def _ti_contributing_moves(self, enemy_slot: int,
+                                exclude_party_slot: int | None,
+                                wild_entry: dict | None) -> set[str]:
+        """Move names from wild_entry that add SE coverage the current team lacks."""
+        if not wild_entry or not impact_db._EFF:
+            return set()
+        team_pv = self._build_team_coverage(exclude_slot=exclude_party_slot)
+        covered = {p for p, v in team_pv.items() if v > 0}
+        result: set[str] = set()
+        for m in wild_entry.get("moves", []):
+            mtype = m.get("type", "")
+            for pairing in impact_db.ALL_PAIRINGS:
+                se = impact_db._EFF.get((mtype, pairing), 0.0)
+                if se > 1.0 and pairing not in covered:
+                    result.add(m["name"])
+                    break
+        return result
 
     def _compute_recommendation(self, slot: int) -> None:
         """Background thread: analyse enemy vs party, emit rec_ready."""
@@ -1065,7 +1181,7 @@ class OverlayPanel(QWidget):
         enemy_name = pokemon.name.lower()
         enemy_bst  = sum(pokemon.stats.values())
 
-        # ── Resolve final-evolution name + BST ────────────────────────────
+        # ── Resolve final evolution ───────────────────────────────────────
         evo_name = enemy_name
         evo_bst  = enemy_bst
         if stats_db.is_ready() and not stats_db.is_fully_evolved(enemy_name):
@@ -1082,70 +1198,97 @@ class OverlayPanel(QWidget):
                         pass
             except Exception:
                 pass
-        evo_bst_pct = (stats_db.bst_percentile(evo_bst, pool="final")
-                       if stats_db.is_ready() else int(enemy_bst_pct))
 
-        # ── New-type coverage (for card display) ──────────────────────────
-        moves = self._enemy_moves[slot]
-        enemy_move_types = [
-            m.type for m in moves
-            if m and m.type and m.category != 'status' and (m.power or 0) > 0
-        ]
-        enemy_cov = offensive_coverage(enemy_move_types)
-        team_cov: set[str] = set()
-        for i, name in enumerate(self._party_names):
-            if not name:
-                continue
-            for move_name in (self._party_current_moves[i] if i < len(self._party_current_moves) else []):
-                try:
-                    mdata = fetch_move(move_name)
-                    if mdata.type and mdata.category != 'status' and (mdata.power or 0) > 0:
-                        team_cov.add(mdata.type)
-                except Exception:
-                    pass
-        new_types = sorted(enemy_cov - team_cov)
-
-        # ── Impact-score lookup for the wild Pokémon ──────────────────────
+        # ── Impact DB lookup ──────────────────────────────────────────────
         wild_entry = impact_db.get(evo_name) or impact_db.get(enemy_name)
-        wild_pct   = wild_entry["percentile"] if wild_entry else None
+        wild_ai    = wild_entry["percentile"] if wild_entry else None
         wild_moves = wild_entry.get("moves", []) if wild_entry else []
+        cand_name  = evo_name if (wild_entry and impact_db.get(evo_name)) else enemy_name
 
         party_size = len([n for n in self._party_names if n])
         team_full  = party_size >= 6
 
-        # ── Team not full: suggest if wild is p50+ impact score ───────────
+        # ── Party not full ────────────────────────────────────────────────
         if not team_full:
-            if wild_pct is not None and wild_pct >= 50:
+            if wild_ai is not None and wild_ai >= 75:
+                contributing = self._ti_contributing_moves(slot, None, wild_entry)
                 self._signals.rec_ready.emit((slot, {
-                    'kind':      'great',
-                    'new_types': new_types,
-                    'score_pct': wild_pct,
-                    'moves':     wild_moves,
+                    'kind':          'catch',
+                    'name':          cand_name.replace('-', ' ').title(),
+                    'candidate_ai':  wild_ai,
+                    'moves':         wild_moves,
+                    'ti_contributing': contributing,
                 }))
             else:
                 self._signals.rec_ready.emit((slot, None))
             return
 
-        # ── Team full: swap if it increases the team's combined score ──────
-        party_names = [n for n in self._party_names if n]
-        if not party_names or not impact_db.is_ready():
+        # ── Full team: best swap by PI ─────────────────────────────────────
+        if not self._party_snapshot or not impact_db.is_ready():
             self._signals.rec_ready.emit((slot, None))
             return
 
-        swap = impact_db.best_swap(party_names, evo_name)
-        if swap is None:
+        swap = impact_db.best_swap_pi(self._party_snapshot, cand_name)
+
+        if swap is not None:
+            ti_delta     = self._ti_delta_for_swap(slot, swap['slot'], wild_entry)
+            contributing = self._ti_contributing_moves(slot, swap['slot'], wild_entry)
+            self._signals.rec_ready.emit((slot, {
+                'kind':            'replace',
+                'name':            swap['replaced_name'].replace('-', ' ').title(),
+                'candidate_ai':    swap['candidate_ai'],
+                'replaced_ai':     swap['replaced_ai'],
+                'pi_delta':        swap['pi_delta'],
+                'ti_delta':        ti_delta,
+                'moves':           wild_moves,
+                'ti_contributing': contributing,
+            }))
+            return
+
+        # ── No PI benefit — check AI vs team members ───────────────────────
+        if wild_ai is None:
             self._signals.rec_ready.emit((slot, None))
             return
 
-        replace_name, old_score, new_score = swap
-        pct_gain = round((new_score - old_score) / max(old_score, 1) * 100)
-        self._signals.rec_ready.emit((slot, {
-            'kind':        'replace',
-            'name':        replace_name.capitalize(),
-            'new_types':   new_types,
-            'pct_gain':    pct_gain,
-            'moves':       wild_moves,
-        }))
+        # Best swap ignoring sign — gives pi/ti context even when PI decreases
+        consider_swap = impact_db.best_swap_pi(
+            self._party_snapshot, cand_name, require_positive=False
+        )
+        consider_pi_delta = consider_swap['pi_delta'] if consider_swap else 0.0
+        consider_ti_delta = (
+            self._ti_delta_for_swap(slot, consider_swap['slot'], wild_entry)
+            if consider_swap else 0.0
+        )
+
+        team_ais: list[tuple[str, int]] = []
+        for n in self._party_names:
+            if not n:
+                continue
+            e = impact_db.get(n) or impact_db.get(impact_db._final_evo_for(n))
+            if e:
+                team_ais.append((n.replace('-', ' ').title(), e['percentile']))
+
+        weakest = min(team_ais, key=lambda x: x[1]) if team_ais else None
+
+        if weakest and wild_ai > weakest[1]:
+            self._signals.rec_ready.emit((slot, {
+                'kind':          'consider',
+                'name':          cand_name.replace('-', ' ').title(),
+                'candidate_ai':  wild_ai,
+                'weakest_name':  weakest[0],
+                'weakest_ai':    weakest[1],
+                'moves':         wild_moves,
+                'pi_delta':      consider_pi_delta,
+                'ti_delta':      consider_ti_delta,
+            }))
+        elif wild_ai > 0:
+            self._signals.rec_ready.emit((slot, {
+                'kind':         'skip',
+                'name':         cand_name.replace('-', ' ').title(),
+                'candidate_ai': wild_ai,
+            }))
+        else:
+            self._signals.rec_ready.emit((slot, None))
 
     def _on_rec_ready(self, payload) -> None:
         slot, rec = payload
@@ -1162,51 +1305,95 @@ class OverlayPanel(QWidget):
             lbl.setVisible(False)
             return
 
-        if rec['kind'] == 'great':
-            new_types = rec['new_types']
-            pct       = rec['score_pct']
-            cov_line  = (
-                f"<span style='font-size:16px; color:#d0eed8'>"
-                f"&nbsp;• Covers {', '.join(t.capitalize() for t in new_types)}</span>"
-                if new_types else
-                "<span style='font-size:16px; color:#6c7086'>&nbsp;• No new type coverage</span>"
-            )
-            move_line = _moves_html(rec.get('moves', []))
+        kind = rec['kind']
+        contributing = rec.get('ti_contributing') or set()
+
+        if kind == 'catch':
+            ai        = rec['candidate_ai']
+            move_line = _moves_html(rec.get('moves', []), contributing)
             html = (
-                f"<span style='font-size:24px; font-weight:bold; color:#52f07a'>Great catch!</span><br>"
-                f"{cov_line}<br>"
-                f"<span style='font-size:16px; color:#a0c8a8'>&nbsp;• p{pct} impact score</span><br>"
+                f"<span style='font-size:22px; font-weight:bold; color:#89dceb'>"
+                f"Catch {rec['name']}!</span>"
+                f"<span style='font-size:14px; color:#89dceb'>&nbsp;ai{ai}</span><br>"
                 f"{move_line}"
             )
             lbl.setStyleSheet(
-                "QLabel { background:#0c1c10; border-left:4px solid #52f07a;"
+                "QLabel { background:#071825; border-left:4px solid #89dceb;"
                 " border-radius:4px; padding:8px 10px; margin-top:2px; }"
             )
             lbl.setText(html)
             lbl.setVisible(True)
             if pulse: pulse.start()
-        else:  # replace — static, no pulse
-            if pulse: pulse.stop()
-            if effect: effect.setOpacity(1.0)
-            new_types = rec.get('new_types', [])
-            cov_line  = (
-                f"Adds: {', '.join(t.capitalize() for t in new_types)}"
-                if new_types else "No new coverage types"
-            )
-            gain = rec['pct_gain']
-            move_line = _moves_html(rec.get('moves', []))
+
+        elif kind == 'replace':
+            old_ai    = rec.get('replaced_ai', 0)
+            new_ai    = rec.get('candidate_ai', 0)
+            pi_delta  = rec.get('pi_delta', 0.0)
+            ti_delta  = rec.get('ti_delta', 0.0)
+            ti_color  = "#a6e3a1" if ti_delta >= 0 else "#f38ba8"
+            border_col = "#52f07a" if ti_delta >= 0 else "#a6e3a1"
+            bg_col     = "#0c1c10" if ti_delta >= 0 else "#0a1810"
+            move_line  = _moves_html(rec.get('moves', []), contributing)
+            pi_str = f"+pi{int(pi_delta):,}" if pi_delta >= 0 else f"-pi{int(-pi_delta):,}"
+            ti_str = f"+ti{int(ti_delta):,}" if ti_delta >= 0 else f"-ti{int(-ti_delta):,}"
             html = (
-                f"<span style='font-size:22px; font-weight:bold; color:#ffb566'>Replace {rec['name']}!</span><br>"
-                f"<span style='font-size:16px; color:#eedcc8'>&nbsp;• {cov_line}</span><br>"
-                f"<span style='font-size:16px; color:#b0a090'>&nbsp;• +{gain}% team score</span><br>"
-                f"{move_line}"
+                f"<span style='font-size:20px; font-weight:bold; color:#a6e3a1'>"
+                f"Replace {rec['name']}</span><br>"
+                f"<span style='font-size:15px; color:#cba6f7'>{pi_str}</span><br>"
+                f"<span style='font-size:15px; color:{ti_color}'>{ti_str}</span><br>"
+                f"<span style='font-size:13px; color:#6c7086'>"
+                f"ai{old_ai} → ai{new_ai}</span><br>"
+                f"<br>{move_line}"
             )
             lbl.setStyleSheet(
-                "QLabel { background:#1a1208; border-left:4px solid #ffb566;"
+                f"QLabel {{ background:{bg_col}; border-left:4px solid {border_col};"
+                f" border-radius:4px; padding:8px 10px; margin-top:2px; }}"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+            if pulse: pulse.start()
+
+        elif kind == 'consider':
+            cand_ai   = rec['candidate_ai']
+            weak_name = rec['weakest_name']
+            weak_ai   = rec['weakest_ai']
+            pi_delta  = rec.get('pi_delta', 0.0)
+            ti_delta  = rec.get('ti_delta', 0.0)
+            ti_color  = "#a6e3a1" if ti_delta >= 0 else "#f38ba8"
+            pi_str    = f"+pi{int(pi_delta):,}" if pi_delta >= 0 else f"-pi{int(-pi_delta):,}"
+            ti_str    = f"+ti{int(ti_delta):,}" if ti_delta >= 0 else f"-ti{int(-ti_delta):,}"
+            move_line = _moves_html(rec.get('moves', []))
+            html = (
+                f"<span style='font-size:20px; font-weight:bold; color:#f9e2af'>"
+                f"Consider {rec['name']}</span>"
+                f"<span style='font-size:13px; color:#f9e2af'>&nbsp;ai{cand_ai}</span><br>"
+                f"<span style='font-size:13px; color:#a09070'>"
+                f"Beats {weak_name} (ai{weak_ai})</span><br>"
+                f"<span style='font-size:15px; color:#cba6f7'>{pi_str}</span><br>"
+                f"<span style='font-size:15px; color:{ti_color}'>{ti_str}</span><br>"
+                f"<br>{move_line}"
+            )
+            lbl.setStyleSheet(
+                "QLabel { background:#1a1808; border-left:3px solid #f9e2af;"
                 " border-radius:4px; padding:8px 10px; margin-top:2px; }"
             )
             lbl.setText(html)
             lbl.setVisible(True)
+            if pulse: pulse.stop()
+
+        else:  # skip
+            cand_ai = rec.get('candidate_ai', 0)
+            html = (
+                f"<span style='font-size:16px; color:#45475a'>"
+                f"{rec['name']} — ai{cand_ai} — team already stronger</span>"
+            )
+            lbl.setStyleSheet(
+                "QLabel { background:#13131f; border-left:2px solid #313244;"
+                " border-radius:4px; padding:6px 10px; margin-top:2px; }"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+            if pulse: pulse.stop()
 
     def set_battle_context(self, player_types: list, battle_type: int) -> None:
         """Called each snapshot tick with the primary player's live types and battle type."""
@@ -1442,11 +1629,14 @@ class OverlayPanel(QWidget):
                 if impact_entry:
                     pct = impact_entry["percentile"]
                     color = _pct_color(pct)
-                    self._pct_lbls[slot].setText(f"p{pct}")
+                    self._pct_lbls[slot].setText(f"ai{pct}")
                     self._pct_lbls[slot].setStyleSheet(f"color:{color}; font-size:14px;")
                     self._pct_lbls[slot].setToolTip(_impact_tooltip(impact_entry, evo_line))
                     self._pct_lbls[slot].setVisible(True)
                     self._slot_bst_pcts[slot] = pct
+                    threading.Thread(
+                        target=self._compute_recommendation, args=(slot,), daemon=True
+                    ).start()
                     break
 
     def _on_error(self, payload):
@@ -1495,7 +1685,7 @@ class OverlayPanel(QWidget):
         if impact_entry:
             pct = impact_entry["percentile"]
             color = _pct_color(pct)
-            self._pct_lbls[slot].setText(f"p{pct}")
+            self._pct_lbls[slot].setText(f"ai{pct}")
             self._pct_lbls[slot].setStyleSheet(f"color:{color}; font-size:14px;")
             self._pct_lbls[slot].setToolTip(_impact_tooltip(impact_entry))
             self._pct_lbls[slot].setVisible(True)
@@ -1542,8 +1732,21 @@ class OverlayPanel(QWidget):
             layout.addWidget(lbl)
             return
 
+        slot_data = self._slot_data[slot]
+        opponent_types = slot_data[0].types if slot_data else []
+        name_to_types = {
+            s["name"].lower(): s.get("types", [])
+            for s in team if s and isinstance(s, dict) and s.get("name")
+        }
+
         for i, (pname, move_name, move_type, eff) in enumerate(picks):
             is_active = bool(self._active_pokemon and pname.lower() == self._active_pokemon)
+
+            friend_types = name_to_types.get(pname.lower(), [])
+            takes_se = False
+            if friend_types and opponent_types:
+                friend_weaknesses = calculate_weaknesses(friend_types)
+                takes_se = any(friend_weaknesses.get(t, 1.0) >= 2.0 for t in opponent_types)
 
             row_widget = QFrame()
             row_widget.setObjectName("active_row" if is_active else "")
@@ -1569,6 +1772,12 @@ class OverlayPanel(QWidget):
             )
             name_lbl.setMinimumWidth(0)
             row.addWidget(name_lbl)
+
+            if takes_se:
+                warn_lbl = QLabel("*")
+                warn_lbl.setStyleSheet("color:#f38ba8; font-size:14px; background: transparent;")
+                warn_lbl.setToolTip("Takes SE damage from opponent's type(s)")
+                row.addWidget(warn_lbl)
 
             bg, fg = TYPE_COLORS.get(move_type, ("#888", "#fff"))
             badge = QLabel(move_type[:4].upper())

@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QSizePolicy,
     QProgressBar, QStyleFactory,
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPointF
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPointF, QTimer
 from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor, QPen, QPolygonF
 
 from pokemon_api import fetch_pokemon, fetch_move, fetch_ability, nature_mod_str, MoveData, PokemonData
@@ -174,7 +174,17 @@ class TeamPanel(QWidget):
         # tiebreaker when 2v2 move attribution is ambiguous (both candidate slots
         # score equally for an OCR'd move).
         self._last_active_position: int = 0
-        self._avg_lbl = None
+        self._potential_lbl: QLabel | None = None
+        self._impact_lbl:    QLabel | None = None
+        self._last_potential: float = 0.0
+        self._last_impact:    float = 0.0
+        self._potential_pulse_timer: QTimer | None = None
+        self._impact_pulse_timer:    QTimer | None = None
+        self._potential_delta_lbl: QLabel | None = None
+        self._impact_delta_lbl:    QLabel | None = None
+        self._potential_delta_timer: QTimer | None = None
+        self._impact_delta_timer:    QTimer | None = None
+        self._live_stats: list[dict | None] = [None] * TEAM_SIZE
 
         self._signals = _Signals()
         self._signals.result_ready.connect(self._on_result)
@@ -247,8 +257,38 @@ class TeamPanel(QWidget):
                 "QPushButton:hover{color:#f38ba8;}"
             )
             close_btn.clicked.connect(self.hide)
+            title_row.addSpacing(6)
             title_row.addWidget(close_btn)
         inner.addLayout(title_row)
+
+        scores_row = QHBoxLayout()
+        pot_hdr = QLabel("Potential")
+        pot_hdr.setStyleSheet("color:#6c7086; font-size:14px;")
+        self._potential_lbl = QLabel("—")
+        self._potential_lbl.setStyleSheet("color:#cba6f7; font-size:39px; font-weight:bold;")
+        self._potential_delta_lbl = QLabel("")
+        self._potential_delta_lbl.setStyleSheet("color:#cba6f7; font-size:16px;")
+        self._potential_delta_lbl.setVisible(False)
+        scores_row.addWidget(pot_hdr)
+        scores_row.addSpacing(4)
+        scores_row.addWidget(self._potential_lbl)
+        scores_row.addSpacing(6)
+        scores_row.addWidget(self._potential_delta_lbl)
+        scores_row.addStretch()
+        imp_hdr = QLabel("Team Impact")
+        imp_hdr.setStyleSheet("color:#6c7086; font-size:14px;")
+        self._impact_lbl = QLabel("—")
+        self._impact_lbl.setStyleSheet("color:#a6e3a1; font-size:39px; font-weight:bold;")
+        self._impact_delta_lbl = QLabel("")
+        self._impact_delta_lbl.setStyleSheet("color:#a6e3a1; font-size:16px;")
+        self._impact_delta_lbl.setVisible(False)
+        scores_row.addWidget(self._impact_delta_lbl)
+        scores_row.addSpacing(6)
+        scores_row.addWidget(self._impact_lbl)
+        scores_row.addSpacing(4)
+        scores_row.addWidget(imp_hdr)
+        inner.addLayout(scores_row)
+
         inner.addWidget(self._divider())
 
         scroll = QScrollArea()
@@ -283,7 +323,7 @@ class TeamPanel(QWidget):
             # Analysis sections inline (standalone window only)
             scroll_layout.addWidget(self._divider())
 
-            self._weak_link_area, wl_frame   = self._make_section_cell("WEAKEST LINK")
+            self._weak_link_area, wl_frame   = self._make_section_cell("COVERAGE DISTRIBUTION")
             self._tips_area,      tips_frame = self._make_section_cell("COVERAGE TIPS")
             self._pref_type_area, pt_frame   = self._make_section_cell("PREFERRED TYPING")
             self._danger_area,    dan_frame  = self._make_section_cell("DANGER COMBOS")
@@ -322,14 +362,36 @@ class TeamPanel(QWidget):
 
         hdr_row = QHBoxLayout()
         hdr_row.setContentsMargins(0, 0, 0, 0)
-        hdr = QLabel("My Team")
-        hdr.setStyleSheet("color:#cdd6f4; font-size:13px; font-weight:bold;")
-        hdr_row.addWidget(hdr)
-        hdr_row.addStretch()
-        self._avg_lbl = QLabel("")
-        self._avg_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._avg_lbl.setStyleSheet("font-size:11px;")
-        hdr_row.addWidget(self._avg_lbl)
+        pot_hdr_s = QLabel("Potential")
+        pot_hdr_s.setStyleSheet("color:#6c7086; font-size:14px;")
+        self._potential_lbl = QLabel("—")
+        self._potential_lbl.setStyleSheet("color:#cba6f7; font-size:33px; font-weight:bold;")
+        self._potential_delta_lbl = QLabel("")
+        self._potential_delta_lbl.setStyleSheet("color:#cba6f7; font-size:13px;")
+        self._potential_delta_lbl.setVisible(False)
+        hdr_row.addWidget(pot_hdr_s)
+        hdr_row.addSpacing(3)
+        hdr_row.addWidget(self._potential_lbl)
+        hdr_row.addSpacing(4)
+        hdr_row.addWidget(self._potential_delta_lbl)
+        hdr_row.addStretch(1)
+        team_lbl = QLabel("Team")
+        team_lbl.setStyleSheet("color:#cdd6f4; font-size:13px; font-weight:bold;")
+        team_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hdr_row.addWidget(team_lbl)
+        hdr_row.addStretch(1)
+        imp_hdr_s = QLabel("Impact")
+        imp_hdr_s.setStyleSheet("color:#6c7086; font-size:14px;")
+        self._impact_lbl = QLabel("—")
+        self._impact_lbl.setStyleSheet("color:#a6e3a1; font-size:33px; font-weight:bold;")
+        self._impact_delta_lbl = QLabel("")
+        self._impact_delta_lbl.setStyleSheet("color:#a6e3a1; font-size:13px;")
+        self._impact_delta_lbl.setVisible(False)
+        hdr_row.addWidget(self._impact_delta_lbl)
+        hdr_row.addSpacing(4)
+        hdr_row.addWidget(self._impact_lbl)
+        hdr_row.addSpacing(3)
+        hdr_row.addWidget(imp_hdr_s)
         root.addLayout(hdr_row)
 
         slots_row = QHBoxLayout()
@@ -496,6 +558,7 @@ class TeamPanel(QWidget):
         for slot in range(TEAM_SIZE):
             if slot >= len(party):
                 self._party_target_types[slot] = []
+                self._live_stats[slot] = None
                 if self._team_data[slot] is not None:
                     self._clear_slot(slot)
                 elif self._hp_bars[slot] is not None:
@@ -505,6 +568,7 @@ class TeamPanel(QWidget):
             name = _norm(member.get('name') or '')
             if not name:
                 self._party_target_types[slot] = []
+                self._live_stats[slot] = None
                 if self._team_data[slot] is not None:
                     self._clear_slot(slot)
                 elif self._hp_bars[slot] is not None:
@@ -527,6 +591,14 @@ class TeamPanel(QWidget):
             # Abilities
             self._set_slot_abilities(slot, member.get('ability'), member.get('passive'),
                                      member.get('abilityIndex'), member.get('nature'))
+
+            # Live stats from JS (level-scaled, permanent — no battle stages)
+            js_stats = member.get('stats') or {}
+            self._live_stats[slot] = {
+                "atk":    js_stats.get("atk") or 0,
+                "spa":    js_stats.get("spa") or 0,
+                "nature": member.get("nature"),
+            }
 
             # Track JS types for form-override on this slot
             types = list(member.get('types') or [])
@@ -714,12 +786,6 @@ class TeamPanel(QWidget):
         header = QHBoxLayout()
         header.setSpacing(3)
 
-        level_lbl = QLabel("")
-        level_lbl.setStyleSheet("color:#89b4fa; font-size:14px;")
-        level_lbl.setFixedWidth(44)
-        level_lbl.setVisible(False)
-        self._level_lbls[slot] = level_lbl
-
         # Type badges live inline — hidden until a pokemon is loaded
         type_container = QWidget()
         type_container.setStyleSheet("background: transparent;")
@@ -734,26 +800,15 @@ class TeamPanel(QWidget):
         name_lbl.setStyleSheet("color:#45475a; font-size:16px;")
         self._name_lbls[slot] = name_lbl
 
-        matchup_lbl = QLabel("")
-        matchup_lbl.setTextFormat(Qt.TextFormat.RichText)
-        matchup_lbl.setStyleSheet("font-size:11px;")
-        matchup_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        matchup_lbl.setVisible(False)
-        self._matchup_lbls[slot] = matchup_lbl
+        level_lbl = QLabel("")
+        level_lbl.setStyleSheet("color:#89b4fa; font-size:14px;")
+        level_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        level_lbl.setVisible(False)
+        self._level_lbls[slot] = level_lbl
 
-        clear_btn = QPushButton("✕")
-        clear_btn.setFixedSize(13, 13)
-        clear_btn.setStyleSheet(
-            "QPushButton{background:transparent;color:#45475a;border:none;font-size:9px;}"
-            "QPushButton:hover{color:#f38ba8;}"
-        )
-        clear_btn.clicked.connect(lambda _, s=slot: self._clear_slot(s))
-
-        header.addWidget(level_lbl)
         header.addWidget(type_container)
         header.addWidget(name_lbl, 1)
-        header.addWidget(matchup_lbl)
-        header.addWidget(clear_btn)
+        header.addWidget(level_lbl)
         layout.addLayout(header)
 
         hp_bar = QProgressBar()
@@ -994,7 +1049,7 @@ class TeamPanel(QWidget):
         self._level_vals[slot] = None
         if not self._embedded:
             self._rebuild_weakness_grid()
-        self._update_avg_lbl()
+        self._update_impact_lbls()
         self._trigger_analysis_rebuild()
         self._save_team()
 
@@ -1008,7 +1063,7 @@ class TeamPanel(QWidget):
         self._move_ocr_buf = [("", 0)] * MOVE_SLOTS
         if not self._embedded:
             self._rebuild_weakness_grid()
-        self._update_avg_lbl()
+        self._update_impact_lbls()
         self._trigger_analysis_rebuild()
         self._save_team()
 
@@ -1066,7 +1121,7 @@ class TeamPanel(QWidget):
         target = self._party_target_types[slot]
         if target and set(target) != set(pokemon.types):
             self._try_form_override_for_slot(slot, target)
-        self._update_avg_lbl()
+        self._update_impact_lbls()
         self._trigger_analysis_rebuild()
         self._save_team()
 
@@ -1136,6 +1191,7 @@ class TeamPanel(QWidget):
         self._team_moves[slot][mi] = move
         self._apply_move_to_row(slot, mi, move)
         self._trigger_analysis_rebuild()
+        self._update_impact_lbls()
         self._save_team()
 
     def _apply_move_to_row(self, slot: int, mi: int, move: MoveData):
@@ -1339,7 +1395,7 @@ class TeamPanel(QWidget):
                 continue
             bst, bst_pct, matchup, unique = stat
             mu_pct = round(matchup / total_covered * 100)
-            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 17 else "#f38ba8"
+            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 15 else "#f38ba8"
             if mu_lbl is not None:
                 mu_lbl.setText(
                     f"<span style='color:{mu_color}'>{mu_pct}%</span>"
@@ -1358,62 +1414,32 @@ class TeamPanel(QWidget):
         self._clear_layout(self._weak_link_area)
         filled = [(s, st) for s, st in enumerate(slot_stats) if st is not None]
         if not filled:
-            self._weak_link_area.addWidget(self._placeholder("Add Pokemon to see weakest link"))
+            self._weak_link_area.addWidget(self._placeholder("Add Pokemon to see hiscores"))
             return
 
         total_covered = sum(st[2] for _, st in filled) or 1
-        ranked = sorted(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
+        ranked = sorted(filled, key=lambda x: x[1][2], reverse=True)
         for s, (bst, bst_pct, matchup, unique) in ranked:
-            pokemon    = self._team_data[s]
-            name       = pokemon.name.capitalize() if pokemon else f"Slot {s + 1}"
-            is_weakest = s == weakest_slot
+            pokemon  = self._team_data[s]
+            name     = pokemon.name.capitalize() if pokemon else f"Slot {s + 1}"
 
             row = QHBoxLayout()
             row.setSpacing(5)
 
-            warn = QLabel("⚠" if is_weakest else "")
-            warn.setFixedWidth(12)
-            warn.setStyleSheet("color:#f38ba8; font-size:12px;")
-
-            name_lbl = QLabel(name)
-            name_color = "#f38ba8" if is_weakest else "#cdd6f4"
-            name_lbl.setStyleSheet(f"color:{name_color}; font-size:12px;")
-
-            pct_color = "#a6e3a1" if bst_pct >= 66 else "#f9e2af" if bst_pct >= 33 else "#f38ba8"
-            stat_lbl  = QLabel(f"{bst} {bst_pct}th%")
-            stat_lbl.setStyleSheet(f"color:{pct_color}; font-size:12px;")
-
             mu_pct = round(matchup / total_covered * 100)
-            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 17 else "#f38ba8"
-            cov_lbl = QLabel(f"{mu_pct}%")
-            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:12px;")
+            mu_color = ("#38bdf8" if mu_pct >= 30 else
+                        "#a6e3a1" if mu_pct >= 15 else
+                        "#f9e2af" if mu_pct >= 10 else
+                        "#f38ba8")
+            name_lbl = QLabel(name)
+            name_lbl.setStyleSheet(f"color:{mu_color}; font-size:12px; font-weight:bold;")
 
-            row.addWidget(warn)
+            cov_lbl = QLabel(f"{mu_pct}%")
+            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:12px; font-weight:bold;")
+
             row.addWidget(name_lbl)
-            row.addWidget(stat_lbl)
             row.addStretch()
             row.addWidget(cov_lbl)
-            self._weak_link_area.addLayout(row)
-
-        if weakest_slot is not None:
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            if replace_sugg:
-                type_name, gain, specific_gaps = replace_sugg
-                add_lbl = QLabel("Add")
-                add_lbl.setStyleSheet("color:#89b4fa; font-size:12px;")
-                row.addWidget(add_lbl)
-                row.addWidget(self._make_type_badge(type_name))
-                count_lbl = QLabel(f"({gain})")
-                count_lbl.setStyleSheet("color:#a6adc8; font-size:12px;")
-                row.addWidget(count_lbl)
-                for gap_type in specific_gaps:
-                    row.addWidget(self._make_type_badge(gap_type))
-            else:
-                desc = QLabel("Coverage unchanged without them")
-                desc.setStyleSheet("color:#6c7086; font-size:12px;")
-                row.addWidget(desc)
-            row.addStretch()
             self._weak_link_area.addLayout(row)
 
     def _rebuild_preferred_typing(self, pref_type):
@@ -1509,27 +1535,133 @@ class TeamPanel(QWidget):
 
     # ── team average ──────────────────────────────────────────────────────────
 
-    def _update_avg_lbl(self):
-        if self._avg_lbl is None:
+    @staticmethod
+    def _fmt_score(score: float) -> str:
+        return f"{int(score):,}"
+
+    def _update_impact_lbls(self):
+        if not impact_db.is_ready():
             return
-        names = [p.name.lower() for p in self._team_data if p is not None]
-        if not names or not impact_db.is_ready():
-            self._avg_lbl.setText("")
+        has_any = any(p is not None for p in self._team_data)
+
+        if not has_any:
+            for lbl in (self._potential_lbl, self._impact_lbl):
+                if lbl:
+                    lbl.setText("—")
+            self._last_potential = 0.0
+            self._last_impact = 0.0
             return
-        score = impact_db.team_score(names)
-        if score <= 0:
-            self._avg_lbl.setText("")
+
+        # ── Team Impact (TI): live stats + actual equipped moves ──────────
+        best: dict = {}
+        for s in range(TEAM_SIZE):
+            pokemon = self._team_data[s]
+            if pokemon is None:
+                continue
+            live = self._live_stats[s]
+            atk    = live["atk"]    if live else pokemon.stats.get("attack", 0)
+            sp_atk = live["spa"]    if live else pokemon.stats.get("special-attack", 0)
+            entry     = impact_db.get(pokemon.name.lower())
+            speed_pct = entry.get("speed_pct", 50) if entry else 50
+            factor    = 1.0 if speed_pct >= 70 else 0.4 + 0.6 * (speed_pct / 70)
+            types     = pokemon.types
+            for move in self._team_moves[s]:
+                if move is None or not move.power or move.category == "status":
+                    continue
+                if move.name.lower() in impact_db._EXCLUDED_MOVES:
+                    continue
+                stat = atk if move.category == "physical" else sp_atk
+                stab = 1.5 if move.type in types else 1.0
+                acc  = (move.accuracy or 100) / 100.0
+                base = stat * move.power * acc * stab * factor
+                for pairing in impact_db.ALL_PAIRINGS:
+                    se = impact_db._EFF.get((move.type, pairing), 0.0)
+                    if se > 1.0:
+                        val = base * se
+                        if val > best.get(pairing, 0.0):
+                            best[pairing] = val
+        new_impact = sum(best.values())
+
+        # ── Potential Impact (PI): final-evo BST + nature + cached learnset ─
+        pi_best: dict = {}
+        for s in range(TEAM_SIZE):
+            pokemon = self._team_data[s]
+            if pokemon is None:
+                continue
+            live      = self._live_stats[s]
+            nature_id = live.get("nature") if live else None
+            final_name = impact_db._final_evo_for(pokemon.name.lower())
+            for pairing, val in impact_db._pi_pairing_vector(final_name, nature_id).items():
+                if val > pi_best.get(pairing, 0.0):
+                    pi_best[pairing] = val
+        new_potential = sum(pi_best.values())
+
+        # ── Update Potential label ─────────────────────────────────────────
+        if self._potential_lbl:
+            self._potential_lbl.setText(self._fmt_score(new_potential) if new_potential > 0 else "—")
+            if new_potential > self._last_potential + 1:
+                delta = new_potential - self._last_potential
+                self._pulse_label(self._potential_lbl, "potential")
+                self._show_delta(self._potential_delta_lbl, delta, "potential",
+                                 "#cba6f7")
+            self._last_potential = new_potential
+
+        # ── Update Impact label ────────────────────────────────────────────
+        if self._impact_lbl:
+            self._impact_lbl.setText(self._fmt_score(new_impact) if new_impact > 0 else "—")
+            if new_impact > self._last_impact + 1:
+                delta = new_impact - self._last_impact
+                self._pulse_label(self._impact_lbl, "impact")
+                self._show_delta(self._impact_delta_lbl, delta, "impact",
+                                 "#a6e3a1")
+            self._last_impact = new_impact
+
+    def _show_delta(self, lbl: QLabel | None, delta: float, which: str, color: str):
+        """Show '+N' delta label for 3 seconds then hide it."""
+        if lbl is None:
             return
-        if score >= 1_000_000:
-            score_str = f"{score / 1_000_000:.1f}M"
-        elif score >= 1_000:
-            score_str = f"{score / 1_000:.0f}k"
-        else:
-            score_str = f"{score:.0f}"
-        self._avg_lbl.setText(
-            f"<span style='color:#6c7086'>impact </span>"
-            f"<span style='color:#a6e3a1'>{score_str}</span>"
-        )
+        timer_attr = f"_{which}_delta_timer"
+        existing = getattr(self, timer_attr, None)
+        if existing is not None:
+            existing.stop()
+        lbl.setText(f"+{int(delta):,}")
+        lbl.setStyleSheet(f"color:{color}; font-size:{'13px' if self._strip else '16px'};")
+        lbl.setVisible(True)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(3000)
+        timer.timeout.connect(lambda: lbl.setVisible(False))
+        setattr(self, timer_attr, timer)
+        timer.start()
+
+    def _pulse_label(self, lbl: QLabel, which: str):
+        """Flash lbl white 3 times then restore its normal color."""
+        timer_attr   = f"_{which}_pulse_timer"
+        normal_color = "#cba6f7" if which == "potential" else "#a6e3a1"
+        font_size    = "33px" if self._strip else "39px"
+        normal_style = f"color:{normal_color}; font-size:{font_size}; font-weight:bold;"
+        flash_style  = f"color:#ffffff; font-size:{font_size}; font-weight:bold;"
+
+        existing = getattr(self, timer_attr, None)
+        if existing is not None:
+            existing.stop()
+
+        count = [0]
+        timer = QTimer(self)
+        timer.setInterval(220)
+
+        def _tick():
+            count[0] += 1
+            lbl.setStyleSheet(flash_style if count[0] % 2 == 1 else normal_style)
+            if count[0] >= 6:
+                timer.stop()
+                lbl.setStyleSheet(normal_style)
+                setattr(self, timer_attr, None)
+
+        timer.timeout.connect(_tick)
+        setattr(self, timer_attr, timer)
+        lbl.setStyleSheet(flash_style)
+        timer.start()
 
     # ── persistence ───────────────────────────────────────────────────────────
 
@@ -1552,7 +1684,8 @@ class TeamPanel(QWidget):
                         moves.append(None)
                 lbl = self._level_lbls[i]
                 level = lbl.text()[1:] if (lbl is not None and lbl.isVisible() and lbl.text().startswith("L")) else None
-                team.append({"name": self._team_data[i].name, "moves": moves, "level": level})
+                team.append({"name": self._team_data[i].name, "moves": moves, "level": level,
+                             "types": self._team_data[i].types})
             else:
                 team.append(None)
         window_state.save_key("team", team)

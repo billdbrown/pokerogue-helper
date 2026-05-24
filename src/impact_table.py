@@ -1,14 +1,19 @@
 """Impact Score browser — searchable, sortable table dialog."""
 
+import json
+import math
+import os
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QTableWidget,
-    QTableWidgetItem, QHeaderView, QLabel, QWidget, QCheckBox,
+    QTableWidgetItem, QHeaderView, QLabel, QWidget, QCheckBox, QSlider,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSlot, QMetaObject, Q_ARG
 from PyQt6.QtGui import QColor
 
 import impact_db
 from scoring import OFFENSIVE_CHART
+from weakness_calc import _effectiveness, ALL_TYPES
 
 # Final-evolution starters across all generations (including Hisuian forms)
 _STARTER_POKEMON: frozenset[str] = frozenset({
@@ -76,14 +81,47 @@ _STYLE = """
     QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
 """
 
+_IMMUNE_CAP = 50  # hits-to-KO assigned to immune type matchups
+
+
+def _load_stats_cache() -> dict:
+    base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PokerogueHelper")
+    path = os.path.join(base, "stats_cache.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        data.pop("_version", None)
+        return data
+    except Exception:
+        return {}
+
+
+def _compute_bulk(types: list[str], hp: int, defense: int, sp_def: int) -> float:
+    """Σ log(1 + hits-to-KO) across all 18 attacking types.
+
+    hits_to_ko = hp * avg(def, sp_def) / (100 * type_effectiveness)
+    Immune matchups are capped at _IMMUNE_CAP hits.
+    avg(def, sp_def) is a placeholder until category-weighted computation lands.
+    """
+    eff_def = (defense + sp_def) / 2
+    score = 0.0
+    for atk_type in ALL_TYPES:
+        eff = _effectiveness(atk_type, types)
+        hits = _IMMUNE_CAP if eff == 0 else hp * eff_def / (100.0 * eff)
+        score += math.log(1 + hits)
+    return score
+
+
 # col index → (row key, ascending-by-default)
+# Col 1 is filter rank (computed live in _populate, not sortable)
 _SORTABLE = {
-    0: ("rank",    True),
-    1: ("display", True),
-    2: ("impact",   False),
-    3: ("pct",      False),
-    4: ("coverage", False),
-    5: ("speed",   False),
+    0: ("rank",      True),
+    2: ("display",   True),
+    3: ("impact",    False),
+    4: ("pct",       False),
+    5: ("coverage",  False),
+    6: ("speed",     False),
+    7: ("def_score", False),
 }
 
 
@@ -130,8 +168,9 @@ class ImpactTableDialog(QDialog):
         self.setStyleSheet(_STYLE)
 
         self._all_rows: list[dict] = []
-        self._sort_col = 2      # score column
+        self._sort_col = 3      # impact column
         self._sort_asc = False  # descending
+        self._stats_cache = _load_stats_cache()
 
         self._build_ui()
 
@@ -140,6 +179,7 @@ class ImpactTableDialog(QDialog):
         else:
             self._status.setText("Impact cache loading…")
 
+    @pyqtSlot()
     def refresh(self):
         """Called when impact_db becomes ready after the dialog was already open."""
         if self._all_rows:
@@ -168,12 +208,31 @@ class ImpactTableDialog(QDialog):
         self._only_starters = QCheckBox("Starters only")
         self._only_starters.toggled.connect(self._apply_filter)
         top.addWidget(self._only_starters)
+        self._egg_cb = QCheckBox("Egg mvs")
+        self._egg_cb.toggled.connect(self._on_egg_toggled)
+        top.addWidget(self._egg_cb)
+
+        self._egg_cap_slider = QSlider(Qt.Orientation.Horizontal)
+        self._egg_cap_slider.setRange(1, 4)
+        self._egg_cap_slider.setValue(4)
+        self._egg_cap_slider.setFixedWidth(56)
+        self._egg_cap_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._egg_cap_slider.setTickInterval(1)
+        self._egg_cap_slider.setVisible(False)
+        self._egg_cap_slider.valueChanged.connect(self._on_egg_cap_changed)
+        top.addWidget(self._egg_cap_slider)
+
+        self._egg_cap_lbl = QLabel("4🥚")
+        self._egg_cap_lbl.setStyleSheet("color:#cdd6f4; font-size:11px; min-width:24px;")
+        self._egg_cap_lbl.setVisible(False)
+        top.addWidget(self._egg_cap_lbl)
+
         layout.addLayout(top)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(8)
+        self._table.setColumnCount(10)
         self._table.setHorizontalHeaderLabels(
-            ["Rank", "Name", "Impact", "%ile", "Coverage", "Spd", "Types", "Moveset"]
+            ["Rank", "Filter", "Name", "Impact", "ai", "Coverage", "Spd", "Bulk", "Types", "Moveset"]
         )
         self._table.setSortingEnabled(False)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -184,24 +243,28 @@ class ImpactTableDialog(QDialog):
 
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
         hdr.setSortIndicatorShown(True)
-        hdr.setSortIndicator(2, Qt.SortOrder.DescendingOrder)
+        hdr.setSortIndicator(3, Qt.SortOrder.DescendingOrder)
         hdr.sectionClicked.connect(self._on_header_click)
 
         self._table.setColumnWidth(0, 52)
-        self._table.setColumnWidth(1, 200)
-        self._table.setColumnWidth(2, 100)
-        self._table.setColumnWidth(3, 52)
-        self._table.setColumnWidth(4, 100)
-        self._table.setColumnWidth(5, 48)
-        self._table.setColumnWidth(6, 110)
+        self._table.setColumnWidth(1, 52)
+        self._table.setColumnWidth(2, 200)
+        self._table.setColumnWidth(3, 100)
+        self._table.setColumnWidth(4, 52)
+        self._table.setColumnWidth(5, 100)
+        self._table.setColumnWidth(6, 48)
+        self._table.setColumnWidth(7, 60)
+        self._table.setColumnWidth(8, 110)
 
         layout.addWidget(self._table)
 
@@ -209,18 +272,70 @@ class ImpactTableDialog(QDialog):
         self._status.setStyleSheet("color:#6c7086; font-size:11px;")
         layout.addWidget(self._status)
 
+    # ── Egg moves ─────────────────────────────────────────────────────────────
+
+    def _on_egg_cap_changed(self, val: int):
+        self._egg_cap_lbl.setText(f"{val}🥚")
+        impact_db.set_egg_cap(val)
+        self._load_data()
+
+    def _on_egg_toggled(self, checked: bool):
+        self._egg_cap_slider.setVisible(checked)
+        self._egg_cap_lbl.setVisible(checked)
+        if not checked:
+            impact_db.set_include_egg(False)
+            self._load_data()
+            return
+        if impact_db.is_egg_ready():
+            impact_db.set_include_egg(True)
+            self._load_data()
+            return
+        self._egg_cb.setEnabled(False)
+        self._status.setText("Building egg-move cache (~3 min on first use)…")
+        impact_db.init_egg(
+            on_progress=lambda msg: QMetaObject.invokeMethod(
+                self, "_on_egg_progress", Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, msg),
+            ),
+            on_ready=lambda: QMetaObject.invokeMethod(
+                self, "_on_egg_ready", Qt.ConnectionType.QueuedConnection,
+            ),
+        )
+
+    @pyqtSlot(str)
+    def _on_egg_progress(self, msg: str):
+        self._status.setText(msg)
+
+    @pyqtSlot()
+    def _on_egg_ready(self):
+        impact_db.set_include_egg(True)
+        self._egg_cb.setEnabled(True)
+        self._load_data()
+
     # ── Data ──────────────────────────────────────────────────────────────────
 
     def _load_data(self):
         entries = impact_db.all_entries()
         sorted_entries = sorted(entries.items(), key=lambda x: x[1]["impact"], reverse=True)
         self._all_rows = []
+        cap = impact_db.get_egg_cap()
         for rank, (name, data) in enumerate(sorted_entries, 1):
             types = data.get("types", [])
             stab_cov: set[str] = set()
             for t in types:
                 stab_cov |= OFFENSIVE_CHART.get(t, frozenset())
-            raw_moves = data.get("moves", [])
+            raw_moves = impact_db.get_capped_moves(name, cap)
+
+            # Bulk: look up hp/def/sp_def from stats cache (alternate forms fall back to base)
+            stat_entry = self._stats_cache.get(name) or self._stats_cache.get(name.split("-")[0])
+            if stat_entry:
+                s = stat_entry["stats"]
+                def_score = _compute_bulk(
+                    types, s.get("hp", 45), s.get("defense", 50), s.get("special-defense", 50)
+                )
+            else:
+                def_score = 0.0
+
             self._all_rows.append({
                 "rank":      rank,
                 "name":      name,
@@ -229,6 +344,7 @@ class ImpactTableDialog(QDialog):
                 "coverage":  data.get("coverage", data["impact"]),
                 "speed":     data.get("speed", 0),
                 "pct":       data["percentile"],
+                "def_score": def_score,
                 "types":     types,
                 "legendary": data.get("legendary", False),
                 "paradox":   data.get("paradox", False),
@@ -276,50 +392,66 @@ class ImpactTableDialog(QDialog):
         self._table.setRowCount(len(rows))
 
         for i, row in enumerate(rows):
-            # Rank
+            # Rank (global)
             rank_item = QTableWidgetItem(str(row["rank"]))
             rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             rank_item.setForeground(QColor("#6c7086"))
             self._table.setItem(i, 0, rank_item)
+
+            # Filter rank (rank within current filter+sort)
+            filt_item = QTableWidgetItem(str(i + 1))
+            filt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            filt_item.setForeground(QColor("#cdd6f4"))
+            self._table.setItem(i, 1, filt_item)
 
             # Name
             prefix = "★ " if row["legendary"] else ""
             name_item = QTableWidgetItem(prefix + row["display"])
             if row["legendary"]:
                 name_item.setForeground(QColor("#cba6f7"))
-            self._table.setItem(i, 1, name_item)
+            self._table.setItem(i, 2, name_item)
 
             # Score
             score_item = QTableWidgetItem(f"{row['impact']:,.0f}")
             score_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
-            self._table.setItem(i, 2, score_item)
+            self._table.setItem(i, 3, score_item)
 
-            # %ile
+            # AI rank
             pct = row["pct"]
-            pct_item = QTableWidgetItem(f"p{pct}")
+            pct_item = QTableWidgetItem(f"ai{pct}")
             pct_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             pct_item.setForeground(QColor(_pct_color(pct)))
-            self._table.setItem(i, 3, pct_item)
+            self._table.setItem(i, 4, pct_item)
 
-            # Impact (raw, before speed weighting)
+            # Coverage (raw, before speed weighting)
             impact_item = QTableWidgetItem(f"{row['coverage']:,.0f}")
             impact_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
             impact_item.setForeground(QColor("#6c7086"))
             impact_item.setToolTip("Raw type coverage score before speed weighting")
-            self._table.setItem(i, 4, impact_item)
+            self._table.setItem(i, 5, impact_item)
 
             # Speed
             spd_item = QTableWidgetItem(str(row["speed"]))
             spd_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             spd_item.setForeground(QColor("#89b4fa"))
-            self._table.setItem(i, 5, spd_item)
+            self._table.setItem(i, 6, spd_item)
+
+            # Bulk (defensive coverage score)
+            bulk_item = QTableWidgetItem(f"{row['def_score']:.0f}")
+            bulk_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            bulk_item.setForeground(QColor("#a6e3a1"))
+            bulk_item.setToolTip(
+                "Σ log(1 + hits-to-KO) across 18 attacking types\n"
+                "effective def = avg(def, sp_def) · immune types capped at 50 hits"
+            )
+            self._table.setItem(i, 7, bulk_item)
 
             # Types
-            self._table.setCellWidget(i, 6, _badges(row["types"]))
+            self._table.setCellWidget(i, 8, _badges(row["types"]))
 
             # Moveset (stretches to fill remaining width)
             move_names = " · ".join(
@@ -333,6 +465,6 @@ class ImpactTableDialog(QDialog):
                 for m in row["moves"]
             )
             move_item.setToolTip(tooltip)
-            self._table.setItem(i, 7, move_item)
+            self._table.setItem(i, 9, move_item)
 
         self._status.setText(f"{len(rows):,} Pokémon")

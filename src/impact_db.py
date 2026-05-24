@@ -6,7 +6,8 @@ Score = sum over all 171 type pairings of the best SE damage the optimal
 4-move selection can deal to that pairing, where:
   damage = stat * base_power * (accuracy/100) * STAB * SE_multiplier
 
-Cached to impact_cache.json in the user data dir.
+Two caches: impact_cache.json (level-up moves only) and impact_cache_egg.json
+(level-up + egg moves). Toggle with set_include_egg().
 """
 
 import json
@@ -14,6 +15,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations
 
 import requests
 
@@ -21,8 +23,9 @@ from app_dirs import data_path
 from weakness_calc import ALL_TYPES, _effectiveness
 
 BASE_URL = "https://pokeapi.co/api/v2"
-CACHE_FILE = data_path("impact_cache.json")
-CACHE_VERSION = 11
+CACHE_FILE     = data_path("impact_cache.json")
+CACHE_FILE_EGG = data_path("impact_cache_egg.json")
+CACHE_VERSION  = 15
 
 # Paradox Pokémon (Gen 9 Scarlet/Violet + DLC) — not flagged in PokéAPI
 _PARADOX_POKEMON: frozenset[str] = frozenset({
@@ -36,17 +39,39 @@ _PARADOX_POKEMON: frozenset[str] = frozenset({
     "iron-leaves", "iron-boulder", "iron-crown",
 })
 
-# Damaging moves that hurt the user — excluded from scoring regardless of recoil field.
-# PokéAPI's drain field only covers %-of-damage recoil; these use fixed-HP or faint mechanics.
-_SELF_DAMAGING_MOVES: frozenset[str] = frozenset({
+# Moves excluded from scoring: self-damaging (fixed HP loss or faint) or too conditional
+# to reliably contribute (e.g. requires a full charge turn with no incoming hit).
+_EXCLUDED_MOVES: frozenset[str] = frozenset({
     "mind-blown", "steel-beam", "chloroblast",  # lose 50% max HP
     "explosion", "self-destruct", "final-gambit",  # user faints
+    "focus-punch",  # charge turn; negated by any hit
+    "overheat",     # -2 sp.atk after use; effectively one-shot
 })
 
 _POKEROGUE_LEARNSET_URL = (
     "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
     "/src/data/balance/pokemon-level-moves.ts"
 )
+_STARTERS_URL = (
+    "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
+    "/src/data/balance/starters.ts"
+)
+_POKEROGUE_EGG_MOVES_URL = (
+    "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
+    "/src/data/balance/moves/egg-moves.ts"
+)
+
+# Evolutions that don't work in Pokerogue despite PokéAPI saying they should.
+# Maps Pokerogue starter slug → cache key of the actual final form to use.
+_POKEROGUE_EVO_OVERRIDES: dict[str, str] = {
+    "froakie": "greninja",  # Ash-Greninja not obtainable through normal evolution
+}
+
+# Starters to omit from team builder suggestions entirely.
+# Use for Pokemon whose evolution situation in Pokerogue is too broken to model cleanly.
+_POKEROGUE_STARTER_EXCLUSIONS: frozenset[str] = frozenset({
+    "farfetchd",   # can't evolve into Sirfetch'd in Pokerogue; Kantonian form unscored
+})
 
 # All 171 unordered type pairings: 18 single + C(18,2)=153 dual
 ALL_PAIRINGS: list[tuple[str, ...]] = []
@@ -59,16 +84,117 @@ for _i, _t1 in enumerate(ALL_TYPES):
 # Populated once during _build_effectiveness_table(), before any score math.
 _EFF: dict[tuple, float] = {}
 
-_db: dict[str, dict] = {}
-_ready = False
+_db_noegg: dict[str, dict] = {}
+_db_egg:   dict[str, dict] = {}
+_use_egg:  bool = False
+
+_starters: dict[int, dict] = {}  # {national_dex_id: {name, cost, final_evo}}
+_ready:     bool = False          # noegg cache ready
+_ready_egg: bool = False          # egg cache ready
+_egg_cap:   int  = 4              # max egg moves in optimal set (1–4)
 _lock = threading.Lock()
+
+# Nature ID → (atk_multiplier, spa_multiplier). Ordered by Pokémon nature enum (Hardy=0..Quirky=24).
+# Neutral natures: Hardy(0), Docile(6), Serious(12), Bashful(18), Quirky(24)
+_NATURE_MODS: tuple[tuple[float, float], ...] = (
+    (1.0, 1.0),  # 0  Hardy
+    (1.1, 1.0),  # 1  Lonely  (+Atk/-Def)
+    (1.1, 1.0),  # 2  Brave   (+Atk/-Spe)
+    (1.1, 0.9),  # 3  Adamant (+Atk/-SpA)
+    (1.1, 1.0),  # 4  Naughty (+Atk/-SpD)
+    (0.9, 1.0),  # 5  Bold    (+Def/-Atk)
+    (1.0, 1.0),  # 6  Docile
+    (1.0, 1.0),  # 7  Relaxed (+Def/-Spe)
+    (1.0, 0.9),  # 8  Impish  (+Def/-SpA)
+    (1.0, 1.0),  # 9  Lax     (+Def/-SpD)
+    (0.9, 1.0),  # 10 Timid   (+Spe/-Atk)
+    (1.0, 1.0),  # 11 Hasty   (+Spe/-Def)
+    (1.0, 1.0),  # 12 Serious
+    (1.0, 0.9),  # 13 Jolly   (+Spe/-SpA)
+    (1.0, 1.0),  # 14 Naive   (+Spe/-SpD)
+    (0.9, 1.1),  # 15 Modest  (+SpA/-Atk)
+    (1.0, 1.1),  # 16 Mild    (+SpA/-Def)
+    (1.0, 1.1),  # 17 Quiet   (+SpA/-Spe)
+    (1.0, 1.0),  # 18 Bashful
+    (1.0, 1.1),  # 19 Rash    (+SpA/-SpD)
+    (0.9, 1.0),  # 20 Calm    (+SpD/-Atk)
+    (1.0, 1.0),  # 21 Gentle  (+SpD/-Def)
+    (1.0, 1.0),  # 22 Sassy   (+SpD/-Spe)
+    (1.0, 0.9),  # 23 Careful (+SpD/-SpA)
+    (1.0, 1.0),  # 24 Quirky
+)
+
+
+def _nature_mods(nature_id) -> tuple[float, float]:
+    if not isinstance(nature_id, int) or not (0 <= nature_id < len(_NATURE_MODS)):
+        return 1.0, 1.0
+    return _NATURE_MODS[nature_id]
+
+
+def _active_db() -> dict[str, dict]:
+    return _db_egg if _use_egg else _db_noegg
+
+
+def _patch_nonleg_percentiles(db: dict) -> None:
+    """Recompute percentile (and percentile_caps) relative to the non-legendary pool.
+
+    Applied in-memory after loading or building the cache. Non-legendaries no
+    longer have their scores suppressed by legendaries, and legendaries that
+    outperform all non-legendaries can exceed AI100 (e.g. AI110 = 10% above best
+    non-leg). Runs in < 1 second — no network calls needed.
+    """
+    nonleg_scores = sorted(v["impact"] for v in db.values() if not v.get("legendary"))
+    n_nonleg    = len(nonleg_scores)
+    best_nonleg = nonleg_scores[-1] if nonleg_scores else 1.0
+
+    for entry in db.values():
+        s     = entry["impact"]
+        below = sum(1 for x in nonleg_scores if x < s)
+        if below >= n_nonleg:
+            entry["percentile"] = round(100 + (s - best_nonleg) / best_nonleg * 100)
+        else:
+            entry["percentile"] = round(below / n_nonleg * 100)
+
+    has_caps = any(v.get("impact_caps") for v in db.values())
+    if not has_caps:
+        return
+    for cap_idx in range(4):
+        cap_nonleg = sorted(
+            v["impact_caps"][cap_idx]
+            for v in db.values()
+            if not v.get("legendary") and v.get("impact_caps")
+        )
+        n_cap    = len(cap_nonleg)
+        best_cap = cap_nonleg[-1] if cap_nonleg else 1.0
+        for entry in db.values():
+            if not entry.get("impact_caps"):
+                continue
+            s     = entry["impact_caps"][cap_idx]
+            below = sum(1 for x in cap_nonleg if x < s)
+            if below >= n_cap:
+                pct = round(100 + (s - best_cap) / best_cap * 100)
+            else:
+                pct = round(below / n_cap * 100)
+            entry.setdefault("percentile_caps", [0, 0, 0, 0])
+            entry["percentile_caps"][cap_idx] = pct
 
 
 # ── public API ────────────────────────────────────────────────────────────────
 
 def init(on_progress=None, on_ready=None):
     threading.Thread(
-        target=_build_or_load, args=(on_progress, on_ready), daemon=True
+        target=_build_or_load, args=(on_progress, on_ready, False), daemon=True
+    ).start()
+
+
+def init_egg(on_progress=None, on_ready=None):
+    """Build/load the egg-moves cache. Safe to call multiple times."""
+    if _ready_egg:
+        if on_ready:
+            on_ready()
+        return
+    threading.Thread(
+        target=_build_or_load, args=(on_progress, on_ready, True), daemon=True
     ).start()
 
 
@@ -76,16 +202,116 @@ def is_ready() -> bool:
     return _ready
 
 
+def is_egg_ready() -> bool:
+    return _ready_egg
+
+
+def set_include_egg(value: bool) -> None:
+    """Switch the active database. Egg db must be ready before enabling."""
+    global _use_egg
+    _use_egg = value and _ready_egg
+
+
+def set_egg_cap(cap: int) -> None:
+    """Set max egg moves allowed in the optimal 4-move set (1–4)."""
+    global _egg_cap
+    _egg_cap = max(1, min(4, cap))
+
+
+def get_egg_cap() -> int:
+    return _egg_cap
+
+
+def _apply_cap(entry: dict) -> dict:
+    """Return a copy of entry with impact/percentile adjusted for the current egg cap."""
+    caps  = entry.get("impact_caps")
+    pcaps = entry.get("percentile_caps")
+    if not caps:
+        return entry
+    entry = dict(entry)
+    entry["impact"] = caps[_egg_cap - 1]
+    if pcaps:
+        entry["percentile"] = pcaps[_egg_cap - 1]
+    return entry
+
+
+def get_capped_moves(name: str, cap: int) -> list[dict]:
+    """Return the brute-force optimal move list for a given egg cap (1–4).
+
+    Used by the impact table to show which moves are in the optimal set
+    when the egg cap slider is below 4. Returns the uncapped 'moves' list
+    when cap==4 or egg cache is not active.
+    """
+    if not _use_egg or cap >= 4:
+        entry = _active_db().get(name.lower())
+        return entry.get("moves", []) if entry else []
+    egg_entry = _db_egg.get(name.lower())
+    if not egg_entry:
+        return []
+    noegg_entry   = _db_noegg.get(name.lower(), {})
+    levelup_moves = noegg_entry.get("moves", [])
+    egg_moves     = egg_entry.get("egg_move_data", [])
+    types  = egg_entry["types"]
+    atk    = egg_entry["atk"]
+    sp_atk = egg_entry["sp_atk"]
+
+    # Build per-vector for each candidate move
+    def _pv(m: dict) -> dict | None:
+        if not (m.get("power") and m["power"] > 0
+                and m.get("category") != "status"
+                and (m.get("drain") or 0) >= 0
+                and m.get("name") not in _EXCLUDED_MOVES):
+            return None
+        mtype = m["type"]
+        stat  = atk if m["category"] == "physical" else sp_atk
+        stab  = 1.5 if mtype in types else 1.0
+        acc   = (m["accuracy"] or 100) / 100.0
+        base  = stat * m["power"] * acc * stab
+        pv    = {p: base * _EFF[(mtype, p)] for p in ALL_PAIRINGS
+                 if _EFF.get((mtype, p), 0.0) > 1.0}
+        return pv if pv else None
+
+    lu_items = [(m, pv) for m in levelup_moves if (pv := _pv(m))]
+    eg_items = [(m, pv) for m in egg_moves     if (pv := _pv(m))]
+    n_lu     = len(lu_items)
+    all_items = lu_items + eg_items
+    if not all_items:
+        return []
+
+    k = min(4, len(all_items))
+    best_score = -1.0
+    best_combo: tuple = ()
+    for combo in combinations(range(len(all_items)), k):
+        if sum(1 for idx in combo if idx >= n_lu) > cap:
+            continue
+        curr: dict = {}
+        for idx in combo:
+            for p, v in all_items[idx][1].items():
+                if v > curr.get(p, 0.0):
+                    curr[p] = v
+        score = sum(curr.values())
+        if score > best_score:
+            best_score = score
+            best_combo = combo
+    return [all_items[idx][0] for idx in best_combo]
+
+
 def get(name: str) -> dict | None:
     """Returns {score, percentile, types} or None."""
     with _lock:
-        return _db.get(name.lower())
+        entry = _active_db().get(name.lower())
+    if entry is None or not _use_egg or _egg_cap >= 4:
+        return entry
+    return _apply_cap(entry)
 
 
 def top_n(n: int = 20, exclude_legendary: bool = False) -> list[tuple[str, float]]:
     with _lock:
+        db = _active_db()
+        use_cap = _use_egg and _egg_cap < 4
         items = [
-            (name, v["impact"]) for name, v in _db.items()
+            (name, (v["impact_caps"][_egg_cap - 1] if use_cap and v.get("impact_caps") else v["impact"]))
+            for name, v in db.items()
             if not (exclude_legendary and v.get("legendary"))
         ]
     items.sort(key=lambda x: x[1], reverse=True)
@@ -95,7 +321,7 @@ def top_n(n: int = 20, exclude_legendary: bool = False) -> list[tuple[str, float
 def impact_percentile(score: float, exclude_legendary: bool = False) -> int:
     with _lock:
         values = [
-            v["impact"] for v in _db.values()
+            v["impact"] for v in _active_db().values()
             if not (exclude_legendary and v.get("legendary"))
         ]
     if not values:
@@ -105,18 +331,78 @@ def impact_percentile(score: float, exclude_legendary: bool = False) -> int:
 
 def all_entries() -> dict[str, dict]:
     with _lock:
-        return dict(_db)
+        raw = dict(_active_db())
+    if not _use_egg or _egg_cap >= 4:
+        return raw
+    return {name: _apply_cap(entry) for name, entry in raw.items()}
+
+
+def _resolve_cache_key(name: str) -> str | None:
+    """Return the actual _db_noegg key that matches name, trying normalisation fallbacks.
+
+    Handles cases where PokéAPI evo-chain slugs differ from the form key stored
+    in the cache (e.g. apostrophe-stripped names like farfetch-d → farfetchd).
+    Returns None when no match is found so callers can skip the entry cleanly.
+    """
+    n = name.lower()
+    with _lock:
+        if n in _db_noegg:
+            return n
+        stripped = n.replace("-", "")
+        if stripped in _db_noegg:
+            return stripped
+    return None
+
+
+def starters_index() -> dict[int, dict]:
+    """Returns {national_dex_id: {name, cost, final_evo}} for all starter-eligible Pokemon.
+
+    Applies _POKEROGUE_STARTER_EXCLUSIONS and _POKEROGUE_EVO_OVERRIDES at runtime —
+    no cache rebuild needed, just edit the dicts and restart.
+    Also normalises final_evo values so they always match actual cache keys.
+    """
+    with _lock:
+        base = dict(_starters)
+    result = {}
+    for sid, info in base.items():
+        if info["name"] in _POKEROGUE_STARTER_EXCLUSIONS:
+            continue
+        # Skip starters that are themselves Hisuian forms
+        if info["name"].endswith("-hisui"):
+            continue
+        override = _POKEROGUE_EVO_OVERRIDES.get(info["name"])
+        if override:
+            info = dict(info)
+            info["final_evo"] = override
+        # If the cached final evo is a Hisuian form, prefer the standard evolution.
+        # (Pokerogue starters evolve to their standard forms, not Hisuian variants.)
+        if info["final_evo"].endswith("-hisui"):
+            base_name = info["final_evo"][:-6]  # strip "-hisui"
+            resolved_base = _resolve_cache_key(base_name)
+            if resolved_base:
+                info = dict(info)
+                info["final_evo"] = resolved_base
+        resolved = _resolve_cache_key(info["final_evo"])
+        if resolved is None:
+            continue  # no matching form in cache — skip rather than silently break
+        if resolved != info["final_evo"]:
+            info = dict(info)
+            info["final_evo"] = resolved
+        result[sid] = info
+    return result
 
 
 def pairing_vector(name: str) -> dict[tuple, float]:
-    """Best SE damage this Pokémon can deal to each of the 171 type pairings."""
+    """Best SE damage this Pokémon can deal to each of the 171 type pairings, speed-adjusted."""
     with _lock:
-        entry = _db.get(name.lower())
+        entry = _active_db().get(name.lower())
     if not entry:
         return {}
     types   = entry.get("types", [])
     atk     = entry.get("atk", 0)
     sp_atk  = entry.get("sp_atk", 0)
+    sp      = entry.get("speed_pct", 50)
+    factor  = 1.0 if sp >= 70 else 0.4 + 0.6 * (sp / 70)
     result: dict[tuple, float] = {}
     for m in entry.get("moves", []):
         mtype    = m.get("type", "")
@@ -127,7 +413,7 @@ def pairing_vector(name: str) -> dict[tuple, float]:
             continue
         stat = atk if category == "physical" else sp_atk
         stab = 1.5 if mtype in types else 1.0
-        base = stat * power * (accuracy / 100.0) * stab
+        base = stat * power * (accuracy / 100.0) * stab * factor
         for pairing in ALL_PAIRINGS:
             se = _EFF.get((mtype, pairing), 0.0)
             if se > 1.0:
@@ -142,6 +428,34 @@ def team_score(names: list[str]) -> float:
     best: dict[tuple, float] = {}
     for name in names:
         for pairing, val in pairing_vector(name).items():
+            if val > best.get(pairing, 0.0):
+                best[pairing] = val
+    return sum(best.values())
+
+
+def _final_evo_for(name: str) -> str:
+    """Return the cache key for this pokemon's final evolution.
+
+    If the name is already in the cache (i.e. it is a final evo), return it
+    directly. Otherwise scan the starters index for a starter that resolves to
+    this name and use its final_evo. Falls back to the raw name so callers
+    receive an empty pairing_vector rather than crashing.
+    """
+    n = name.lower()
+    with _lock:
+        if n in _db_noegg:
+            return n
+    for info in starters_index().values():
+        if info["name"] == n:
+            return info["final_evo"]
+    return n
+
+
+def potential_team_score(names: list[str]) -> float:
+    """Potential score: each member resolved to its best final evo with cached optimal moves."""
+    best: dict[tuple, float] = {}
+    for name in names:
+        for pairing, val in pairing_vector(_final_evo_for(name)).items():
             if val > best.get(pairing, 0.0):
                 best[pairing] = val
     return sum(best.values())
@@ -170,7 +484,169 @@ def best_swap(team_names: list[str], wild_name: str) -> tuple[str, float, float]
     return best_member, current, best_new
 
 
+def _pi_pairing_vector(final_name: str, nature_id) -> dict:
+    """Per-pairing PI contribution for one team member.
+
+    Uses final-evo BST with nature-adjusted atk/sp_atk, cached optimal
+    learnset moves, and speed percentile weighting.
+    """
+    entry = _db_noegg.get(final_name)
+    if not entry:
+        return {}
+    atk_mod, spa_mod = _nature_mods(nature_id)
+    types   = entry["types"]
+    atk     = entry["atk"] * atk_mod
+    sp_atk  = entry["sp_atk"] * spa_mod
+    sp      = entry["speed_pct"]
+    factor  = 1.0 if sp >= 70 else 0.4 + 0.6 * (sp / 70)
+    result: dict = {}
+    for m in entry.get("moves", []):
+        mtype    = m.get("type", "")
+        power    = m.get("power") or 0
+        accuracy = m.get("accuracy") or 100
+        category = m.get("category", "special")
+        if not power:
+            continue
+        stat = atk if category == "physical" else sp_atk
+        stab = 1.5 if mtype in types else 1.0
+        base = stat * power * (accuracy / 100.0) * stab * factor
+        for pairing in ALL_PAIRINGS:
+            se = _EFF.get((mtype, pairing), 0.0)
+            if se > 1.0:
+                val = base * se
+                if val > result.get(pairing, 0.0):
+                    result[pairing] = val
+    return result
+
+
+def best_swap_pi(
+    party_snapshot: list[dict],
+    candidate_name: str,
+    require_positive: bool = True,
+) -> dict | None:
+    """Find best team slot to replace with candidate, optimising for PI delta.
+
+    party_snapshot entries: {name, nature, stats, fainted, moves (equipped)}
+    candidate_name: final-evo slug (already resolved by caller)
+    require_positive: if False, returns the best swap even when PI would decrease
+      (used to show delta numbers on the consider card).
+
+    Returns dict with swap details or None if no swap can be found:
+      {slot, replaced_name, replaced_final, replaced_ai, candidate_ai, pi_delta}
+    """
+    if not _ready or not _EFF:
+        return None
+
+    cand_entry = _db_noegg.get(candidate_name.lower())
+    if not cand_entry:
+        return None
+
+    # Candidate PI vector: no nature known → use neutral BST (identical to pairing_vector)
+    cand_pv = pairing_vector(candidate_name.lower())
+
+    # Per-slot PI vectors for current party
+    team_pv: list[dict] = []
+    for member in party_snapshot:
+        if member.get("fainted"):
+            team_pv.append({})
+            continue
+        name       = (member.get("name") or "").lower()
+        final_name = _final_evo_for(name)
+        team_pv.append(_pi_pairing_vector(final_name, member.get("nature")))
+
+    # Current team PI
+    current_best: dict = {}
+    for pv in team_pv:
+        for p, v in pv.items():
+            if v > current_best.get(p, 0.0):
+                current_best[p] = v
+    current_pi = sum(current_best.values())
+
+    # Try each swap (skip fainted slots only if live members exist)
+    any_alive = any(not m.get("fainted") for m in party_snapshot)
+    best_pi_delta = 0.0 if require_positive else float('-inf')
+    best_slot: int | None = None
+    for i, member in enumerate(party_snapshot):
+        if any_alive and member.get("fainted"):
+            continue
+        new_best: dict = {}
+        for j, pv in enumerate(team_pv):
+            src = cand_pv if j == i else pv
+            for p, v in src.items():
+                if v > new_best.get(p, 0.0):
+                    new_best[p] = v
+        new_pi    = sum(new_best.values())
+        pi_delta  = new_pi - current_pi
+        if pi_delta > best_pi_delta:
+            best_pi_delta = pi_delta
+            best_slot     = i
+
+    if best_slot is None:
+        return None
+
+    replaced       = party_snapshot[best_slot]
+    replaced_name  = (replaced.get("name") or "").lower()
+    replaced_final = _final_evo_for(replaced_name)
+    replaced_entry = _db_noegg.get(replaced_final)
+    replaced_ai    = replaced_entry["percentile"] if replaced_entry else 0
+
+    return {
+        "slot":          best_slot,
+        "replaced_name": replaced_name,
+        "replaced_final": replaced_final,
+        "replaced_ai":   replaced_ai,
+        "candidate_ai":  cand_entry["percentile"],
+        "pi_delta":      best_pi_delta,
+    }
+
+
 # ── score computation ─────────────────────────────────────────────────────────
+
+def _best_capped_score(
+    types: list[str], atk: int, sp_atk: int,
+    levelup_moves: list[dict], egg_moves: list[dict], max_egg: int,
+) -> float:
+    """Brute-force optimal 4-move coverage score with at most max_egg from egg_moves.
+
+    Uses combinations (C(n,4)) — feasible because n ≤ 8 (4 levelup + 4 egg).
+    """
+    def _pv(m: dict) -> dict | None:
+        if not (m.get("power") and m["power"] > 0
+                and m.get("category") != "status"
+                and (m.get("drain") or 0) >= 0
+                and m.get("name") not in _EXCLUDED_MOVES):
+            return None
+        mtype = m["type"]
+        stat  = atk if m["category"] == "physical" else sp_atk
+        stab  = 1.5 if mtype in types else 1.0
+        acc   = (m["accuracy"] or 100) / 100.0
+        base  = stat * m["power"] * acc * stab
+        pv = {p: base * _EFF[(mtype, p)] for p in ALL_PAIRINGS
+              if _EFF.get((mtype, p), 0.0) > 1.0}
+        return pv if pv else None
+
+    lu_pvs = [pv for m in levelup_moves if (pv := _pv(m))]
+    eg_pvs = [pv for m in egg_moves     if (pv := _pv(m))]
+    n_lu   = len(lu_pvs)
+    all_pvs = lu_pvs + eg_pvs
+    if not all_pvs:
+        return 0.0
+
+    k = min(4, len(all_pvs))
+    best = 0.0
+    for combo in combinations(range(len(all_pvs)), k):
+        if sum(1 for i in combo if i >= n_lu) > max_egg:
+            continue
+        curr: dict = {}
+        for i in combo:
+            for p, v in all_pvs[i].items():
+                if v > curr.get(p, 0.0):
+                    curr[p] = v
+        score = sum(curr.values())
+        if score > best:
+            best = score
+    return best
+
 
 def _build_effectiveness_table():
     """Warm _EFF with all 18 * 171 = 3078 entries. Triggers 18 API calls."""
@@ -280,30 +756,97 @@ def _fetch_pokerogue_learnset() -> dict[str, set[str]]:
     return learnset
 
 
+def _fetch_pokerogue_egg_moves() -> dict[str, set[str]]:
+    """Parse Pokerogue's egg-moves.ts into {species_slug: {move_slug}}.
+
+    Format per line: [SpeciesId.BULBASAUR]: [MoveId.SAPPY_SEED, MoveId.EARTH_POWER, ...]
+    Exactly 4 moves per species.
+    """
+    r = requests.get(_POKEROGUE_EGG_MOVES_URL, timeout=30)
+    r.raise_for_status()
+
+    egg_moves: dict[str, set[str]] = {}
+    for line in r.text.splitlines():
+        sm = re.search(r'\[SpeciesId\.(\w+)\]', line)
+        if not sm:
+            continue
+        species = sm.group(1).lower().replace("_", "-")
+        moves: set[str] = set()
+        for mm in re.finditer(r'MoveId\.(\w+)', line):
+            slug = mm.group(1).lower().replace("_", "-")
+            if slug != "none":
+                moves.add(slug)
+        if moves:
+            egg_moves[species] = moves
+    return egg_moves
+
+
+def _fetch_starter_costs() -> dict[str, int]:
+    """Parse Pokerogue's speciesStarterCosts map → {species_slug: cost}."""
+    r = requests.get(_STARTERS_URL, timeout=30)
+    r.raise_for_status()
+    costs: dict[str, int] = {}
+    in_map = False
+    for line in r.text.splitlines():
+        if "speciesStarterCosts" in line and "{" in line:
+            in_map = True
+        if in_map:
+            m = re.search(r"\[SpeciesId\.(\w+)\]:\s*(\d+)", line)
+            if m:
+                name = m.group(1).lower().replace("_", "-")
+                costs[name] = int(m.group(2))
+            if line.strip().startswith("};"):
+                break
+    return costs
+
+
+def _evo_finals(node: dict) -> list[str]:
+    """Return all leaf species slugs in a PokéAPI evolution chain node."""
+    if not node.get("evolves_to"):
+        return [node["species"]["name"]]
+    result: list[str] = []
+    for child in node["evolves_to"]:
+        result.extend(_evo_finals(child))
+    return result
+
+
 # ── cache build ───────────────────────────────────────────────────────────────
 
-def _build_or_load(on_progress, on_ready):
-    global _db, _ready
+def _build_or_load(on_progress, on_ready, include_egg: bool = False):
+    global _db_noegg, _db_egg, _ready, _ready_egg, _starters
 
-    if os.path.exists(CACHE_FILE):
-        _prog(on_progress, "Loading impact cache…")
+    cache_file = CACHE_FILE_EGG if include_egg else CACHE_FILE
+    label      = "egg" if include_egg else "standard"
+
+    if os.path.exists(cache_file):
+        _prog(on_progress, f"Loading {label} impact cache…")
         try:
-            with open(CACHE_FILE) as f:
+            with open(cache_file) as f:
                 data = json.load(f)
             if data.get("_version") == CACHE_VERSION:
                 data.pop("_version")
+                starters_raw = data.pop("_starters", {})
                 with _lock:
-                    _db = data
-                _build_effectiveness_table()
-                _ready = True
+                    if include_egg:
+                        _db_egg = data
+                    else:
+                        _db_noegg = data
+                        _starters = {int(k): v for k, v in starters_raw.items()}
+                if not _EFF:
+                    _build_effectiveness_table()
+                _patch_nonleg_percentiles(data)
+                if include_egg:
+                    _ready_egg = True
+                else:
+                    _ready = True
                 if on_ready:
                     on_ready()
                 return
-            _prog(on_progress, "Impact cache outdated — rebuilding…")
+            _prog(on_progress, f"{label.title()} impact cache outdated — rebuilding…")
         except Exception:
             pass
 
-    _prog(on_progress, "Building impact cache — takes ~3 minutes on first run…")
+    _prog(on_progress, f"Building {label} impact cache — takes ~3 minutes…")
 
     # Step 1: fully-evolved species from stats cache
     stats_path = data_path("stats_cache.json")
@@ -346,10 +889,11 @@ def _build_or_load(on_progress, on_ready):
             r = requests.get(f"{BASE_URL}/pokemon/{form}", timeout=15)
             r.raise_for_status()
             d = r.json()
+            all_moves = d.get("moves", [])
             return form, {
                 "types": [t["type"]["name"] for t in sorted(d["types"], key=lambda t: t["slot"])],
                 "stats": {s["stat"]["name"]: s["base_stat"] for s in d["stats"]},
-                "move_names": [m["move"]["name"] for m in d.get("moves", [])],
+                "move_names": [m["move"]["name"] for m in all_moves],
                 "species": d.get("species", {}).get("name", form),
             }
         except Exception:
@@ -379,6 +923,32 @@ def _build_or_load(on_progress, on_ready):
                 pd["move_names"] = [m for m in pd["move_names"] if m in allowed]
                 filtered += before - len(pd["move_names"])
         _prog(on_progress, f"Filtered {filtered} non-level-up moves from learnsets.")
+
+        if include_egg:
+            _prog(on_progress, "Fetching Pokerogue egg moves…")
+            try:
+                egg_moves_map = _fetch_pokerogue_egg_moves()
+                _prog(on_progress, f"Egg move map loaded — {len(egg_moves_map)} species.")
+                # Egg moves are indexed by base/starter species, not final evo.
+                # Build final_evo → base_species reverse map from the starters index.
+                with _lock:
+                    final_to_base = {info["final_evo"]: info["name"] for info in _starters.values()}
+                egg_added = 0
+                for form, pd in pokemon_data.items():
+                    species = pd.get("species", form)
+                    egg_set = (egg_moves_map.get(species)
+                               or egg_moves_map.get(form)
+                               or egg_moves_map.get(final_to_base.get(form))
+                               or egg_moves_map.get(final_to_base.get(species))
+                               or set())
+                    pd["_egg_move_set"] = egg_set   # tracked for step 5/6.5
+                    if egg_set:
+                        before = len(pd["move_names"])
+                        pd["move_names"] = list(set(pd["move_names"]) | egg_set)
+                        egg_added += len(pd["move_names"]) - before
+                _prog(on_progress, f"Added {egg_added} egg move entries to learnsets.")
+            except Exception as e:
+                _prog(on_progress, f"Warning: could not fetch Pokerogue egg moves ({e}) — skipping.")
     except Exception as e:
         _prog(on_progress, f"Warning: could not fetch Pokerogue learnset ({e}) — using full PokéAPI movesets.")
 
@@ -430,9 +1000,9 @@ def _build_or_load(on_progress, on_ready):
         moves  = [move_cache[mn] for mn in pd["move_names"]
                   if move_cache.get(mn)
                   and (move_cache[mn].get("drain") or 0) >= 0
-                  and mn not in _SELF_DAMAGING_MOVES]
+                  and mn not in _EXCLUDED_MOVES]
         impact, selected = _compute_score(pd["types"], atk, sp_atk, moves)
-        db[form] = {
+        entry: dict = {
             "coverage": impact,
             "atk":     atk,
             "sp_atk":  sp_atk,
@@ -451,6 +1021,15 @@ def _build_or_load(on_progress, on_ready):
                 for m in selected
             ],
         }
+        if include_egg:
+            egg_names = pd.get("_egg_move_set", set())
+            entry["egg_move_data"] = [
+                {"name": m["name"], "type": m["type"], "power": m["power"],
+                 "accuracy": m["accuracy"], "category": m["category"]}
+                for mn in egg_names
+                if (m := move_cache.get(mn)) and m is not None
+            ]
+        db[form] = entry
 
     # Step 6: speed percentiles → combined score → combined percentiles
     all_speeds = [v["speed"] for v in db.values()]
@@ -459,30 +1038,133 @@ def _build_or_load(on_progress, on_ready):
         sp = entry["speed"]
         entry["speed_pct"] = round(sum(1 for x in all_speeds if x < sp) / n * 100)
 
-    _SPEED_THRESHOLD = 50  # percentile below which a penalty applies
+    _SPEED_THRESHOLD = 70  # percentile below which a penalty applies
     for entry in db.values():
         sp = entry["speed_pct"]
         if sp >= _SPEED_THRESHOLD:
             factor = 1.0
         else:
-            factor = 0.6 + 0.4 * (sp / _SPEED_THRESHOLD)
+            factor = 0.4 + 0.6 * (sp / _SPEED_THRESHOLD)
         entry["impact"] = entry["coverage"] * factor
 
-    all_scores = [v["impact"] for v in db.values()]
-    for entry in db.values():
-        s = entry["impact"]
-        entry["percentile"] = round(sum(1 for x in all_scores if x < s) / n * 100)
+    # Percentile is computed relative to non-legendary pool only so legendaries
+    # don't suppress non-legendary rankings. Legendaries that outperform all
+    # non-legendaries extrapolate past 100 (e.g. AI110 = 10% above the best non-leg).
+    nonleg_scores_sorted = sorted(
+        v["impact"] for v in db.values() if not v.get("legendary")
+    )
+    n_nonleg    = len(nonleg_scores_sorted)
+    best_nonleg = nonleg_scores_sorted[-1] if nonleg_scores_sorted else 1.0
 
-    _prog(on_progress, "Saving impact cache…")
-    with open(CACHE_FILE, "w") as f:
-        json.dump({"_version": CACHE_VERSION, **db}, f)
+    for entry in db.values():
+        s     = entry["impact"]
+        below = sum(1 for x in nonleg_scores_sorted if x < s)
+        if below >= n_nonleg:
+            excess = (s - best_nonleg) / best_nonleg * 100
+            entry["percentile"] = round(100 + excess)
+        else:
+            entry["percentile"] = round(below / n_nonleg * 100)
+
+    # Step 6.5: brute-force cap scores for egg caps 1–4 (egg build only)
+    if include_egg:
+        _prog(on_progress, "Computing egg-cap scores (1–4 egg moves)…")
+        n_db = len(db)
+        for form, entry in db.items():
+            noegg_entry   = _db_noegg.get(form, {})
+            levelup_moves = noegg_entry.get("moves", [])
+            egg_moves     = entry.get("egg_move_data", [])
+            types  = entry["types"]
+            atk    = entry["atk"]
+            sp_atk = entry["sp_atk"]
+            sp_pct = entry["speed_pct"]
+            factor = 1.0 if sp_pct >= 70 else 0.4 + 0.6 * (sp_pct / 70)
+            entry["impact_caps"] = [
+                _best_capped_score(types, atk, sp_atk, levelup_moves, egg_moves, cap) * factor
+                for cap in range(1, 5)
+            ]
+        for cap_idx in range(4):
+            cap_nonleg_sorted = sorted(
+                v["impact_caps"][cap_idx] for v in db.values() if not v.get("legendary")
+            )
+            n_cap_nonleg    = len(cap_nonleg_sorted)
+            best_cap_nonleg = cap_nonleg_sorted[-1] if cap_nonleg_sorted else 1.0
+            for entry in db.values():
+                s     = entry["impact_caps"][cap_idx]
+                below = sum(1 for x in cap_nonleg_sorted if x < s)
+                if below >= n_cap_nonleg:
+                    excess = (s - best_cap_nonleg) / best_cap_nonleg * 100
+                    pct = round(100 + excess)
+                else:
+                    pct = round(below / n_cap_nonleg * 100)
+                entry.setdefault("percentile_caps", [0, 0, 0, 0])
+                entry["percentile_caps"][cap_idx] = pct
+
+    # Step 7: Build starters index (only needed for the primary noegg cache)
+    _si: dict[int, dict] = {}
+    if not include_egg:
+        _prog(on_progress, "Building starters index…")
+        try:
+            starter_costs = _fetch_starter_costs()
+            _prog(on_progress, f"Starter costs: {len(starter_costs)} entries. Fetching evo chains…")
+
+            def _fetch_starter_info(species_name: str) -> tuple[str, int | None, list[str]]:
+                try:
+                    r = requests.get(f"{BASE_URL}/pokemon-species/{species_name}", timeout=10)
+                    if r.status_code == 404:
+                        return species_name, None, [species_name]
+                    r.raise_for_status()
+                    d = r.json()
+                    sid = d["id"]
+                    chain_url = d["evolution_chain"]["url"]
+                    r2 = requests.get(chain_url, timeout=10)
+                    r2.raise_for_status()
+                    finals = _evo_finals(r2.json()["chain"])
+                    return species_name, sid, finals
+                except Exception:
+                    return species_name, None, [species_name]
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                for sname, sid, finals in pool.map(_fetch_starter_info, sorted(starter_costs.keys())):
+                    if sid is None:
+                        continue
+                    cost = starter_costs[sname]
+                    best_final = sname
+                    best_score = -1.0
+                    for final in finals:
+                        for form_name, entry in db.items():
+                            base = form_name.split("-")[0]
+                            if base == final or form_name == final:
+                                s = entry.get("impact", 0.0)
+                                if s > best_score:
+                                    best_score = s
+                                    best_final = form_name
+                    _si[sid] = {"name": sname, "cost": cost, "final_evo": best_final}
+
+            _starters = _si
+            _prog(on_progress, f"Starters index: {len(_si)} entries.")
+        except Exception as e:
+            _prog(on_progress, f"Warning: starters index failed ({e})")
+    else:
+        # Reuse the already-built starters index from the noegg cache file
+        with _lock:
+            _si = dict(_starters)
+
+    _prog(on_progress, f"Saving {label} impact cache…")
+    with open(cache_file, "w") as f:
+        json.dump({"_version": CACHE_VERSION, "_starters": _si, **db}, f)
 
     with _lock:
-        _db = db
-    _ready = True
+        if include_egg:
+            _db_egg = db
+        else:
+            _db_noegg = db
+    if include_egg:
+        _ready_egg = True
+    else:
+        _ready = True
     if on_ready:
         on_ready()
-    _prog(on_progress, f"Done — {len(db)} forms scored.")
+    _prog(on_progress, f"Done — {len(db)} forms scored ({label}).")
 
 
 def _prog(cb, msg: str):
@@ -502,7 +1184,7 @@ if __name__ == "__main__":
     def _on_ready():
         done.set()
 
-    _build_or_load(lambda msg: print(f"  {msg}"), _on_ready)
+    _build_or_load(lambda msg: print(f"  {msg}"), _on_ready, False)
     done.wait()
 
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 30
@@ -510,7 +1192,7 @@ if __name__ == "__main__":
     print(f"{'Rank':<5} {'Name':<30} {'Score':>10}  {'%ile':>5}  Types")
     print("-" * 65)
     for rank, (name, score) in enumerate(top_n(n), 1):
-        entry = _db[name]
+        entry = _db_noegg[name]
         pct = entry["percentile"]
         types = "/".join(entry["types"])
         leg = " [L]" if entry.get("legendary") else ""
@@ -520,7 +1202,7 @@ if __name__ == "__main__":
     print(f"{'Rank':<5} {'Name':<30} {'Score':>10}  {'%ile':>5}  Types")
     print("-" * 65)
     for rank, (name, score) in enumerate(top_n(n, exclude_legendary=True), 1):
-        entry = _db[name]
+        entry = _db_noegg[name]
         pct = entry["percentile"]
         types = "/".join(entry["types"])
         print(f"{rank:<5} {name:<30} {score:>10.0f}  p{pct:<4}  {types}")

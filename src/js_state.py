@@ -65,6 +65,10 @@ EXTRACTOR_JS = r"""
                     spa: tryGet(() => p.getEffectiveStat(3)),
                     spd: tryGet(() => p.getEffectiveStat(4)),
                 },
+                permanentStats: {
+                    atk: tryGet(() => p.getStat(1)),
+                    spa: tryGet(() => p.getStat(3)),
+                },
             };
         } catch(e) { return null; }
     };
@@ -107,6 +111,71 @@ EXTRACTOR_JS = r"""
         });
     }) || false;
 
+    // ── Starter select detection ─────────────────────────────────────────
+    // The starter select runs inside the 'battle' scene as a UI mode/phase.
+    // Detect via: no active wave + starterData loaded + no live enemies.
+    const _active_scenes = tryGet(() =>
+        Object.keys(g.scene.keys).filter(k => g.scene.keys[k].sys && g.scene.keys[k].sys.isActive())
+    ) || [];
+
+    // Diagnostic: current UI handler property names (helps tune detection in minified builds)
+    const _uiHandler = tryGet(() => battle.ui && battle.ui.getHandler && battle.ui.getHandler()) || null;
+    const _handler_keys = tryGet(() => _uiHandler ? Object.getOwnPropertyNames(_uiHandler) : []) || [];
+
+    const isStarterSelect = tryGet(() => {
+        if (!battle) return false;
+        // No wave in progress
+        const wave = battle.currentBattle && battle.currentBattle.waveIndex;
+        if (wave) return false;
+        // starterData must be present and non-empty (means game data is loaded)
+        const starterData = battle.gameData && battle.gameData.starterData;
+        if (!starterData || Object.keys(starterData).length === 0) return false;
+        // No enemies active (distinguishes from wave 0 edge cases)
+        const enemies = tryGet(() => battle.getEnemyField(true)) || [];
+        if (enemies.length > 0) return false;
+        return true;
+    }) || false;
+
+    if (isStarterSelect) {
+        const starterData = tryGet(() => battle.gameData.starterData) || {};
+        const unlockedIds = [];
+        const wonIds = [];
+        const valueReductions = {};
+        for (const [id, d] of Object.entries(starterData)) {
+            if (d && d.abilityAttr > 0) {
+                const sid = parseInt(id);
+                unlockedIds.push(sid);
+                if (d.classicWinCount > 0) wonIds.push(sid);
+                if (d.valueReduction > 0) valueReductions[sid] = d.valueReduction;
+            }
+        }
+        const selectedIds = tryGet(() => {
+            if (!_uiHandler) return [];
+            // Try known property names from handler key inspection
+            const arr = _uiHandler.starters || _uiHandler.selectedStarters ||
+                        _uiHandler.starterGens || _uiHandler.selectedPokemon;
+            if (arr && arr.length !== undefined) {
+                return Array.from(arr).filter(Boolean)
+                    .map(s => (s.species && s.species.speciesId) || (s.speciesId))
+                    .filter(Boolean);
+            }
+            // Fallback: scan validStarterContainers for a 'selected' or 'chosen' flag
+            const containers = _uiHandler.validStarterContainers || _uiHandler.starterContainers || [];
+            return Array.from(containers).filter(c => c && (c.selected || c.chosen || c.isSelected))
+                .map(c => c.species && c.species.speciesId).filter(Boolean);
+        }) || [];
+        return {
+            is_starter_select: true,
+            unlocked_ids: unlockedIds,
+            won_ids: wonIds,
+            selected_ids: selectedIds,
+            value_reductions: valueReductions,
+            _handler_keys: _handler_keys,
+            wave: null, player: [], enemies: [], party: [],
+            _active_scenes: _active_scenes,
+        };
+    }
+
     try {
         return {
             wave: battle.currentBattle ? battle.currentBattle.waveIndex : null,
@@ -117,6 +186,7 @@ EXTRACTOR_JS = r"""
             player: battle.getPlayerField(true).map(summarize).filter(x => x),
             enemies: battle.getEnemyField(true).map(summarize).filter(x => x),
             party: tryGet(() => battle.getPlayerParty().map(summarizeParty).filter(x => x)) || [],
+            _active_scenes: _active_scenes,
         };
     } catch(e) {
         return {error: String(e && e.message)};

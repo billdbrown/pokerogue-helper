@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from weakness_calc import ALL_TYPES, covered_gaps
+from weakness_calc import ALL_TYPES
 
 TEAM_SIZE = 6
 
@@ -88,11 +88,8 @@ class AnalysisPanel(QWidget):
         self._tabs.setDocumentMode(True)
         self._tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
-        self._weak_link_area = self._add_tab("WEAKEST")
-        self._tips_area      = self._add_tab("TIPS")
-        self._pref_type_area = self._add_tab("TYPING")
+        self._weak_link_area = self._add_tab("COVERAGE")
         self._danger_area    = self._add_tab("DANGER")
-        self._weak_area      = self._add_tab("WEAKNESS")
 
         root.addWidget(self._tabs)
 
@@ -113,9 +110,7 @@ class AnalysisPanel(QWidget):
 
     def _init_empty(self):
         self._rebuild_weakest_link([None] * TEAM_SIZE, None, None, [None] * TEAM_SIZE)
-        self._rebuild_tips_danger(None, None, None, None, None)
-        self._rebuild_preferred_typing(None)
-        self._rebuild_weakness_grid([None] * TEAM_SIZE)
+        self._rebuild_danger(None)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -124,9 +119,7 @@ class AnalysisPanel(QWidget):
          slot_stats, weakest_slot, replace_sugg, pref_type,
          team_weaknesses, team_names) = payload
         self._rebuild_weakest_link(slot_stats, weakest_slot, replace_sugg, team_names)
-        self._rebuild_tips_danger(full, partial, gaps, suggestions, danger)
-        self._rebuild_preferred_typing(pref_type)
-        self._rebuild_weakness_grid(team_weaknesses)
+        self._rebuild_danger(danger)
 
     # ── Tab content builders ──────────────────────────────────────────────────
 
@@ -134,91 +127,38 @@ class AnalysisPanel(QWidget):
         self._clear_layout(self._weak_link_area)
         filled = [(s, st) for s, st in enumerate(slot_stats) if st is not None]
         if not filled:
-            self._weak_link_area.addWidget(self._placeholder("Add Pokémon to see weakest link"))
+            self._weak_link_area.addWidget(self._placeholder("Add Pokémon to see coverage distribution"))
             return
 
         total_covered = sum(st[2] for _, st in filled) or 1
-        ranked = sorted(filled, key=lambda x: (x[1][2], x[1][3], x[1][1]))
+        ranked = sorted(filled, key=lambda x: x[1][2], reverse=True)
         for s, (bst, bst_pct, matchup, unique) in ranked:
             name = (team_names[s] or f"Slot {s + 1}").capitalize()
-            is_weakest = s == weakest_slot
 
             row = QHBoxLayout()
             row.setSpacing(4)
 
-            warn = QLabel("⚠" if is_weakest else "")
-            warn.setFixedWidth(20)
-            warn.setStyleSheet("color:#f38ba8; font-size:18px;")
-
-            name_lbl = QLabel(name)
-            name_color = "#f38ba8" if is_weakest else "#cdd6f4"
-            name_lbl.setStyleSheet(f"color:{name_color}; font-size:18px;")
-
-            pct_color = "#a6e3a1" if bst_pct >= 66 else "#f9e2af" if bst_pct >= 33 else "#f38ba8"
-            stat_lbl = QLabel(f"{bst} {bst_pct}th%")
-            stat_lbl.setStyleSheet(f"color:{pct_color}; font-size:18px;")
-
             mu_pct = round(matchup / total_covered * 100)
-            mu_color = "#a6e3a1" if mu_pct >= 34 else "#f9e2af" if mu_pct >= 17 else "#f38ba8"
-            cov_lbl = QLabel(f"{mu_pct}%")
-            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px;")
+            mu_color = ("#38bdf8" if mu_pct >= 30 else
+                        "#a6e3a1" if mu_pct >= 15 else
+                        "#f9e2af" if mu_pct >= 10 else
+                        "#f38ba8")
+            name_lbl = QLabel(name)
+            name_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px; font-weight:bold;")
 
-            row.addWidget(warn)
+            cov_lbl = QLabel(f"{mu_pct}%")
+            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px; font-weight:bold;")
+
             row.addWidget(name_lbl)
-            row.addWidget(stat_lbl)
             row.addStretch()
             row.addWidget(cov_lbl)
             self._weak_link_area.addLayout(row)
 
-        if weakest_slot is not None:
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            if replace_sugg:
-                type_name, gain, specific_gaps = replace_sugg
-                add_lbl = QLabel("Add")
-                add_lbl.setStyleSheet("color:#89b4fa; font-size:18px;")
-                row.addWidget(add_lbl)
-                row.addWidget(self._make_type_badge(type_name))
-                count_lbl = QLabel(f"({gain})")
-                count_lbl.setStyleSheet("color:#a6adc8; font-size:18px;")
-                row.addWidget(count_lbl)
-                for gap_type in specific_gaps:
-                    row.addWidget(self._make_type_badge(gap_type))
-            else:
-                desc = QLabel("Coverage unchanged without them")
-                desc.setStyleSheet("color:#6c7086; font-size:18px;")
-                row.addWidget(desc)
-            row.addStretch()
-            self._weak_link_area.addLayout(row)
-
-    def _rebuild_tips_danger(self, full, partial, gaps, suggestions, danger):
-        self._clear_layout(self._tips_area)
+    def _rebuild_danger(self, danger):
         self._clear_layout(self._danger_area)
-
-        if full is None:
-            self._tips_area.addWidget(self._placeholder("Enter moves to see coverage tips"))
+        if danger is None:
             self._danger_area.addWidget(self._placeholder("Enter moves to see danger combos"))
             return
-
-        if suggestions:
-            for type_name, count in suggestions:
-                gap_types = covered_gaps(type_name, gaps) if gaps else []
-                row = QHBoxLayout()
-                row.setSpacing(4)
-                add_lbl = QLabel("Add")
-                add_lbl.setStyleSheet("color:#89b4fa; font-size:18px;")
-                row.addWidget(add_lbl)
-                row.addWidget(self._make_type_badge(type_name))
-                count_lbl = QLabel(f"({count})")
-                count_lbl.setStyleSheet("color:#a6adc8; font-size:18px;")
-                row.addWidget(count_lbl)
-                for gap_type in gap_types:
-                    row.addWidget(self._make_type_badge(gap_type))
-                row.addStretch()
-                self._tips_area.addLayout(row)
-        else:
-            self._tips_area.addWidget(self._placeholder("Full coverage — no gaps!"))
-
         if danger:
             for t1, t2, weak_count in danger:
                 row = QHBoxLayout()
@@ -243,25 +183,6 @@ class AnalysisPanel(QWidget):
                 self._danger_area.addLayout(row)
         else:
             self._danger_area.addWidget(self._placeholder("No uncovered dual-type combos"))
-
-    def _rebuild_preferred_typing(self, pref_type):
-        self._clear_layout(self._pref_type_area)
-        if not pref_type:
-            self._pref_type_area.addWidget(self._placeholder("Enter moves to see"))
-            return
-        for type_name, count, mode in pref_type:
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            row.addWidget(self._make_type_badge(type_name))
-            if mode == "gap":
-                desc = QLabel(f"fills {count} gap{'s' if count != 1 else ''}")
-                desc.setStyleSheet("color:#f38ba8; font-size:18px;")
-            else:
-                desc = QLabel(f"backs up {count} type{'s' if count != 1 else ''}")
-                desc.setStyleSheet("color:#a6e3a1; font-size:18px;")
-            row.addWidget(desc)
-            row.addStretch()
-            self._pref_type_area.addLayout(row)
 
     def _rebuild_weakness_grid(self, team_weaknesses):
         self._clear_layout(self._weak_area)

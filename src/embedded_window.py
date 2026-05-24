@@ -39,7 +39,7 @@ _VERSION = _read_version()
 
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QSizePolicy,
+    QMainWindow, QSizePolicy, QStackedWidget,
     QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QLabel,
     QDialog, QCheckBox, QDialogButtonBox,
 )
@@ -51,6 +51,7 @@ from PyQt6.QtCore import Qt, QUrl, QPoint, QTimer
 
 from overlay import OverlayPanel
 from team_panel import TeamPanel
+from team_builder_panel import TeamBuilderPanel
 from impact_table import ImpactTableDialog
 import impact_db
 from wave_panel import WavePanel
@@ -61,7 +62,7 @@ from notification_panel import NotificationPanel
 from js_state import JSStateService
 
 # Waves at which rival battles occur in Classic mode.
-_RIVAL_WAVES = [25, 55, 95, 145, 182]
+_RIVAL_WAVES = [8, 25, 55, 95, 145, 195]
 
 
 _LEFT_WIDTH = 390
@@ -165,10 +166,11 @@ class EmbeddedMainWindow(QMainWindow):
         self._configure_web()
 
         # ── Panels ────────────────────────────────────────────────────────
-        self._wave     = WavePanel(embedded=True)
-        self._enemy    = OverlayPanel([], embedded=True)
-        self._analysis = AnalysisPanel()
-        self._team     = TeamPanel(strip=True)
+        self._wave          = WavePanel(embedded=True)
+        self._enemy         = OverlayPanel([], embedded=True)
+        self._team_builder  = TeamBuilderPanel()
+        self._analysis      = AnalysisPanel()
+        self._team          = TeamPanel(strip=True)
         self._team.set_analysis_panel(self._analysis)
         self._team.load_saved_team()
 
@@ -202,7 +204,11 @@ class EmbeddedMainWindow(QMainWindow):
 
         title_hl.addStretch()
 
-        # ── Left panel: title + enemy (fills remaining space) + analysis (fills down) ──
+        # ── Left panel: title + stacked (enemy | team builder) + analysis ───
+        self._left_stack = QStackedWidget()
+        self._left_stack.addWidget(self._enemy)         # index 0 — battle view
+        self._left_stack.addWidget(self._team_builder)  # index 1 — starter select
+
         left_panel = QWidget()
         left_panel.setFixedWidth(_LEFT_WIDTH)
         left_panel.setStyleSheet("QWidget { background: #181825; }")
@@ -210,8 +216,8 @@ class EmbeddedMainWindow(QMainWindow):
         left_vl.setContentsMargins(0, 0, 0, 0)
         left_vl.setSpacing(0)
         left_vl.addWidget(title_bar)
-        left_vl.addWidget(self._enemy, 1)
-        left_vl.addWidget(self._analysis, 1)
+        left_vl.addWidget(self._left_stack, 1)
+        left_vl.addWidget(self._analysis)
 
         # ── Right panel: navbar + browser + team ─────────────────────────
         right_panel = QWidget()
@@ -368,7 +374,7 @@ class EmbeddedMainWindow(QMainWindow):
         self._status_lbl.setObjectName("status")
         row.addWidget(self._status_lbl)
 
-        impact_btn = QPushButton("Impact")
+        impact_btn = QPushButton("Impact Score Browser")
         impact_btn.setToolTip("Browse Impact Scores")
         impact_btn.clicked.connect(self._open_impact_table)
         row.addWidget(impact_btn)
@@ -425,6 +431,7 @@ class EmbeddedMainWindow(QMainWindow):
     def _on_js_snapshot(self, snap):
         """Live Phaser-scene snapshot. Drives every downstream panel."""
         if snap is None or snap.get('error'):
+            self._left_stack.setCurrentIndex(0)
             self._team.set_active_slot("", position=0)
             self._team.set_active_slot("", position=1)
             self._enemy.set_active_pokemon("")
@@ -437,6 +444,14 @@ class EmbeddedMainWindow(QMainWindow):
                 self._in_fight = False
                 self._push_debug_state()
             return
+
+        # ── Starter select screen ─────────────────────────────────────────
+        if snap.get('is_starter_select'):
+            self._left_stack.setCurrentIndex(1)
+            self._team_builder.update_starter_state(snap)
+            return
+
+        self._left_stack.setCurrentIndex(0)
 
         # Wave
         wave = snap.get('wave')
@@ -505,6 +520,8 @@ class EmbeddedMainWindow(QMainWindow):
                     e.get('level') or 1, e.get('types') or [], e.get('status'),
                     stat_total=_enemy_total,
                 )
+                perm = e.get('permanentStats') or {}
+                self._enemy.receive_enemy_perm_stats(slot, perm)
                 was_boss = slot in self._ui_state.boss_mask
                 is_boss = bool(e.get('isBoss'))
                 if is_boss != was_boss:
