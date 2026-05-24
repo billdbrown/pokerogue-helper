@@ -1,5 +1,8 @@
 # Pokerogue Helper
 
+<img width="1598" height="900" alt="image" src="https://github.com/user-attachments/assets/f842aab5-58df-4ae4-8b48-1c0d995fb538" />
+
+
 A Windows desktop overlay for [pokerogue.net](https://pokerogue.net). Embeds the
 game in a native window and reads live battle state directly from the running
 Phaser scene via JavaScript injection — no OCR required.
