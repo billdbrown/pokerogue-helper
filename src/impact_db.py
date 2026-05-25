@@ -28,7 +28,7 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 25
+CACHE_VERSION  = 35
 
 # Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
 _EXCLUDED_FORMS: frozenset[str] = frozenset({
@@ -138,6 +138,57 @@ def _is_self_reducing(effect: str) -> bool:
 #   "def"   : list of (type_filter, category_filter, multiplier)  — damage reduction
 #   "immune": set of incoming move types that deal 0 damage
 # None in a filter position means "any".
+_IRON_FIST_MOVES: frozenset[str] = frozenset({
+    "bullet-punch", "comet-punch", "dizzy-punch", "drain-punch", "dynamic-punch",
+    "fire-punch", "focus-punch", "hammer-arm", "ice-hammer", "ice-punch",
+    "mach-punch", "mega-punch", "meteor-mash", "plasma-fists", "power-up-punch",
+    "shadow-punch", "sky-uppercut", "thunder-punch",
+})
+
+_STRONG_JAW_MOVES: frozenset[str] = frozenset({
+    "bite", "bug-bite", "crunch", "fire-fang", "fishious-rend",
+    "hyper-fang", "ice-fang", "jaw-lock", "poison-fang",
+    "psychic-fangs", "thunder-fang",
+})
+
+_RECKLESS_MOVES: frozenset[str] = frozenset({
+    "brave-bird", "double-edge", "flare-blitz", "head-charge", "head-smash",
+    "submission", "take-down", "volt-tackle", "wild-charge", "wood-hammer",
+})
+
+_SOUNDPROOF_MOVES: frozenset[str] = frozenset({
+    "boomburst", "bug-buzz", "chatter", "clanging-scales", "clangorous-soul",
+    "disarming-voice", "echoed-voice", "hyper-voice", "metal-sound", "noble-roar",
+    "parting-shot", "perish-song", "relic-song", "round", "screech", "sing",
+    "snarl", "sparkling-aria", "supersonic", "uproar",
+})
+
+_BULLETPROOF_MOVES: frozenset[str] = frozenset({
+    "acid-spray", "aura-sphere", "barrage", "bullet-seed", "egg-bomb",
+    "electro-ball", "energy-ball", "focus-blast", "gyro-ball", "ice-ball",
+    "magnet-bomb", "mist-ball", "mud-bomb", "octazooka", "pollen-puff",
+    "pyro-ball", "rock-blast", "rock-wrecker", "seed-bomb", "shadow-ball",
+    "sludge-bomb", "weather-ball", "zap-cannon",
+})
+
+_SHARPNESS_MOVES: frozenset[str] = frozenset({
+    "aerial-ace", "air-slash", "aqua-cutter", "behemoth-blade", "bitter-blade",
+    "ceaseless-edge", "cross-poison", "cut", "fury-cutter", "kowtow-cleave",
+    "leaf-blade", "night-slash", "population-bomb", "psycho-cut", "razor-leaf",
+    "razor-shell", "razor-wind", "sacred-sword", "secret-sword", "slash",
+    "solar-blade", "spacial-rend", "stone-axe", "x-scissor",
+})
+
+_MEGA_LAUNCHER_MOVES: frozenset[str] = frozenset({
+    "aura-sphere", "dark-pulse", "dragon-pulse", "origin-pulse",
+    "terrain-pulse", "water-pulse", "oblivion-wing",
+})
+
+_WIND_MOVES: frozenset[str] = frozenset({
+    "bleakwind-storm", "fairy-wind", "gust", "hurricane", "icy-wind",
+    "petal-blizzard", "tailwind", "twister", "whirlwind",
+})
+
 ABILITY_EFFECTS: dict[str, dict] = {
     # ── Offensive ──────────────────────────────────────────────────────────────
     "transistor":     {"off": [("electric", None,       1.5)]},
@@ -145,6 +196,51 @@ ABILITY_EFFECTS: dict[str, dict] = {
     "rocky-payload":  {"off": [("rock",     None,       1.5)]},
     "water-bubble":   {"off": [("water",    None,       2.0)],
                        "def": [("fire",     None,       0.5)]},
+    "sheer-force":    {"off": [(None,       None,       1.3)]},
+    "hustle":         {"off": [(None,       "physical", 1.2)]},
+    "huge-power":     {"off": [(None,       "physical", 2.0)]},
+    "pure-power":     {"off": [(None,       "physical", 2.0)]},
+    "technician":     {"power_cap":  [(60, None, None, 1.5)]},
+    "iron-fist":      {"move_set":   [(_IRON_FIST_MOVES,      None, None, 1.2)]},
+    "strong-jaw":     {"move_set":   [(_STRONG_JAW_MOVES,     None, None, 1.5)]},
+    "reckless":       {"move_set":   [(_RECKLESS_MOVES,       None, None, 1.2)]},
+    "sharpness":      {"move_set":   [(_SHARPNESS_MOVES,      None, None, 1.5)]},
+    "mega-launcher":  {"move_set":   [(_MEGA_LAUNCHER_MOVES,  None, None, 1.5)]},
+    "punk-rock":      {"move_set":   [(_SOUNDPROOF_MOVES,     None, None, 1.3)],
+                       "def_move_set": [(_SOUNDPROOF_MOVES,   None, None, 0.5)]},
+    "truant":         {"off": [(None, None, 0.5)]},
+    "slow-start":     {"off": [(None, "physical", 0.5)]},
+    "defeatist":      {"off": [(None, None, 0.75)]},
+    "fairy-aura":     {"off": [("fairy", None, 4/3)]},
+    "dark-aura":      {"off": [("dark",  None, 4/3)]},
+    "parental-bond":  {"off": [(None, None, 1.25)]},
+    "intrepid-sword": {"off": [(None, "physical", 1.5)]},
+    "steelworker":    {"off": [("steel", None, 1.5)]},
+    "neuroforce":     {"off_se": 1.25},
+    "stall":          {"always_last": True},
+    # ── Offensive (remap all move types) ──────────────────────────────────────
+    "normalize":      {"remap_all": ("normal", 1.2)},
+    # ── Offensive (charge when hit — Electric ×2 when moving second) ──────────
+    "electromorphosis": {"charge_electric": 2.0},
+    # ── Offensive (ruin — reduces opponent's defense stats) ────────────────────
+    "beads-of-ruin":  {"off": [(None, "special",  4/3)]},
+    "sword-of-ruin":  {"off": [(None, "physical", 4/3)]},
+    # ── Defensive (ruin — reduces opponent's attack stats) ─────────────────────
+    "vessel-of-ruin": {"def": [(None, "special",  0.75)]},
+    "tablets-of-ruin":{"def": [(None, "physical", 0.75)]},
+    # ── Defensive (only SE moves deal damage) ──────────────────────────────────
+    "wonder-guard":   {"wonder_guard": True},
+    "compound-eyes":  {"acc_mult": 1.3},
+    "victory-star":   {"acc_mult": 1.1},
+    # ── Offensive (STAB boost) ─────────────────────────────────────────────────
+    "adaptability":   {"stab": 2.0},
+    # ── Offensive (recoil negation — affects clean-mode move eligibility) ──────
+    "rock-head":      {"no_recoil": True},
+    # ── Offensive (pierce immunity / Ghost-type) ──────────────────────────────
+    "scrappy":        {"scrappy": True},
+    "minds-eye":      {"scrappy": True},
+    # ── Offensive (NVE doubling) ───────────────────────────────────────────────
+    "tinted-lens":    {"tinted": True},
     # -ate: Normal moves become new type + ×1.3 power; STAB re-evaluated on new type
     "aerilate":       {"remap": ("normal", "flying",    1.3)},
     "pixilate":       {"remap": ("normal", "fairy",     1.3)},
@@ -158,12 +254,127 @@ ABILITY_EFFECTS: dict[str, dict] = {
     "multiscale":     {"def": [(None,       None,       0.5)]},
     "shadow-shield":  {"def": [(None,       None,       0.5)]},
     "purifying-salt": {"def": [("ghost",    None,       0.5)]},
+    "intimidate":     {"def": [(None,       "physical", 2/3)]},
+    "dauntless-shield": {"def": [(None,    "physical", 2/3)]},
+    "fluffy":         {"def": [(None,       "physical", 0.5),
+                                ("fire",     None,       2.0)]},
     # ── Immunity ───────────────────────────────────────────────────────────────
     "well-baked-body": {"immune": {"fire"}},
+    "levitate":        {"immune": {"ground"}},
+    "lightning-rod":   {"immune": {"electric"}},
+    "water-absorb":    {"immune": {"water"}},
+    "volt-absorb":     {"immune": {"electric"}},
+    "motor-drive":     {"immune": {"electric"}},
+    "earth-eater":     {"immune": {"ground"}},
+    "flash-fire":      {"immune": {"fire"}},
+    "sap-sipper":      {"immune": {"grass"}},
+    "dry-skin":        {"immune": {"water"}, "def": [("fire", None, 1.25)]},
+    # ── Defensive (move-set immunity) ─────────────────────────────────────────
+    "soundproof":      {"immune_move_set": _SOUNDPROOF_MOVES},
+    "bulletproof":     {"immune_move_set": _BULLETPROOF_MOVES},
+    "wind-rider":      {"immune_move_set": _WIND_MOVES},
+    # ── Offensive (recoil negation) ────────────────────────────────────────────
+    "magic-guard":     {"no_recoil": True},
+    # ── Offensive (accuracy override) ─────────────────────────────────────────
+    "no-guard":        {"no_guard": True},
+    # ── Offensive (STAB on every move) ────────────────────────────────────────
+    "protean":         {"protean": True},
+    # ── Offensive (speed-conditional boost) ───────────────────────────────────
+    "analytic":        {"analytic": True},
+    # ── Offensive (max multi-hit) ──────────────────────────────────────────────
+    "skill-link":      {"skill_link": True},
+    # ── Offensive (contact moves) ──────────────────────────────────────────────
+    "tough-claws":     {"off": [(None, "physical", 1.3)]},
+    # ── Offensive (STAB on every move — same flag as Protean) ─────────────────
+    "libero":          {"protean": True},
+    # ── Offensive (per-matchup stat boost) ────────────────────────────────────
+    "download":        {"download": True},
+    # ── Offensive (sound → Water remap) ───────────────────────────────────────
+    "liquid-voice":    {"sound_remap": "water"},
+    # ── Offensive (type remap, same pattern as -ate) ───────────────────────────
+    "galvanize":       {"remap": ("normal", "electric", 1.2)},
+    # ── Defensive (SE damage reduction) ───────────────────────────────────────
+    "filter":          {"filter_se": 0.75},
+    "solid-rock":      {"filter_se": 0.75},
+    "prism-armor":     {"filter_se": 0.75},
+    # ── Immunity (water redirect) ──────────────────────────────────────────────
+    "storm-drain":     {"immune": {"water"}},
 }
 
+# All abilities explicitly categorized — modeled, deferred, or intentional no-ops.
+# Used to identify Pokémon whose impact scores are fully accounted for.
+KNOWN_ABILITIES: frozenset[str] = frozenset(ABILITY_EFFECTS) | frozenset({
+    # Intentional no-ops — no battle-math effect in this sim
+    "keen-eye", "frisk", "pressure", "run-away", "gluttony", "pickup",
+    "unnerve", "telepathy", "mold-breaker", "regenerator", "infiltrator",
+    "weak-armor", "rattled", "damp", "prankster",
+    "clear-body", "natural-cure", "synchronize", "rivalry", "anticipation",
+    "unburden", "early-bird", "vital-spirit", "steadfast", "pickpocket",
+    "defiant", "serene-grace", "cute-charm", "unaware", "cursed-body",
+    "big-pecks", "competitive", "speed-boost", "limber", "shields-down", "water-veil",
+    "shield-dust", "hyper-cutter", "klutz", "healer", "aftermath", "contrary",
+    "magic-bounce", "sweet-veil", "plus", "sticky-hold", "friend-guard",
+    "heavy-metal", "justified", "magnet-pull", "harvest", "stakeout",
+    "illuminate", "minus", "aroma-veil",
+    "trace", "light-metal", "cheek-pouch", "gooey", "tangling-hair",
+    "shadow-tag", "rough-skin", "iron-barbs", "forewarn", "magician",
+    "suction-cups", "white-smoke", "simple", "honey-gather", "wonder-skin",
+    "flower-veil", "symbiosis", "ripen", "unseen-fist",
+    "illusion", "stalwart", "steam-engine", "cud-chew", "long-reach",
+    "gulp-missile", "neutralizing-gas", "commander",
+    "liquid-ooze", "gale-wings", "stamina", "berserk",
+    "turboblaze", "teravolt", "aura-break", "water-compaction", "merciless",
+    "soul-heart", "power-of-alchemy", "cotton-down", "propeller-tail",
+    "screen-cleaner", "guard-dog", "toxic-debris", "mycelium-might",
+    "supersweet-syrup", "hospitality", "gorilla-tactics",
+    "triage", "queenly-majesty", "dazzling", "battery", "receiver",
+    "full-metal-body", "ball-fetch", "power-spot", "steely-spirit",
+    "color-change", "perish-body", "curious-medicine",
+    "chilling-neigh", "grim-neigh", "as-one", "good-as-gold", "costar",
+    # Deferred — multi-battle scaling (1v1 sim cannot capture)
+    "moxie", "beast-boost", "moody", "speed-boost", "innards-out",
+    "supreme-overlord",
+    # Deferred — HP-conditional (needs HP tracking inside sim)
+    "overgrow", "blaze", "torrent", "swarm",
+    # Deferred — needs sim architecture change
+    "sturdy",
+    # Deferred — needs weather mechanic
+    "swift-swim", "chlorophyll", "sand-veil",
+    "overcoat", "hydration", "leaf-guard", "ice-body",
+    "sand-force", "snow-cloak", "rain-dish",
+    "solar-power", "sand-rush", "snow-warning", "protosynthesis", "quark-drive",
+    "cloud-nine", "slush-rush", "sand-stream", "drought", "grassy-surge", "orichalcum-pulse",
+    "hadron-engine", "forecast", "drizzle", "sand-spit", "psychic-surge",
+    "grass-pelt", "electric-surge", "misty-surge", "wind-power",
+    "air-lock", "primordial-sea", "desolate-land", "delta-stream",
+    "surge-surfer", "mimicry",
+    # Deferred — needs status mechanic
+    "static", "own-tempo",
+    "oblivious", "guts", "insomnia", "flame-body", "shed-skin", "poison-point",
+    "effect-spore", "quick-feet", "poison-touch", "tangled-feet", "corrosion",
+    "immunity", "magma-armor", "marvel-scale", "arena-trap", "poison-heal",
+    "toxic-chain", "thermal-exchange",
+    "flare-boost", "pastel-veil",
+    # Deferred — needs flinch mechanic
+    "inner-focus", "stench",
+    # Deferred — HP-conditional / form-change
+    "zen-mode", "disguise", "dancer", "power-construct",
+    "mummy", "stance-change", "schooling", "battle-bond",
+    "ice-face", "wandering-spirit", "mirror-armor",
+    "hunger-switch", "zero-to-hero",
+    "multitype", "flower-gift", "imposter",
+    "wimp-out", "emergency-exit", "rks-system",
+    "comatose", "bad-dreams", "toxic-boost", "flare-boost",
+    "lingering-aroma", "seed-sower", "anger-shell", "opportunist",
+    "armor-tail", "quick-draw", "tera-shift", "tera-shell",
+    "teraform-zero", "poison-puppeteer",
+    # Deferred — needs critical-hit mechanic
+    "shell-armor", "sniper", "anger-point", "battle-armor", "super-luck",
+})
 
-def _off_effect(abilities: list[str], move_type: str, category: str) -> tuple[str, float]:
+
+def _off_effect(abilities: list[str], move_type: str, category: str,
+                move_name: str = "", base_power: int = 0) -> tuple[str, float]:
     """Return (effective_type, power_multiplier) after applying all active abilities."""
     etype = move_type
     mult = 1.0
@@ -174,21 +385,57 @@ def _off_effect(abilities: list[str], move_type: str, category: str) -> tuple[st
             if etype == from_t:
                 etype = to_t
                 mult *= rmult
+        if "remap_all" in fx:
+            new_t, rmult = fx["remap_all"]
+            etype = new_t
+            mult *= rmult
+        if "sound_remap" in fx and move_name in _SOUNDPROOF_MOVES:
+            etype = fx["sound_remap"]
         for t, cat, m in fx.get("off", []):
             if (t is None or t == move_type) and (cat is None or cat == category):
+                mult *= m
+        for ms, t, cat, m in fx.get("move_set", []):
+            if move_name and move_name in ms and (t is None or t == move_type) and (cat is None or cat == category):
+                mult *= m
+        for max_bp, t, cat, m in fx.get("power_cap", []):
+            if 0 < base_power <= max_bp and (t is None or t == move_type) and (cat is None or cat == category):
                 mult *= m
     return etype, mult
 
 
-def _def_mult(abilities: list[str], move_type: str, category: str) -> float:
+def _stab_mult(abilities: list[str]) -> float:
+    """Return STAB multiplier (2.0 for Adaptability, 1.5 otherwise)."""
+    for ab in abilities:
+        s = ABILITY_EFFECTS.get(ab, {}).get("stab")
+        if s:
+            return s
+    return 1.5
+
+
+def _acc_mult(abilities: list[str]) -> float:
+    """Return accuracy multiplier (1.3 for Compound Eyes, 1.0 otherwise)."""
+    for ab in abilities:
+        m = ABILITY_EFFECTS.get(ab, {}).get("acc_mult")
+        if m:
+            return m
+    return 1.0
+
+
+def _def_mult(abilities: list[str], move_type: str, category: str,
+              move_name: str = "") -> float:
     """Return combined incoming damage multiplier (0.0 = immune) across all abilities."""
     mult = 1.0
     for ability in abilities:
         fx = ABILITY_EFFECTS.get(ability, {})
         if move_type in fx.get("immune", set()):
             return 0.0
+        if move_name and move_name in fx.get("immune_move_set", frozenset()):
+            return 0.0
         for t, cat, m in fx.get("def", []):
             if (t is None or t == move_type) and (cat is None or cat == category):
+                mult *= m
+        for ms, t, cat, m in fx.get("def_move_set", []):
+            if move_name and move_name in ms and (t is None or t == move_type) and (cat is None or cat == category):
                 mult *= m
     return mult
 
@@ -197,6 +444,14 @@ def _pick_ability(api_abilities: list[str]) -> str | None:
     """Return the first modeled regular ability in slot order (slot1 → slot2 → hidden)."""
     for ab in api_abilities:
         if ab in ABILITY_EFFECTS:
+            return ab
+    return None
+
+
+def _pick_known_ability(api_abilities: list[str]) -> str | None:
+    """Return the first non-modeled but categorized ability in slot order (display only)."""
+    for ab in api_abilities:
+        if ab in KNOWN_ABILITIES and ab not in ABILITY_EFFECTS:
             return ab
     return None
 
@@ -600,19 +855,27 @@ def pairing_vector(name: str) -> dict[tuple, float]:
     sp_atk  = entry.get("sp_atk", 0)
     sp      = entry.get("speed_pct", 50)
     factor  = 1.0 if sp >= 70 else 0.4 + 0.6 * (sp / 70)
+    abs_         = [ab for ab in (entry.get("ability_used"), entry.get("passive_ability")) if ab]
+    stab_base    = _stab_mult(abs_)
+    acc_m        = _acc_mult(abs_)
+    has_no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in abs_)
+    has_protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in abs_)
+    has_skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in abs_)
     result: dict[tuple, float] = {}
     for m in entry.get("moves", []):
         mtype    = m.get("type", "")
-        power    = m.get("power") or 0
-        accuracy = m.get("accuracy") or 100
+        raw_acc  = m.get("accuracy") or 0
         category = m.get("category", "special")
+        power    = m.get("power_max", m.get("power") or 0) if has_skill_lk else (m.get("power") or 0)
         if not power:
             continue
+        etype, ab_mult = _off_effect(abs_, mtype, category, m.get("name", ""), m.get("base_power", 0))
         stat = atk if category == "physical" else sp_atk
-        stab = 1.5 if mtype in types else 1.0
-        base = stat * power * (accuracy / 100.0) * stab * factor
+        stab = stab_base if (has_protean or etype in types) else 1.0
+        acc  = 1.0 if has_no_guard else (min(raw_acc * acc_m, 100) if raw_acc else 100) / 100.0
+        base = stat * power * ab_mult * acc * stab * factor
         for pairing in ALL_PAIRINGS:
-            se = _EFF.get((mtype, pairing), 0.0)
+            se = _EFF.get((etype, pairing), 0.0)
             if se > 1.0:
                 val = base * se
                 if val > result.get(pairing, 0.0):
@@ -696,19 +959,27 @@ def _pi_pairing_vector(final_name: str, nature_id) -> dict:
     sp_atk  = entry["sp_atk"] * spa_mod
     sp      = entry["speed_pct"]
     factor  = 1.0 if sp >= 70 else 0.4 + 0.6 * (sp / 70)
+    abs_         = [ab for ab in (entry.get("ability_used"), entry.get("passive_ability")) if ab]
+    stab_base    = _stab_mult(abs_)
+    acc_m        = _acc_mult(abs_)
+    has_no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in abs_)
+    has_protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in abs_)
+    has_skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in abs_)
     result: dict = {}
     for m in entry.get("moves", []):
         mtype    = m.get("type", "")
-        power    = m.get("power") or 0
-        accuracy = m.get("accuracy") or 100
+        raw_acc  = m.get("accuracy") or 0
         category = m.get("category", "special")
+        power    = m.get("power_max", m.get("power") or 0) if has_skill_lk else (m.get("power") or 0)
         if not power:
             continue
+        etype, ab_mult = _off_effect(abs_, mtype, category, m.get("name", ""), m.get("base_power", 0))
         stat = atk if category == "physical" else sp_atk
-        stab = 1.5 if mtype in types else 1.0
-        base = stat * power * (accuracy / 100.0) * stab * factor
+        stab = stab_base if (has_protean or etype in types) else 1.0
+        acc  = 1.0 if has_no_guard else (min(raw_acc * acc_m, 100) if raw_acc else 100) / 100.0
+        base = stat * power * ab_mult * acc * stab * factor
         for pairing in ALL_PAIRINGS:
-            se = _EFF.get((mtype, pairing), 0.0)
+            se = _EFF.get((etype, pairing), 0.0)
             if se > 1.0:
                 val = base * se
                 if val > result.get(pairing, 0.0):
@@ -797,6 +1068,151 @@ def best_swap_pi(
     }
 
 
+def matchup_details(name: str) -> list[dict]:
+    """Per-matchup battle detail for one Pokémon vs every non-legendary pool target.
+
+    Returns a list of dicts — one per opponent — with keys:
+      opponent, opponent_types, move_used, move_against,
+      outcome (ZDW/DW/DL/ZDL/Draw), pohko_a, pohko_b, a_final, b_final.
+    Replicates _compute_battle_score logic exactly, including all modeled abilities.
+    """
+    with _lock:
+        entry = _active_db().get(name.lower())
+        if not entry:
+            return []
+        pool = {
+            k: v for k, v in _active_db().items()
+            if not v.get("legendary") and not v.get("paradox") and v.get("moves")
+        }
+
+    a_types  = entry["types"]
+    a_atk    = entry["atk"]
+    a_sp_atk = entry["sp_atk"]
+    a_speed  = entry["speed"]
+    a_hp     = float(entry["hp"])
+    a_def    = float(entry["defense"])
+    a_sp_def = float(entry["sp_def"])
+    a_moves  = entry.get("moves", [])
+    a_abs: list[str] = [ab for ab in (entry.get("ability_used"), entry.get("passive_ability")) if ab]
+
+    _scrappy  = any(ABILITY_EFFECTS.get(ab, {}).get("scrappy")    for ab in a_abs)
+    _tinted   = any(ABILITY_EFFECTS.get(ab, {}).get("tinted")     for ab in a_abs)
+    _no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in a_abs)
+    _protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in a_abs)
+    _analytic = any(ABILITY_EFFECTS.get(ab, {}).get("analytic")   for ab in a_abs)
+    _skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in a_abs)
+    _download      = any(ABILITY_EFFECTS.get(ab, {}).get("download")      for ab in a_abs)
+    _off_se        = max((ABILITY_EFFECTS.get(ab, {}).get("off_se", 1.0)   for ab in a_abs), default=1.0)
+    _always_last   = any(ABILITY_EFFECTS.get(ab, {}).get("always_last")    for ab in a_abs)
+    _charge_elec   = max((ABILITY_EFFECTS.get(ab, {}).get("charge_electric", 1.0) for ab in a_abs), default=1.0)
+    _wonder_guard  = any(ABILITY_EFFECTS.get(ab, {}).get("wonder_guard")   for ab in a_abs)
+    _acc_m         = _acc_mult(a_abs)
+
+    eff_memo: dict = {}
+    _EPS = 1e-9
+    results: list[dict] = []
+
+    for tgt_name, tgt_e in pool.items():
+        t_types  = tgt_e["types"]
+        t_hp     = float(tgt_e["hp"])
+        t_def    = float(tgt_e["defense"])
+        t_sp_def = float(tgt_e["sp_def"])
+        t_atk    = float(tgt_e["atk"])
+        t_sp_atk = float(tgt_e["sp_atk"])
+        t_speed  = tgt_e["speed"]
+        t_moves  = tgt_e.get("moves", [])
+
+        analytic_mult = 1.3 if _analytic and a_speed < t_speed else 1.0
+        dl_phys_mult  = 1.5 if _download and t_def < t_sp_def else 1.0
+        dl_spec_mult  = 1.5 if _download and t_sp_def <= t_def else 1.0
+
+        # A's best P(OHKO) vs B
+        pohko_a = 0.0
+        best_move_a: str | None = None
+        for m in a_moves:
+            mtype = m["type"]
+            cat   = m["category"]
+            etype, ab_mult = _off_effect(a_abs, mtype, cat, m.get("name", ""), m.get("base_power", 0))
+            k = (etype, tuple(t_types))
+            eff = eff_memo.get(k)
+            if eff is None:
+                eff = _effectiveness(etype, t_types)
+                eff_memo[k] = eff
+            if _scrappy and eff == 0.0 and etype in {"normal", "fighting"} and "ghost" in t_types:
+                eff = 1.0
+            if _tinted and 0 < eff < 1.0:
+                eff *= 2.0
+            if eff > 0:
+                stat = a_atk if cat == "physical" else a_sp_atk
+                stab = _stab_mult(a_abs) if (_protean or etype in a_types) else 1.0
+                raw_acc = m["accuracy"] or 0
+                acc = 1.0 if _no_guard else (min(raw_acc * _acc_m, 100) if raw_acc else 100) / 100.0
+                pwr     = m.get("power_max", m["power"]) if _skill_lk else m["power"]
+                dl_mult = dl_phys_mult if cat == "physical" else dl_spec_mult
+                charge  = _charge_elec if etype == "electric" and a_speed < t_speed else 1.0
+                base    = stat * pwr * ab_mult * analytic_mult * dl_mult * charge * acc * stab
+                if eff > 1.0:
+                    base *= _off_se
+                avg_def = t_def if cat == "physical" else t_sp_def
+                pohko = min(base * eff * _OHKO_K / (t_hp * avg_def), 1.0)
+                if pohko > pohko_a:
+                    pohko_a = pohko
+                    best_move_a = m["name"]
+
+        # B's best P(OHKO) vs A
+        pohko_b = 0.0
+        best_move_b: str | None = None
+        for m in t_moves:
+            mtype = m["type"]
+            cat   = m["category"]
+            dmg_mult = _def_mult(a_abs, mtype, cat, m.get("name", ""))
+            if dmg_mult == 0.0:
+                continue
+            k = (mtype, tuple(a_types))
+            eff = eff_memo.get(k)
+            if eff is None:
+                eff = _effectiveness(mtype, a_types)
+                eff_memo[k] = eff
+            if eff > 0:
+                if _wonder_guard and eff <= 1.0:
+                    continue  # Wonder Guard: only SE moves deal damage
+                if eff > 1.0:
+                    for _ab in a_abs:
+                        dmg_mult *= ABILITY_EFFECTS.get(_ab, {}).get("filter_se", 1.0)
+                stat = t_atk if cat == "physical" else t_sp_atk
+                stab = 1.5 if mtype in t_types else 1.0
+                acc  = (m["accuracy"] or 100) / 100.0
+                base = stat * m["power"] * acc * stab
+                avg_def = a_def if cat == "physical" else a_sp_def
+                pohko = min(base * dmg_mult * eff * _OHKO_K / (a_hp * avg_def), 1.0)
+                if pohko > pohko_b:
+                    pohko_b = pohko
+                    best_move_b = m["name"]
+
+        a_final, b_final = _simulate_battle(pohko_a, pohko_b, 0 if _always_last else a_speed, t_speed)
+
+        if b_final < _EPS:
+            outcome = "ZDW" if a_final >= 1.0 - _EPS else "DW"
+        elif a_final < _EPS:
+            outcome = "ZDL" if b_final >= 1.0 - _EPS else "DL"
+        else:
+            outcome = "Draw"
+
+        results.append({
+            "opponent":       tgt_name,
+            "opponent_types": t_types,
+            "move_used":      best_move_a or "—",
+            "move_against":   best_move_b or "—",
+            "outcome":        outcome,
+            "pohko_a":        pohko_a,
+            "pohko_b":        pohko_b,
+            "a_final":        a_final,
+            "b_final":        b_final,
+        })
+
+    return results
+
+
 # ── score computation ─────────────────────────────────────────────────────────
 
 def _best_capped_score(
@@ -876,21 +1292,28 @@ def _compute_score(
     if not damaging:
         return 0.0, []
 
-    _abs = abilities or []
+    _abs      = abilities or []
+    _acc_m    = _acc_mult(_abs)
+    _no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in _abs)
+    _protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in _abs)
+    _skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in _abs)
+    _download = any(ABILITY_EFFECTS.get(ab, {}).get("download")   for ab in _abs)
+    _off_se   = max((ABILITY_EFFECTS.get(ab, {}).get("off_se", 1.0) for ab in _abs), default=1.0)
     move_pv: list[tuple[dict, dict[int, float]]] = []
     for m in damaging:
         mtype = m["type"]
         cat   = m["category"]
-        etype, ab_mult = _off_effect(_abs, mtype, cat)
+        etype, ab_mult = _off_effect(_abs, mtype, cat, m.get("name", ""), m.get("power") or 0)
         stat  = atk if cat == "physical" else sp_atk
-        stab  = 1.5 if etype in pokemon_types else 1.0
-        acc   = (m["accuracy"] or 100) / 100.0
+        stab  = _stab_mult(_abs) if (_protean or etype in pokemon_types) else 1.0
+        raw_acc = m["accuracy"] or 0
+        acc     = 1.0 if _no_guard else (min(raw_acc * _acc_m, 100) if raw_acc else 100) / 100.0
         pwr = float(m["power"] or 0)
         if m.get("recharge") or m.get("two_turn"):
             pwr /= 2.0
         min_h, max_h = m.get("min_hits") or 0, m.get("max_hits") or 0
         if min_h and max_h:
-            pwr *= (min_h + max_h) / 2.0
+            pwr *= max_h if _skill_lk else (min_h + max_h) / 2.0
         base  = stat * pwr * ab_mult * acc * stab
 
         pv: dict[int, float] = {}
@@ -901,8 +1324,12 @@ def _compute_score(
                 eff = _effectiveness(etype, tgt["types"])
                 eff_memo[types_key] = eff
             if eff > 1.0:
+                dl_mult = 1.5 if _download and (
+                    (cat == "physical" and tgt["def"] < tgt["sp_def"]) or
+                    (cat != "physical" and tgt["sp_def"] <= tgt["def"])
+                ) else 1.0
                 avg_def = tgt["def"] if cat == "physical" else tgt["sp_def"]
-                pv[t_idx] = min(base * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
+                pv[t_idx] = min(base * dl_mult * _off_se * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
         if pv:
             move_pv.append((m, pv))
 
@@ -947,6 +1374,7 @@ def _compute_bulk_pairwise(
     _IMMUNE_CAP hits. sqrt gives ~4-5x range across the population.
     """
     _dabs = defender_abilities or []
+    _wg   = any(ABILITY_EFFECTS.get(ab, {}).get("wonder_guard") for ab in _dabs)
     bulk = 0.0
     for tgt in targets:
         if not tgt.get("moves"):
@@ -955,7 +1383,7 @@ def _compute_bulk_pairwise(
         for m in tgt["moves"]:
             mtype = m["type"]
             cat   = m["category"]
-            dmg_mult = _def_mult(_dabs, mtype, cat)
+            dmg_mult = _def_mult(_dabs, mtype, cat, m.get("name", ""))
             if dmg_mult == 0.0:
                 continue
             types_key = (mtype, tuple(defender_types))
@@ -965,6 +1393,11 @@ def _compute_bulk_pairwise(
                 eff_memo[types_key] = eff
             if eff == 0:
                 continue
+            if _wg and eff <= 1.0:
+                continue  # Wonder Guard: only SE moves count toward bulk
+            if eff > 1.0:
+                for _ab in _dabs:
+                    dmg_mult *= ABILITY_EFFECTS.get(_ab, {}).get("filter_se", 1.0)
             stat = tgt["atk"] if cat == "physical" else tgt["sp_atk"]
             stab = 1.5 if mtype in tgt["types"] else 1.0
             acc  = (m["accuracy"] or 100) / 100.0
@@ -1038,29 +1471,55 @@ def _compute_battle_score(
     a_abs: list[str] = [ab for ab in (
         attacker.get("ability_used"), attacker.get("passive_ability")
     ) if ab]
+    _scrappy  = any(ABILITY_EFFECTS.get(ab, {}).get("scrappy")    for ab in a_abs)
+    _tinted   = any(ABILITY_EFFECTS.get(ab, {}).get("tinted")     for ab in a_abs)
+    _no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in a_abs)
+    _protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in a_abs)
+    _analytic = any(ABILITY_EFFECTS.get(ab, {}).get("analytic")   for ab in a_abs)
+    _skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in a_abs)
+    _acc_m    = _acc_mult(a_abs)
+
+    _download      = any(ABILITY_EFFECTS.get(ab, {}).get("download")      for ab in a_abs)
+    _off_se        = max((ABILITY_EFFECTS.get(ab, {}).get("off_se", 1.0)   for ab in a_abs), default=1.0)
+    _always_last   = any(ABILITY_EFFECTS.get(ab, {}).get("always_last")    for ab in a_abs)
+    _charge_elec   = max((ABILITY_EFFECTS.get(ab, {}).get("charge_electric", 1.0) for ab in a_abs), default=1.0)
+    _wonder_guard  = any(ABILITY_EFFECTS.get(ab, {}).get("wonder_guard")   for ab in a_abs)
 
     _EPS = 1e-9
     zdw = dw = dl = zdl = 0
     move_usage: dict[str, int] = {}
     total = 0.0
     for tgt in targets:
+        analytic_mult = 1.3 if _analytic and a_speed < tgt["speed"] else 1.0
+        dl_phys_mult  = 1.5 if _download and tgt["def"] < tgt["sp_def"] else 1.0
+        dl_spec_mult  = 1.5 if _download and tgt["sp_def"] <= tgt["def"] else 1.0
         # Best P(OHKO) of A on B — apply A's offensive abilities
         pohko_a = 0.0
         best_move: str | None = None
         for m in a_moves:
             mtype = m["type"]
             cat   = m["category"]
-            etype, ab_mult = _off_effect(a_abs, mtype, cat)
+            etype, ab_mult = _off_effect(a_abs, mtype, cat, m.get("name", ""), m.get("base_power", 0))
             k = (etype, tuple(tgt["types"]))
             eff = eff_memo.get(k)
             if eff is None:
                 eff = _effectiveness(etype, tgt["types"])
                 eff_memo[k] = eff
+            if _scrappy and eff == 0.0 and etype in {"normal", "fighting"} and "ghost" in tgt["types"]:
+                eff = 1.0
+            if _tinted and 0 < eff < 1.0:
+                eff *= 2.0
             if eff > 0:
                 stat = a_atk if cat == "physical" else a_sp_atk
-                stab = 1.5 if etype in a_types else 1.0
-                acc  = (m["accuracy"] or 100) / 100.0
-                base = stat * m["power"] * ab_mult * acc * stab
+                stab = _stab_mult(a_abs) if (_protean or etype in a_types) else 1.0
+                raw_acc = m["accuracy"] or 0
+                acc     = 1.0 if _no_guard else (min(raw_acc * _acc_m, 100) if raw_acc else 100) / 100.0
+                pwr     = m.get("power_max", m["power"]) if _skill_lk else m["power"]
+                dl_mult = dl_phys_mult if cat == "physical" else dl_spec_mult
+                charge  = _charge_elec if etype == "electric" and a_speed < tgt["speed"] else 1.0
+                base    = stat * pwr * ab_mult * analytic_mult * dl_mult * charge * acc * stab
+                if eff > 1.0:
+                    base *= _off_se
                 avg_def = tgt["def"] if cat == "physical" else tgt["sp_def"]
                 pohko = min(base * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
                 if pohko > pohko_a:
@@ -1074,7 +1533,7 @@ def _compute_battle_score(
         for m in tgt.get("moves", []):
             mtype = m["type"]
             cat   = m["category"]
-            dmg_mult = _def_mult(a_abs, mtype, cat)
+            dmg_mult = _def_mult(a_abs, mtype, cat, m.get("name", ""))
             if dmg_mult == 0.0:
                 continue
             k = (mtype, tuple(a_types))
@@ -1083,6 +1542,11 @@ def _compute_battle_score(
                 eff = _effectiveness(mtype, a_types)
                 eff_memo[k] = eff
             if eff > 0:
+                if _wonder_guard and eff <= 1.0:
+                    continue  # Wonder Guard: only SE moves deal damage
+                if eff > 1.0:
+                    for _ab in a_abs:
+                        dmg_mult *= ABILITY_EFFECTS.get(_ab, {}).get("filter_se", 1.0)
                 stat = tgt["atk"] if cat == "physical" else tgt["sp_atk"]
                 stab = 1.5 if mtype in tgt["types"] else 1.0
                 acc  = (m["accuracy"] or 100) / 100.0
@@ -1092,7 +1556,7 @@ def _compute_battle_score(
                 if pohko > pohko_b:
                     pohko_b = pohko
 
-        a_final, b_final = _simulate_battle(pohko_a, pohko_b, a_speed, tgt["speed"])
+        a_final, b_final = _simulate_battle(pohko_a, pohko_b, 0 if _always_last else a_speed, tgt["speed"])
         total += (a_final - b_final + 1.0) / 2.0
 
         if b_final < _EPS:          # A wins (B KO'd)
@@ -1467,18 +1931,24 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
 
     def _to_move_dict(m: dict) -> dict:
         """Stored move entry; power adjusted for recharge/two-turn and multi-hit."""
-        pwr = float(m["power"] or 0)
+        raw = m["power"] or 0
+        pwr = float(raw)
         if m.get("recharge") or m.get("two_turn"):
             pwr /= 2.0
         min_h, max_h = m.get("min_hits") or 0, m.get("max_hits") or 0
         if min_h and max_h:
+            pwr_max = float(raw) * max_h   # Skill Link: always max hits
             pwr *= (min_h + max_h) / 2.0
+        else:
+            pwr_max = pwr
         return {
-            "name":     m["name"],
-            "type":     m["type"],
-            "power":    pwr,
-            "accuracy": m["accuracy"],
-            "category": m["category"],
+            "name":       m["name"],
+            "type":       m["type"],
+            "power":      pwr,
+            "power_max":  pwr_max,
+            "base_power": raw,
+            "accuracy":   m["accuracy"],
+            "category":   m["category"],
         }
 
     db: dict[str, dict] = {}
@@ -1486,16 +1956,24 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
         atk    = pd["stats"].get("attack", 0)
         sp_atk = pd["stats"].get("special-attack", 0)
         speed  = pd["stats"].get("speed", 0)
-        ability_used    = _pick_ability(pd.get("abilities", []))
-        passive_raw     = passive_map.get(form) or passive_map.get(pd.get("species", form))
-        passive_ability = passive_raw if passive_raw and passive_raw in ABILITY_EFFECTS else None
+        ability_used         = _pick_ability(pd.get("abilities", []))
+        ability_acknowledged = _pick_known_ability(pd.get("abilities", []))
+        passive_raw          = passive_map.get(form) or passive_map.get(pd.get("species", form))
+        passive_ability      = passive_raw if passive_raw and passive_raw in ABILITY_EFFECTS else None
+        passive_acknowledged = (passive_raw if passive_raw and passive_raw in KNOWN_ABILITIES
+                                and passive_raw not in ABILITY_EFFECTS else None)
         abilities = [ab for ab in (ability_used, passive_ability) if ab]
+        has_no_recoil = any(ABILITY_EFFECTS.get(ab, {}).get("no_recoil") for ab in abilities)
 
         all_eligible = [
             move_cache[mn] for mn in pd["move_names"]
             if move_cache.get(mn) and _is_eligible(move_cache[mn])
         ]
-        clean_eligible = [m for m in all_eligible if not _is_adverse(m)]
+        clean_eligible = [
+            m for m in all_eligible
+            if not ((m.get("drain") or 0) < 0 and not has_no_recoil)
+            and not m.get("self_reducing", False)
+        ]
 
         coverage_all,   selected_all   = _compute_score(pd["types"], atk, sp_atk, all_eligible,   targets_build, eff_memo, abilities)
         coverage_clean, selected_clean = _compute_score(pd["types"], atk, sp_atk, clean_eligible, targets_build, eff_memo, abilities)
@@ -1511,8 +1989,10 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             "types":         pd["types"],
             "legendary":     _is_legendary(pd.get("species", form), form, legendary_set),
             "paradox":       form in _PARADOX_POKEMON,
-            "ability_used":  ability_used,
-            "passive_ability": passive_ability,
+            "ability_used":          ability_used,
+            "ability_acknowledged":  ability_acknowledged,
+            "passive_ability":       passive_ability,
+            "passive_acknowledged":  passive_acknowledged,
             "moves":         [_to_move_dict(m) for m in selected_all],
             "moves_clean":   [_to_move_dict(m) for m in selected_clean],
         }

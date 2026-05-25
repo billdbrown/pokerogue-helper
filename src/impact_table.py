@@ -7,9 +7,9 @@ import statistics
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QLabel, QWidget, QCheckBox, QSlider,
-    QTabWidget, QComboBox, QFrame,
+    QTabWidget, QComboBox, QFrame, QCompleter, QPushButton,
 )
-from PyQt6.QtCore import Qt, QUrl, pyqtSlot, QMetaObject, Q_ARG
+from PyQt6.QtCore import Qt, QUrl, pyqtSlot, QMetaObject, Q_ARG, QStringListModel
 from PyQt6.QtGui import QColor, QDesktopServices
 
 import impact_db
@@ -149,57 +149,636 @@ _FEASIBILITY_COLORS = {
     "—":       "#6c7086",
 }
 
-# Abilities modeled in the battle sim.
-# Key = PokéAPI slug.  "sim_desc" explains exactly what is implemented.
+# All abilities explicitly categorized. status: "modeled" | "deferred" | "ignored".
 _ABILITY_SIM_INFO: dict[str, dict] = {
-    # ── Offensive ──────────────────────────────────────────────────────────────
-    "transistor": {
-        "sim_desc": "Electric moves deal ×1.5 damage (applied to base power in scoring).",
-    },
-    "dragons-maw": {
-        "sim_desc": "Dragon moves deal ×1.5 damage.",
-    },
-    "rocky-payload": {
-        "sim_desc": "Rock moves deal ×1.5 damage.",
-    },
-    "water-bubble": {
-        "sim_desc": "Water moves deal ×2.0 damage (off); incoming Fire moves deal ×0.5 damage (def).",
-    },
-    "aerilate": {
-        "sim_desc": "Normal moves treated as Flying-type with ×1.3 power; STAB re-evaluated on Flying.",
-    },
-    "pixilate": {
-        "sim_desc": "Normal moves treated as Fairy-type with ×1.3 power; STAB re-evaluated on Fairy.",
-    },
-    "refrigerate": {
-        "sim_desc": "Normal moves treated as Ice-type with ×1.3 power; STAB re-evaluated on Ice.",
-    },
-    # ── Defensive ──────────────────────────────────────────────────────────────
-    "thick-fat": {
-        "sim_desc": "Incoming Fire and Ice moves deal ×0.5 damage.",
-    },
-    "fur-coat": {
-        "sim_desc": "Incoming physical moves deal ×0.5 damage.",
-    },
-    "ice-scales": {
-        "sim_desc": "Incoming special moves deal ×0.5 damage.",
-    },
-    "heatproof": {
-        "sim_desc": "Incoming Fire moves deal ×0.5 damage.",
-    },
-    "multiscale": {
-        "sim_desc": "All incoming moves deal ×0.5 damage (assumes full HP).",
-    },
-    "shadow-shield": {
-        "sim_desc": "All incoming moves deal ×0.5 damage (assumes full HP).",
-    },
-    "purifying-salt": {
-        "sim_desc": "Incoming Ghost moves deal ×0.5 damage.",
-    },
-    # ── Immunity ───────────────────────────────────────────────────────────────
-    "well-baked-body": {
-        "sim_desc": "Immune to Fire-type moves (eff = 0 in bulk/battle scoring).",
-    },
+    # ── Modeled: Offensive ────────────────────────────────────────────────────
+    "transistor":    {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Electric moves deal ×1.5 damage."},
+    "dragons-maw":   {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Dragon moves deal ×1.5 damage."},
+    "rocky-payload": {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Rock moves deal ×1.5 damage."},
+    "water-bubble":  {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Water moves ×2.0 (off); incoming Fire ×0.5 (def)."},
+    "sheer-force":   {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "All moves ×1.3 (approx — only moves with secondary effects qualify; slight overestimate)."},
+    "hustle":        {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Physical moves ×1.2 (net of ×1.5 Atk and ×0.8 accuracy; SpA unaffected)."},
+    "huge-power":    {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Physical moves deal ×2.0 damage (effective Attack stat doubled)."},
+    "pure-power":    {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Physical moves deal ×2.0 damage (effective Attack stat doubled)."},
+    "technician":    {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Moves with base power ≤60 deal ×1.5 damage (checks original power, before multi-hit/charge adjustments)."},
+    "iron-fist":     {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Punching moves deal ×1.2 damage (18 moves: Fire/Ice/Thunder Punch, Bullet/Mach/Drain Punch, etc.)."},
+    "adaptability":  {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "STAB multiplier raised from ×1.5 to ×2.0."},
+    "rock-head":     {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Recoil moves included in clean-mode scoring (no HP lost from recoil in sim)."},
+    "magic-guard":   {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Recoil moves included in clean-mode scoring (no recoil damage taken)."},
+    "truant":         {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "All moves ×0.5 (skip every other turn = half effective output)."},
+    "slow-start":     {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Physical moves ×0.5 (Atk halved for first 5 turns; Speed penalty not captured)."},
+    "defeatist":      {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "All moves ×0.75 (Atk and SpAtk halved below 50% HP; expected value under uniform HP distribution)."},
+    "fairy-aura":     {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Fairy moves deal ×1.33 damage (×4/3 boost applies to user's own moves)."},
+    "dark-aura":      {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Dark moves deal ×1.33 damage (×4/3 boost applies to user's own moves)."},
+    "parental-bond":  {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "All moves deal ×1.25 damage (second hit at ¼ power: 1.0 + 0.25 = ×1.25 total)."},
+    "steelworker":    {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Steel moves deal ×1.5 damage."},
+    "neuroforce":       {"status": "modeled", "category": "Offensive",
+                         "sim_desc": "Super-effective moves deal an extra ×1.25 damage."},
+    "beads-of-ruin":    {"status": "modeled", "category": "Offensive",
+                         "sim_desc": "All opponents' SpDef −25% (Chi-Yu); modeled as special moves ×1.33 (÷0.75 defense)."},
+    "sword-of-ruin":    {"status": "modeled", "category": "Offensive",
+                         "sim_desc": "All opponents' Def −25% (Chien-Pao); modeled as physical moves ×1.33 (÷0.75 defense)."},
+    "electromorphosis": {"status": "modeled", "category": "Offensive",
+                         "sim_desc": "Electric moves deal ×2 when moving second (Pawmot); speed-checked per matchup."},
+    "minds-eye":        {"status": "modeled", "category": "Offensive",
+                         "sim_desc": "Normal and Fighting moves hit Ghost types at ×1 (neutral) — identical to Scrappy."},
+    "stall":          {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Always goes last in battle sim (speed treated as 0 for turn-order purposes)."},
+    "victory-star":   {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Accuracy of sub-100% moves multiplied by ×1.1."},
+    "intrepid-sword": {"status": "modeled", "category": "Offensive",
+                       "sim_desc": "Physical moves deal ×1.5 damage (Atk +1 on entry)."},
+    "normalize":      {"status": "modeled", "category": "Type Remap",
+                       "sim_desc": "All moves become Normal-type with ×1.2 power boost; STAB re-evaluated on Normal."},
+    "download":      {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Atk or SpA +1 (×1.5) per matchup: Atk if target's Def < SpDef, SpA otherwise."},
+    "libero":        {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Every move gets STAB — identical to Protean."},
+    "strong-jaw":    {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Biting moves deal ×1.5 damage (Bite, Crunch, Fire/Ice/Thunder/Poison Fang, Bug Bite, Fishious Rend, Hyper Fang, Jaw Lock, Psychic Fangs)."},
+    "sharpness":     {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Slicing moves deal ×1.5 damage (Leaf Blade, Night Slash, Razor Shell, Sacred Sword, Air Slash, etc.)."},
+    "mega-launcher": {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Aura and pulse moves deal ×1.5 damage (Aura Sphere, Dark Pulse, Dragon Pulse, Origin Pulse, Water Pulse, etc.)."},
+    "punk-rock":     {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Sound moves deal ×1.3 damage (off); incoming sound moves deal ×0.5 damage (def)."},
+    "reckless":      {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Recoil moves deal ×1.2 damage (Brave Bird, Double-Edge, Flare Blitz, Head Smash, Take Down, Volt Tackle, Wild Charge, Wood Hammer, etc.)."},
+    "compound-eyes": {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Accuracy of moves with sub-100% accuracy multiplied by ×1.3 (capped at 100%)."},
+    "scrappy":       {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Normal and Fighting moves hit Ghost types at ×1 (neutral) instead of immune."},
+    "tinted-lens":   {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Not-very-effective moves deal ×2 damage in battle sim (0.5× → 1×, 0.25× → 0.5×)."},
+    "no-guard":      {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "All moves hit (accuracy = 100%). Defensive side (opponent also never misses) not yet modeled."},
+    "analytic":      {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Moves deal ×1.3 damage when this Pokémon is slower than the target (per-matchup check)."},
+    "protean":       {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Every move gets STAB — type changes to match the move before attacking."},
+    "skill-link":    {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Multi-hit moves always hit maximum times (e.g. Rock Blast: 5× instead of avg 3.5×)."},
+    "tough-claws":   {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Physical moves deal ×1.3 damage (approx — non-contact physical moves like Earthquake included; slight overestimate)."},
+    "magic-guard":   {"status": "modeled", "category": "Offensive",
+                      "sim_desc": "Recoil moves included in clean-mode scoring (no recoil damage taken)."},
+    "bulletproof":   {"status": "modeled", "category": "Immunity",
+                      "sim_desc": "Immune to ball and bomb moves (Shadow Ball, Focus Blast, Aura Sphere, Energy Ball, etc.)."},
+    "storm-drain":   {"status": "modeled", "category": "Immunity",
+                      "sim_desc": "Immune to Water-type moves (SpA boost on activation not modeled)."},
+    "motor-drive":   {"status": "modeled", "category": "Immunity",
+                      "sim_desc": "Immune to Electric-type moves (Speed boost not modeled)."},
+    "earth-eater":   {"status": "modeled", "category": "Immunity",
+                      "sim_desc": "Immune to Ground-type moves (HP recovery not modeled)."},
+    "wind-rider":    {"status": "modeled", "category": "Immunity",
+                      "sim_desc": "Immune to wind-based moves (Gust, Hurricane, Icy Wind, Bleakwind Storm, etc.)."},
+    # ── Modeled: Type Remap ──────────────────────────────────────────────────
+    "aerilate":      {"status": "modeled", "category": "Type Remap",
+                      "sim_desc": "Normal moves → Flying-type ×1.3 power; STAB re-evaluated."},
+    "pixilate":      {"status": "modeled", "category": "Type Remap",
+                      "sim_desc": "Normal moves → Fairy-type ×1.3 power; STAB re-evaluated."},
+    "refrigerate":   {"status": "modeled", "category": "Type Remap",
+                      "sim_desc": "Normal moves → Ice-type ×1.3 power; STAB re-evaluated."},
+    "galvanize":     {"status": "modeled", "category": "Type Remap",
+                      "sim_desc": "Normal moves → Electric-type ×1.2 power; STAB re-evaluated."},
+    "liquid-voice":  {"status": "modeled", "category": "Type Remap",
+                      "sim_desc": "Sound-based moves become Water-type; Water STAB applies if Pokémon is Water-type."},
+    # ── Modeled: Defensive ───────────────────────────────────────────────────
+    "thick-fat":      {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming Fire and Ice moves ×0.5."},
+    "fur-coat":       {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming physical moves ×0.5."},
+    "ice-scales":     {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming special moves ×0.5."},
+    "heatproof":      {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming Fire moves ×0.5."},
+    "multiscale":     {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "All incoming moves ×0.5 (assumes full HP)."},
+    "shadow-shield":  {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "All incoming moves ×0.5 (assumes full HP)."},
+    "purifying-salt": {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming Ghost moves ×0.5."},
+    "intimidate":     {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming physical moves ×0.667 (−1 Atk stage on switch-in)."},
+    "dauntless-shield": {"status": "modeled", "category": "Defensive",
+                         "sim_desc": "Incoming physical moves ×0.667 (Def +1 stage on entry = ×1.5 effective defense)."},
+    "fluffy":         {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming physical moves ×0.5; incoming Fire moves ×2.0 (fire+physical naturally cancels to ×1.0; approx: non-contact physical also halved)."},
+    "vessel-of-ruin": {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "All opponents' SpAtk −25% (Wo-Chien); modeled as incoming special moves ×0.75."},
+    "tablets-of-ruin":{"status": "modeled", "category": "Defensive",
+                       "sim_desc": "All opponents' Atk −25% (Ting-Lu); modeled as incoming physical moves ×0.75."},
+    "wonder-guard":   {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Only super-effective moves deal damage (Shedinja); non-SE moves deal 0 in battle and bulk scoring."},
+    "filter":         {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming super-effective moves deal ×0.75 damage."},
+    "solid-rock":     {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming super-effective moves deal ×0.75 damage."},
+    "prism-armor":    {"status": "modeled", "category": "Defensive",
+                       "sim_desc": "Incoming super-effective moves deal ×0.75 damage."},
+    "dry-skin":       {"status": "modeled", "category": "Immunity",
+                       "sim_desc": "Immune to Water moves; incoming Fire moves deal ×1.25 damage."},
+    # ── Modeled: Immunity ────────────────────────────────────────────────────
+    "well-baked-body": {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Fire-type moves."},
+    "levitate":        {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Ground-type moves."},
+    "lightning-rod":   {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Electric-type moves (SpA boost not modeled)."},
+    "water-absorb":    {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Water-type moves (HP recovery not modeled)."},
+    "volt-absorb":     {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Electric-type moves (HP recovery not modeled)."},
+    "flash-fire":      {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Fire-type moves (Fire-boost on activation not modeled)."},
+    "sap-sipper":      {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to Grass-type moves (Atk boost on activation not modeled)."},
+    "soundproof":      {"status": "modeled", "category": "Immunity",
+                        "sim_desc": "Immune to sound-based moves (Boomburst, Hyper Voice, Bug Buzz, Clanging Scales, etc.)."},
+    # ── Deferred: HP-conditional ─────────────────────────────────────────────
+    "overgrow": {"status": "deferred", "category": "HP Conditional",
+                 "sim_desc": "Grass moves ×1.5 when HP < 1/3 — no HP tracking in sim."},
+    "blaze":    {"status": "deferred", "category": "HP Conditional",
+                 "sim_desc": "Fire moves ×1.5 when HP < 1/3 — no HP tracking in sim."},
+    "torrent":  {"status": "deferred", "category": "HP Conditional",
+                 "sim_desc": "Water moves ×1.5 when HP < 1/3 — no HP tracking in sim."},
+    "swarm":    {"status": "deferred", "category": "HP Conditional",
+                 "sim_desc": "Bug moves ×1.5 when HP < 1/3 — no HP tracking in sim."},
+    # ── Deferred: Sim architecture ───────────────────────────────────────────
+    "sturdy": {"status": "deferred", "category": "Defensive",
+               "sim_desc": "Survives any OHKO at full HP — requires multi-hit sim rework."},
+    # ── Deferred: Scaling ────────────────────────────────────────────────────
+    "supreme-overlord": {"status": "deferred", "category": "Scaling",
+                         "sim_desc": "Atk/SpAtk +10% per fainted ally (up to +50%) — 1v1 sim never fires."},
+    "moxie":       {"status": "deferred", "category": "Scaling",
+                    "sim_desc": "Atk +1 after each KO — 1v1 sim never fires this; multi-battle value not captured."},
+    "innards-out": {"status": "deferred", "category": "Scaling",
+                    "sim_desc": "Deals remaining HP as damage when KO'd — requires KO tracking."},
+    # ── Deferred: Weather ────────────────────────────────────────────────────
+    "swift-swim":  {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Speed ×2 in rain — no weather mechanic."},
+    "chlorophyll": {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Speed ×2 in sun — no weather mechanic."},
+    "sand-veil":   {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Evasion +20% in sandstorm — no weather mechanic."},
+    "sand-force":  {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Rock/Ground/Steel moves ×1.3 in sandstorm — no weather mechanic."},
+    "snow-cloak":  {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Evasion +20% in hail/snow — no weather mechanic."},
+    "rain-dish":   {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Restores HP in rain — no weather mechanic."},
+    # ── Deferred: Status ─────────────────────────────────────────────────────
+    "static":    {"status": "deferred", "category": "Status",
+                  "sim_desc": "30% paralysis on contact — no status mechanic."},
+    "own-tempo": {"status": "deferred", "category": "Status",
+                  "sim_desc": "Prevents confusion — no status mechanic."},
+    # ── Deferred: Flinching ──────────────────────────────────────────────────
+    "inner-focus": {"status": "deferred", "category": "Flinching",
+                    "sim_desc": "Prevents flinching — no flinch mechanic."},
+    # ── Deferred: Critical Hits ──────────────────────────────────────────────
+    "shell-armor": {"status": "deferred", "category": "Critical Hit",
+                    "sim_desc": "Prevents critical hits — no crit mechanic."},
+    "sniper":      {"status": "deferred", "category": "Critical Hit",
+                    "sim_desc": "Boosts critical hit damage ×1.5 — no crit mechanic."},
+    # ── Ignored: No battle-math effect ───────────────────────────────────────
+    "keen-eye":    {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Prevents accuracy reduction — no accuracy-lowering moves in pool."},
+    "frisk":       {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Reveals held item — items not modeled."},
+    "pressure":    {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Doubles PP usage — PP not tracked in sim."},
+    "run-away":    {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Allows fleeing wild Pokémon — irrelevant to scoring."},
+    "gluttony":    {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Uses berries at higher HP — items not modeled."},
+    "pickup":      {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Picks up used items — items not modeled."},
+    "unnerve":     {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Prevents opponent eating berries — items not modeled."},
+    "telepathy":   {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Prevents ally move damage — doubles mechanic, irrelevant in 1v1."},
+    "mold-breaker":{"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Ignores target abilities — too complex; would suppress modeled defensive abilities."},
+    "regenerator": {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Restores 1/3 HP on switch-out — no switch mechanic in sim."},
+    "infiltrator": {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Bypasses substitutes and screens — not modeled."},
+    "weak-armor":  {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Speed +2 / Def −1 when hit physically — volatile mid-battle stat change."},
+    "rattled":     {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Speed +1 when hit by Bug/Ghost/Dark — speed boosts not tracked in sim."},
+    "damp":        {"status": "ignored", "category": "No Effect",
+                    "sim_desc": "Prevents Explosion/Self-Destruct — those moves are already excluded from the pool."},
+    "prankster":      {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Gives priority to status moves — status moves not scored."},
+    "clear-body":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents stat reduction — no stat modifier tracking."},
+    "natural-cure":   {"status": "deferred", "category": "Status",
+                       "sim_desc": "Cures status on switch-out — no switch mechanic."},
+    "synchronize":    {"status": "deferred", "category": "Status",
+                       "sim_desc": "Mirrors status condition to opponent — no status mechanic."},
+    "rivalry":        {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Atk/SpA ±25% based on gender match — no gender tracking."},
+    "anticipation":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Alerts to super-effective or OHKO moves — no battle math effect."},
+    "unburden":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Doubles Speed when item is consumed — items not modeled."},
+    "early-bird":     {"status": "deferred", "category": "Status",
+                       "sim_desc": "Halves sleep duration — no status mechanic."},
+    "vital-spirit":   {"status": "deferred", "category": "Status",
+                       "sim_desc": "Prevents sleep — no status mechanic."},
+    "steadfast":      {"status": "deferred", "category": "Flinching",
+                       "sim_desc": "Speed +1 on flinch — no flinch mechanic."},
+    "pickpocket":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Steals held item on contact — items not modeled."},
+    "defiant":        {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Atk +2 when stats lowered — no stat modifier tracking."},
+    "serene-grace":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Doubles secondary effect chance — secondary effects not scored."},
+    "cute-charm":     {"status": "deferred", "category": "Status",
+                       "sim_desc": "30% infatuation on contact — no status mechanic."},
+    "unaware":        {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Ignores target's stat boosts — no stat modifier tracking."},
+    "cursed-body":    {"status": "deferred", "category": "Status",
+                       "sim_desc": "30% chance to disable attacker's move — no status mechanic."},
+    "big-pecks":      {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents Defense reduction — no stat modifier tracking."},
+    "competitive":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "SpA +2 when stats lowered — no stat modifier tracking."},
+    "speed-boost":    {"status": "deferred", "category": "Scaling",
+                       "sim_desc": "Speed +1 each turn — scaling, not captured in 1v1 sim."},
+    "limber":         {"status": "deferred", "category": "Status",
+                       "sim_desc": "Prevents paralysis — no status mechanic."},
+    "shields-down":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Minior form-change mechanic — not modeled."},
+    "water-veil":     {"status": "deferred", "category": "Status",
+                       "sim_desc": "Prevents burn — no status mechanic."},
+    "beast-boost":    {"status": "deferred", "category": "Scaling",
+                       "sim_desc": "Highest stat +1 after KO — 1v1 sim never fires this; multi-battle value not captured."},
+    "moody":          {"status": "deferred", "category": "Scaling",
+                       "sim_desc": "Random stat ×2/−1 each turn — scaling, not captured in 1v1 sim."},
+    "effect-spore":   {"status": "deferred", "category": "Status",
+                       "sim_desc": "30% chance to inflict sleep/paralysis/poison on contact."},
+    "quick-feet":     {"status": "deferred", "category": "Status",
+                       "sim_desc": "Speed ×1.5 when statused — no status mechanic."},
+    "poison-touch":   {"status": "deferred", "category": "Status",
+                       "sim_desc": "30% chance to poison on contact — no status mechanic."},
+    "tangled-feet":   {"status": "deferred", "category": "Status",
+                       "sim_desc": "Evasion ×2 when confused — no status mechanic."},
+    "stench":         {"status": "deferred", "category": "Flinching",
+                       "sim_desc": "10% flinch chance on contact — no flinch mechanic."},
+    "anger-point":    {"status": "deferred", "category": "Critical Hit",
+                       "sim_desc": "Atk maxes out when hit by a crit — no crit mechanic."},
+    "battle-armor":   {"status": "deferred", "category": "Critical Hit",
+                       "sim_desc": "Prevents critical hits — no crit mechanic."},
+    "super-luck":     {"status": "deferred", "category": "Critical Hit",
+                       "sim_desc": "Raises critical hit rate — no crit mechanic."},
+    "solar-power":    {"status": "deferred", "category": "Weather",
+                       "sim_desc": "SpA ×1.5 in harsh sun — no weather mechanic."},
+    "sand-rush":      {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Speed ×2 in sandstorm — no weather mechanic."},
+    "snow-warning":   {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Summons hail/snow on entry — no weather mechanic."},
+    "protosynthesis": {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Boosts highest stat in harsh sun — no weather mechanic."},
+    "quark-drive":    {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Boosts highest stat on Electric Terrain — no terrain mechanic."},
+    "shield-dust":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents secondary effect damage — secondary effects not scored."},
+    "hyper-cutter":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents Attack reduction — no stat modifier tracking."},
+    "klutz":          {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Can't use held items — items not modeled."},
+    "healer":         {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "30% chance to cure ally's status — team fights only."},
+    "aftermath":      {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Damages attacker when KO'd by contact — complex mechanic."},
+    "contrary":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Reverses stat changes — no stat tracking; too complex."},
+    "magic-bounce":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Reflects status moves — status moves not scored."},
+    "sweet-veil":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents ally sleep — team fights only."},
+    "plus":           {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "SpA ×1.5 with Minus partner — doubles mechanic."},
+    "sticky-hold":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Can't lose held item — items not modeled."},
+    "friend-guard":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Reduces damage to allies — team fights only."},
+    "heavy-metal":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Doubles weight — weight-based moves not relevant."},
+    "justified":      {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Atk +1 when hit by Dark — no stat modifier tracking."},
+    "magnet-pull":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Traps Steel-type Pokémon — no trapping mechanic."},
+    "harvest":        {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "May restore consumed berry — items not modeled."},
+    "stakeout":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "×2 damage vs switched-in target — no switch mechanic."},
+    "illuminate":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "No battle math effect in Gen 8+."},
+    "minus":          {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "SpA ×1.5 with Plus partner — doubles mechanic."},
+    "aroma-veil":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Protects from mental-targeting moves — team fights only."},
+    "turboblaze":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Ignores target abilities for Fire moves — too complex; would suppress modeled defensive abilities."},
+    "teravolt":         {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Ignores target abilities for Electric moves — too complex."},
+    "aura-break":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Reverses Fairy/Dark Aura — per-matchup ability interaction."},
+    "water-compaction": {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Def +2 when hit by Water — stat modifier."},
+    "merciless":        {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Moves are critical against poisoned targets — status + crit."},
+    "soul-heart":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "SpAtk +1 when any Pokémon faints — scaling."},
+    "power-of-alchemy": {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Copies fallen ally's ability — team fights only."},
+    "cotton-down":      {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Lowers attacker's Speed — stat modifier."},
+    "propeller-tail":   {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Ignores redirection effects — no redirection mechanic."},
+    "screen-cleaner":   {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Removes screens on entry — no screens mechanic."},
+    "guard-dog":        {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Atk +1 when Intimidated, or ignores Intimidate — stat modifier."},
+    "toxic-debris":     {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Lays Toxic Spikes when hit by physical move — no field mechanic."},
+    "mycelium-might":   {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Status moves go last and bypass abilities — status not scored."},
+    "supersweet-syrup": {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Lowers opponent's evasion on first entry — stat modifier."},
+    "hospitality":      {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Restores ally's HP on entry — team fights only."},
+    "color-change":     {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Changes type to the type of the last move that hit it — too complex."},
+    "perish-body":      {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Sets Perish Song when hit by contact — too complex."},
+    "curious-medicine": {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Resets ally's stat changes — team fights only."},
+    "chilling-neigh":   {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Atk +1 after KO — scaling, 1v1 sim never fires."},
+    "grim-neigh":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "SpAtk +1 after KO — scaling, 1v1 sim never fires."},
+    "as-one":           {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Chilling/Grim Neigh + Unnerve combined — scaling."},
+    "good-as-gold":     {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Immune to status moves — status moves not scored."},
+    "costar":           {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Copies ally's stat boosts — team fights only."},
+    "gorilla-tactics":  {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Atk ×1.5 but locked to one move — penalty not modeled, not implemented."},
+    "triage":           {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Priority on healing moves — healing moves not scored."},
+    "queenly-majesty":  {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Prevents priority moves — priority not tracked in sim."},
+    "dazzling":         {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Prevents priority moves — priority not tracked in sim."},
+    "battery":          {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Raises ally's SpAtk — team fights only."},
+    "receiver":         {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Copies fallen ally's ability — team fights only."},
+    "full-metal-body":  {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Prevents stat reduction — no stat modifier tracking."},
+    "ball-fetch":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Retrieves Poké Ball after failed catch — irrelevant."},
+    "power-spot":       {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Boosts adjacent ally's moves — team fights only."},
+    "steely-spirit":    {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Raises ally's Steel moves — team fights only."},
+    "illusion":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Disguises as last Pokémon in party — no battle math effect."},
+    "stalwart":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Ignores redirection effects — no redirection mechanic."},
+    "steam-engine":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Speed +6 when hit by Fire or Water — stat modifier."},
+    "cud-chew":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Repeats berry effect at end of next turn — items not modeled."},
+    "long-reach":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Contact moves don't make contact — no contact effects modeled."},
+    "gulp-missile":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Cramorant's Surf/Dive triggers a counterattack — niche mechanic."},
+    "neutralizing-gas": {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Suppresses all Pokémon's abilities — would require per-matchup ability nullification."},
+    "commander":      {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Dondozo/Tatsugiri combo — doubles mechanic only."},
+    "liquid-ooze":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Drain moves damage the user instead of healing — niche interaction."},
+    "gale-wings":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Flying moves gain priority at full HP — no priority mechanic."},
+    "stamina":        {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Def +1 when hit — stat modifier."},
+    "berserk":        {"status": "deferred", "category": "HP Conditional",
+                       "sim_desc": "SpA +1 when HP drops below 50% — HP-conditional stat modifier."},
+    "hadron-engine":  {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Boosts highest stat on Electric Terrain — no terrain mechanic."},
+    "forecast":       {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Castform changes type with weather — no weather mechanic."},
+    "drizzle":        {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Summons rain on entry — no weather mechanic."},
+    "sand-spit":      {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Summons sandstorm when hit — no weather mechanic."},
+    "psychic-surge":  {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Sets Psychic Terrain — no terrain mechanic."},
+    "immunity":       {"status": "deferred", "category": "Status",
+                       "sim_desc": "Prevents poison — no status mechanic."},
+    "magma-armor":    {"status": "deferred", "category": "Status",
+                       "sim_desc": "Prevents freezing — no status mechanic."},
+    "marvel-scale":   {"status": "deferred", "category": "Status",
+                       "sim_desc": "Def ×1.5 when statused — no status mechanic."},
+    "arena-trap":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents grounded opponents from fleeing — no switching mechanic."},
+    "poison-heal":    {"status": "deferred", "category": "Status",
+                       "sim_desc": "Restores HP when poisoned — no status mechanic."},
+    "toxic-chain":    {"status": "deferred", "category": "Status",
+                       "sim_desc": "30% chance to badly poison on move use — no status mechanic."},
+    "thermal-exchange": {"status": "ignored", "category": "No Effect",
+                         "sim_desc": "Atk +1 when hit by Fire — stat modifier."},
+    "zen-mode":         {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Darmanitan form change at 50% HP — HP-conditional form change."},
+    "defeatist":        {"status": "modeled", "category": "Offensive",
+                         "sim_desc": "All moves ×0.75 (Atk and SpAtk halved below 50% HP; expected value under uniform HP distribution)."},
+    "mummy":            {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Changes physical attacker's ability to Mummy on contact — per-matchup ability swap."},
+    "lingering-aroma":  {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Changes attacker's ability to Lingering Aroma on contact — per-matchup ability swap."},
+    "seed-sower":       {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Sets Grassy Terrain when hit — no terrain mechanic."},
+    "anger-shell":      {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Atk/SpAtk/Speed +1, Def/SpDef −1 when HP drops below 50% — HP-conditional stat change."},
+    "opportunist":      {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Copies opponent's positive stat boosts — no stat modifier tracking."},
+    "armor-tail":       {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Prevents opponent from using priority moves — no priority mechanic."},
+    "quick-draw":       {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "30% chance to go first regardless of speed — probability mechanic."},
+    "tera-shift":       {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Ogerpon Tera form on entry — Pokémon-specific."},
+    "tera-shell":       {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "At full HP, SE moves deal neutral damage — Terapagos-specific."},
+    "teraform-zero":    {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Removes weather and terrain — too complex."},
+    "poison-puppeteer": {"status": "deferred", "category": "Status",
+                         "sim_desc": "Poisons opponents Pecharunt poisons — no status mechanic."},
+    "multitype":        {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Arceus changes type based on held plate — Pokémon-specific + items."},
+    "flower-gift":      {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Raises Atk and SpDef of allies in harsh sun — weather + team."},
+    "imposter":         {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Transforms into target on entry — would require full per-matchup stat/move copy."},
+    "wimp-out":         {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Switches out when HP drops below 50% — no switching mechanic."},
+    "emergency-exit":   {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Switches out when HP drops below 50% — no switching mechanic."},
+    "rks-system":       {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Silvally changes type based on memory — Pokémon-specific + items."},
+    "stance-change":    {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Aegislash toggles Blade/Shield form on attack vs protect — form-specific."},
+    "schooling":        {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Wishiwashi school/solo form based on HP — HP-conditional form change."},
+    "battle-bond":      {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Greninja transforms after KO — also excluded from scoring pool."},
+    "ice-face":         {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Eiscue blocks one physical hit — requires multi-hit sim change."},
+    "wandering-spirit": {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Swaps ability with physical attacker on contact — per-matchup."},
+    "mirror-armor":     {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Reflects stat drops back at user — no stat modifier tracking."},
+    "hunger-switch":    {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Morpeko form switch each turn — Pokémon-specific."},
+    "zero-to-hero":     {"status": "deferred", "category": "HP Conditional",
+                         "sim_desc": "Palafin transforms into hero form after fainting — Pokémon-specific."},
+    "disguise":       {"status": "deferred", "category": "HP Conditional",
+                       "sim_desc": "Mimikyu blocks one hit — would require multi-hit sim change."},
+    "dancer":         {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Copies dance moves — too complex to model."},
+    "power-construct": {"status": "deferred", "category": "HP Conditional",
+                        "sim_desc": "Zygarde form change at 50% HP — HP-conditional form change."},
+    "trace":          {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Copies target's ability — requires per-matchup ability lookup; too complex."},
+    "light-metal":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Halves weight — weight-based moves not relevant."},
+    "cheek-pouch":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Restores HP when eating berries — items not modeled."},
+    "gooey":          {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Lowers attacker's Speed on contact — stat modifier."},
+    "tangling-hair":  {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Lowers attacker's Speed on contact — stat modifier."},
+    "shadow-tag":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents opponent fleeing — no switching mechanic."},
+    "rough-skin":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Deals 1/8 max HP to attacker on contact — requires per-turn HP tracking."},
+    "iron-barbs":     {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Deals 1/8 max HP to attacker on contact — requires per-turn HP tracking."},
+    "forewarn":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Reveals opponent's strongest move — no battle math effect."},
+    "magician":       {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Steals held item — items not modeled."},
+    "suction-cups":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents forced switching — no switching mechanic."},
+    "white-smoke":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Prevents stat reduction — no stat modifier tracking."},
+    "simple":         {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Doubles all stat changes — no stat modifier tracking."},
+    "honey-gather":   {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "May find Honey after battle — items not modeled."},
+    "wonder-skin":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Halves accuracy of status moves — status moves not scored."},
+    "flower-veil":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Protects ally Grass types from status — team fights only."},
+    "symbiosis":      {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Passes item to ally — team fights / items not modeled."},
+    "ripen":          {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Doubles berry effects — items not modeled."},
+    "unseen-fist":    {"status": "ignored", "category": "No Effect",
+                       "sim_desc": "Contact moves bypass Protect — no protection mechanic."},
+    "grass-pelt":       {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Def raised on Grassy Terrain — no terrain mechanic."},
+    "air-lock":         {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Suppresses all weather effects — no weather mechanic."},
+    "primordial-sea":   {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Summons extremely heavy rain — no weather mechanic."},
+    "desolate-land":    {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Summons extremely harsh sun — no weather mechanic."},
+    "delta-stream":     {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Summons strong winds — no weather mechanic."},
+    "surge-surfer":     {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Speed ×2 on Electric Terrain — no terrain mechanic."},
+    "mimicry":          {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Changes type based on active terrain — no terrain mechanic."},
+    "electric-surge":   {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Sets Electric Terrain on entry — no terrain mechanic."},
+    "misty-surge":    {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Sets Misty Terrain on entry — no terrain mechanic."},
+    "wind-power":     {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Becomes Charged when hit by wind moves — no terrain/field mechanic."},
+    "cloud-nine":     {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Suppresses all weather effects — no weather mechanic."},
+    "slush-rush":     {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Speed ×2 in snow/hail — no weather mechanic."},
+    "sand-stream":    {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Summons sandstorm on entry — no weather mechanic."},
+    "drought":        {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Summons harsh sun on entry — no weather mechanic."},
+    "grassy-surge":   {"status": "deferred", "category": "Weather",
+                       "sim_desc": "Sets Grassy Terrain on entry — no terrain mechanic."},
+    "orichalcum-pulse": {"status": "deferred", "category": "Weather",
+                         "sim_desc": "Summons harsh sun + Atk boost in sun — no weather mechanic."},
+    "corrosion":      {"status": "deferred", "category": "Status",
+                       "sim_desc": "Allows poisoning Steel and Poison types — no status mechanic."},
+    # ── Deferred: Weather ────────────────────────────────────────────────────
+    "overcoat":    {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Immunity to powder moves and weather damage — no weather mechanic."},
+    "hydration":   {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Cures status in rain — no weather mechanic."},
+    "leaf-guard":  {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Prevents status in harsh sun — no weather mechanic."},
+    "ice-body":    {"status": "deferred", "category": "Weather",
+                    "sim_desc": "Restores HP in hail/snow — no weather mechanic."},
+    # ── Deferred: Status ─────────────────────────────────────────────────────
+    "flare-boost":  {"status": "deferred", "category": "Status",
+                     "sim_desc": "SpAtk ×1.5 when burned — no status mechanic."},
+    "bad-dreams":   {"status": "deferred", "category": "Status",
+                     "sim_desc": "Damages sleeping opponents each turn — no status mechanic."},
+    "toxic-boost":  {"status": "deferred", "category": "Status",
+                     "sim_desc": "Atk ×1.5 when poisoned — no status mechanic."},
+    "comatose":     {"status": "deferred", "category": "Status",
+                     "sim_desc": "Permanently in sleep-like state but can still attack — status blocker."},
+    "pastel-veil":  {"status": "deferred", "category": "Status",
+                     "sim_desc": "Prevents poison of self and allies — no status mechanic."},
+    "oblivious":    {"status": "deferred", "category": "Status",
+                     "sim_desc": "Prevents infatuation and Taunt — no status mechanic."},
+    "guts":         {"status": "deferred", "category": "Status",
+                     "sim_desc": "Atk ×1.5 when statused — no status mechanic."},
+    "insomnia":     {"status": "deferred", "category": "Status",
+                     "sim_desc": "Prevents sleep — no status mechanic."},
+    "flame-body":   {"status": "deferred", "category": "Status",
+                     "sim_desc": "30% burn on contact — no status mechanic."},
+    "shed-skin":    {"status": "deferred", "category": "Status",
+                     "sim_desc": "30% chance to cure status each turn — no status mechanic."},
+    "poison-point": {"status": "deferred", "category": "Status",
+                     "sim_desc": "30% poison on contact — no status mechanic."},
 }
 
 
@@ -263,6 +842,12 @@ class ImpactTableDialog(QDialog):
         self._abilities_init_started = False
         self._abilities_debug = False
 
+        # Matchups tab state
+        self._matchup_all_rows: list[dict] = []
+        self._matchup_poke_name: str = ""
+        self._matchup_sort_col: int = 5   # Our POHKO, descending
+        self._matchup_sort_asc: bool = False
+
         self._build_ui()
 
         if impact_db.is_ready():
@@ -298,6 +883,10 @@ class ImpactTableDialog(QDialog):
         abil_w = QWidget()
         self._build_abilities_tab(abil_w)
         self._tabs.addTab(abil_w, "Abilities")
+
+        matchup_w = QWidget()
+        self._build_matchups_tab(matchup_w)
+        self._tabs.addTab(matchup_w, "Matchups")
 
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -504,17 +1093,6 @@ class ImpactTableDialog(QDialog):
         top.addWidget(self._abilities_search, 1)
         top.addSpacing(8)
 
-        self._abilities_feas_cb = QComboBox()
-        self._abilities_feas_cb.addItems(["All feasibility", "Easy", "Medium", "Hard", "Complex"])
-        self._abilities_feas_cb.currentIndexChanged.connect(self._apply_abilities_filter)
-        top.addWidget(self._abilities_feas_cb)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-        sep.setStyleSheet("color: #45475a;")
-        top.addWidget(sep)
-
         self._abilities_debug_cb = QCheckBox("Debug")
         self._abilities_debug_cb.setChecked(False)
         self._abilities_debug_cb.toggled.connect(self._on_abilities_debug_toggled)
@@ -522,11 +1100,11 @@ class ImpactTableDialog(QDialog):
 
         layout.addLayout(top)
 
-        # Cols: 0 Ability | 1 # Pokémon | 2 Feasibility | 3 In Sim | 4 Sim Desc (debug) | 5 Description
+        # Cols: 0 Ability | 1 # Pokémon | 2 Category | 3 In Sim | 4 Sim Desc (debug) | 5 Description
         self._abilities_table = QTableWidget()
         self._abilities_table.setColumnCount(6)
         self._abilities_table.setHorizontalHeaderLabels(
-            ["Ability", "# Pokémon", "Feasibility", "In Sim", "Sim Description", "Description"]
+            ["Ability", "# Pokémon", "Category", "In Sim", "Sim Description", "Description"]
         )
         self._abilities_table.setSortingEnabled(False)
         self._abilities_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -548,7 +1126,7 @@ class ImpactTableDialog(QDialog):
 
         self._abilities_table.setColumnWidth(0, 175)
         self._abilities_table.setColumnWidth(1, 85)
-        self._abilities_table.setColumnWidth(2, 90)
+        self._abilities_table.setColumnWidth(2, 105)
         self._abilities_table.setColumnWidth(3, 58)
         self._abilities_table.setColumnWidth(4, 260)
         self._abilities_table.setColumnHidden(4, True)
@@ -661,8 +1239,10 @@ class ImpactTableDialog(QDialog):
                 "moves":           raw_moves,
                 "outcomes":        data.get("outcomes", {}),
                 "move_usage":      data.get("move_usage", {}),
-                "ability_used":    data.get("ability_used"),
-                "passive_ability": data.get("passive_ability"),
+                "ability_used":          data.get("ability_used"),
+                "ability_acknowledged":  data.get("ability_acknowledged"),
+                "passive_ability":       data.get("passive_ability"),
+                "passive_acknowledged":  data.get("passive_acknowledged"),
             })
 
         nonleg    = [r for r in self._all_rows if not r["legendary"] and not r["paradox"]]
@@ -744,18 +1324,27 @@ class ImpactTableDialog(QDialog):
 
             prefix = "★ " if row["legendary"] else ""
             name_color = "#cba6f7" if row["legendary"] else "#89b4fa"
-            ability_used    = row.get("ability_used")
-            passive_ability = row.get("passive_ability")
-            ab_parts = []
+            ability_used         = row.get("ability_used")
+            ability_acknowledged = row.get("ability_acknowledged")
+            passive_ability      = row.get("passive_ability")
+            passive_acknowledged = row.get("passive_acknowledged")
+            # (text, color) — modeled abilities in normal color, known-but-unmodeled dimmed
+            ab_parts: list[tuple[str, str]] = []
             if ability_used:
-                ab_parts.append(ability_used.replace("-", " ").title())
+                ab_parts.append((ability_used.replace("-", " ").title(), "#a6adc8"))
             if passive_ability and passive_ability != ability_used:
-                ab_parts.append(passive_ability.replace("-", " ").title() + " (p)")
+                ab_parts.append((passive_ability.replace("-", " ").title() + " (p)", "#a6adc8"))
+            if ability_acknowledged:
+                ab_parts.append((ability_acknowledged.replace("-", " ").title() + " (—)", "#45475a"))
+            if passive_acknowledged:
+                ab_parts.append((passive_acknowledged.replace("-", " ").title() + " (—p)", "#45475a"))
             if ab_parts:
+                ab_html = " · ".join(
+                    f'<span style="color:{c};">{t}</span>' for t, c in ab_parts
+                )
                 name_html = (
                     f'<span style="color:{name_color};">{prefix}{row["display"]}</span>'
-                    f'<br><span style="color:#6c7086; font-size:10px; font-style:italic;">'
-                    f'{" · ".join(ab_parts)}</span>'
+                    f'<br><span style="font-size:10px; font-style:italic;">{ab_html}</span>'
                 )
             else:
                 name_html = f'<span style="color:{name_color};">{prefix}{row["display"]}</span>'
@@ -1072,23 +1661,23 @@ class ImpactTableDialog(QDialog):
         if not self._abilities_all_rows:
             self._abilities_all_rows = list(ability_info_db.all_entries().values())
 
-        q           = self._abilities_search.text().strip().lower()
-        feas_choice = self._abilities_feas_cb.currentText()
+        q = self._abilities_search.text().strip().lower()
 
         rows = []
         for r in self._abilities_all_rows:
             if q and q not in r["name"] and q not in r["display"].lower() and q not in r["effect"].lower():
                 continue
-            if feas_choice != "All feasibility" and r["feasibility"] != feas_choice:
-                continue
             sim_info = _ABILITY_SIM_INFO.get(r["name"], {})
-            rows.append({**r, "in_sim": "✓" if sim_info else "", "sim_desc": sim_info.get("sim_desc", "")})
+            status   = sim_info.get("status", "")
+            in_sim   = "✓" if status == "modeled" else "X" if status == "ignored" else "—" if status == "deferred" else ""
+            rows.append({**r, "in_sim": in_sim, "category": sim_info.get("category", ""),
+                         "sim_desc": sim_info.get("sim_desc", "")})
 
         _abil_sort_keys = {
-            0: ("display",     True),
-            1: ("total",       False),
-            2: ("feasibility", True),
-            3: ("in_sim",      False),
+            0: ("display",  True),
+            1: ("total",    False),
+            2: ("category", True),
+            3: ("in_sim",   False),
         }
         key_field, _ = _abil_sort_keys.get(self._abilities_sort_col, ("total", False))
         rows.sort(
@@ -1102,6 +1691,20 @@ class ImpactTableDialog(QDialog):
         t = self._abilities_table
         t.setRowCount(0)
         t.setRowCount(len(rows))
+
+        _IN_SIM_COLORS = {"✓": "#a6e3a1", "X": "#f38ba8", "—": "#f9e2af"}
+        _CAT_COLORS = {
+            "Offensive":      "#fab387",
+            "Defensive":      "#a6e3a1",
+            "Immunity":       "#89b4fa",
+            "Type Remap":     "#cba6f7",
+            "Weather":        "#94e2d5",
+            "Status":         "#f9e2af",
+            "Flinching":      "#f9e2af",
+            "Critical Hit":   "#f9e2af",
+            "HP Conditional": "#f9e2af",
+            "No Effect":      "#6c7086",
+        }
 
         for i, row in enumerate(rows):
             name_item = QTableWidgetItem(row["display"])
@@ -1118,23 +1721,16 @@ class ImpactTableDialog(QDialog):
             )
             t.setItem(i, 1, count_item)
 
-            feas = row["feasibility"]
-            feas_item = QTableWidgetItem(feas)
-            feas_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            feas_item.setForeground(QColor(_FEASIBILITY_COLORS.get(feas, "#cdd6f4")))
-            feas_item.setToolTip(
-                "Easy    — always-on passive multiplier or type immunity\n"
-                "Medium  — triggers on a single condition (entry, weather, HP threshold)\n"
-                "Hard    — accumulates over turns or has multi-step trigger\n"
-                "Complex — copies, transforms, or suppresses other abilities/types\n"
-                "(heuristic — may be wrong for edge cases)"
-            )
-            t.setItem(i, 2, feas_item)
+            cat = row.get("category", "")
+            cat_item = QTableWidgetItem(cat)
+            cat_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            cat_item.setForeground(QColor(_CAT_COLORS.get(cat, "#6c7086")))
+            t.setItem(i, 2, cat_item)
 
             in_sim = row.get("in_sim", "")
             sim_item = QTableWidgetItem(in_sim)
             sim_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            sim_item.setForeground(QColor("#a6e3a1" if in_sim else "#45475a"))
+            sim_item.setForeground(QColor(_IN_SIM_COLORS.get(in_sim, "#45475a")))
             t.setItem(i, 3, sim_item)
 
             sim_desc_item = QTableWidgetItem(row.get("sim_desc", ""))
@@ -1154,8 +1750,213 @@ class ImpactTableDialog(QDialog):
             self._abilities_sort_asc = not self._abilities_sort_asc
         else:
             self._abilities_sort_col = col
-            self._abilities_sort_asc = col in {0, 2}  # strings default ascending; In Sim defaults desc
+            self._abilities_sort_asc = col in {0, 2}  # strings default ascending; In Sim (3) defaults desc
         order = (Qt.SortOrder.AscendingOrder if self._abilities_sort_asc
                  else Qt.SortOrder.DescendingOrder)
         self._abilities_table.horizontalHeader().setSortIndicator(col, order)
         self._apply_abilities_filter()
+
+    # ── Matchups tab ──────────────────────────────────────────────────────────
+
+    def _build_matchups_tab(self, container: QWidget):
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+
+        self._matchup_input = QLineEdit()
+        self._matchup_input.setPlaceholderText("Type a Pokémon name and press Enter…")
+        self._matchup_input.returnPressed.connect(self._load_matchup_details)
+        top.addWidget(self._matchup_input, 1)
+
+        load_btn = QPushButton("Load")
+        load_btn.setStyleSheet(
+            "QPushButton { background:#313244; color:#cdd6f4; border:1px solid #45475a;"
+            " border-radius:4px; padding:4px 14px; font-size:12px; }"
+            "QPushButton:hover { background:#45475a; }"
+        )
+        load_btn.clicked.connect(self._load_matchup_details)
+        top.addWidget(load_btn)
+
+        self._matchup_outcome_cb = QComboBox()
+        self._matchup_outcome_cb.addItems(["All outcomes", "ZDW", "DW", "DL", "ZDL"])
+        self._matchup_outcome_cb.currentIndexChanged.connect(self._apply_matchup_filter)
+        top.addWidget(self._matchup_outcome_cb)
+
+        layout.addLayout(top)
+
+        # Cols: Opponent | Types | Move Used | Opponent Move | Outcome | Our POHKO | Their POHKO
+        self._matchups_table = QTableWidget()
+        self._matchups_table.setColumnCount(7)
+        self._matchups_table.setHorizontalHeaderLabels([
+            "Opponent", "Types", "Move Used", "Opponent Move", "Outcome", "Our POHKO", "Their POHKO",
+        ])
+        self._matchups_table.setSortingEnabled(False)
+        self._matchups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._matchups_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._matchups_table.verticalHeader().setVisible(False)
+        self._matchups_table.verticalHeader().setDefaultSectionSize(30)
+        self._matchups_table.setWordWrap(False)
+
+        hdr = self._matchups_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(5, Qt.SortOrder.DescendingOrder)
+        hdr.sectionClicked.connect(self._on_matchups_header_click)
+
+        self._matchups_table.setColumnWidth(0, 200)
+        self._matchups_table.setColumnWidth(1, 110)
+        self._matchups_table.setColumnWidth(2, 185)
+        self._matchups_table.setColumnWidth(4, 62)
+        self._matchups_table.setColumnWidth(5, 90)
+        self._matchups_table.setColumnWidth(6, 90)
+
+        layout.addWidget(self._matchups_table)
+
+        self._matchups_status = QLabel("Type a Pokémon name and press Enter to view its matchups.")
+        self._matchups_status.setStyleSheet("color:#6c7086; font-size:11px;")
+        layout.addWidget(self._matchups_status)
+
+    def _load_matchup_details(self):
+        if not impact_db.is_ready():
+            self._matchups_status.setText("Impact DB not ready yet.")
+            return
+        raw = self._matchup_input.text().strip().lower().replace(" ", "-")
+        if not raw:
+            return
+
+        # Exact match first, then substring
+        db = impact_db.all_entries()
+        if raw in db:
+            name = raw
+        else:
+            matches = sorted(k for k in db if raw in k)
+            if not matches:
+                self._matchups_status.setText(f"No Pokémon found matching '{raw}'.")
+                return
+            name = matches[0]
+            self._matchup_input.setText(name)
+
+        self._matchups_status.setText(f"Computing matchups for {name.replace('-', ' ').title()}…")
+        self._matchup_poke_name = name
+        self._matchup_all_rows = impact_db.matchup_details(name)
+
+        # Wire autocomplete from DB keys if not done yet
+        if not self._matchup_input.completer():
+            completer = QCompleter(sorted(db.keys()))
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            self._matchup_input.setCompleter(completer)
+
+        self._apply_matchup_filter()
+
+    def _apply_matchup_filter(self):
+        if not self._matchup_all_rows:
+            return
+        outcome_filter = self._matchup_outcome_cb.currentText()
+        rows = self._matchup_all_rows
+        if outcome_filter != "All outcomes":
+            rows = [r for r in rows if r["outcome"] == outcome_filter]
+
+        _sort_keys = {
+            0: ("opponent",     True),
+            2: ("move_used",    True),
+            3: ("move_against", True),
+            4: ("outcome",      True),
+            5: ("pohko_a",      False),
+            6: ("pohko_b",      False),
+        }
+        field, _ = _sort_keys.get(self._matchup_sort_col, ("pohko_a", False))
+        rows = sorted(
+            rows,
+            key=lambda r: r[field] if isinstance(r[field], float) else r[field].lower(),
+            reverse=not self._matchup_sort_asc,
+        )
+        self._populate_matchups(rows)
+
+    def _populate_matchups(self, rows: list[dict]):
+        _OUTCOME_COLORS = {
+            "ZDW":  "#a6e3a1",
+            "DW":   "#f9e2af",
+            "DL":   "#fab387",
+            "ZDL":  "#f38ba8",
+            "Draw": "#6c7086",
+        }
+        t = self._matchups_table
+        t.setRowCount(0)
+        t.setRowCount(len(rows))
+
+        for i, row in enumerate(rows):
+            name_item = QTableWidgetItem(row["opponent"].replace("-", " ").title())
+            name_item.setForeground(QColor("#89b4fa"))
+            t.setItem(i, 0, name_item)
+
+            t.setCellWidget(i, 1, _badges(row["opponent_types"]))
+
+            move_item = QTableWidgetItem(row["move_used"].replace("-", " ").title())
+            move_item.setForeground(QColor("#cba6f7"))
+            t.setItem(i, 2, move_item)
+
+            opp_item = QTableWidgetItem(row["move_against"].replace("-", " ").title())
+            opp_item.setForeground(QColor("#f38ba8"))
+            t.setItem(i, 3, opp_item)
+
+            outcome = row["outcome"]
+            out_item = QTableWidgetItem(outcome)
+            out_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            out_item.setForeground(QColor(_OUTCOME_COLORS.get(outcome, "#cdd6f4")))
+            t.setItem(i, 4, out_item)
+
+            pa_item = QTableWidgetItem(f"{row['pohko_a'] * 100:.0f}%")
+            pa_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            pa_item.setForeground(QColor("#a6e3a1"))
+            pa_item.setToolTip(
+                f"Our best move: {row['move_used'].replace('-', ' ').title()}\n"
+                f"P(OHKO) = {row['pohko_a']*100:.1f}%"
+            )
+            t.setItem(i, 5, pa_item)
+
+            pb_item = QTableWidgetItem(f"{row['pohko_b'] * 100:.0f}%")
+            pb_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            pb_item.setForeground(QColor("#f38ba8"))
+            pb_item.setToolTip(
+                f"Opponent's best move: {row['move_against'].replace('-', ' ').title()}\n"
+                f"P(OHKO) = {row['pohko_b']*100:.1f}%"
+            )
+            t.setItem(i, 6, pb_item)
+
+        all_rows = self._matchup_all_rows
+        zdw  = sum(1 for r in all_rows if r["outcome"] == "ZDW")
+        dw   = sum(1 for r in all_rows if r["outcome"] == "DW")
+        dl   = sum(1 for r in all_rows if r["outcome"] == "DL")
+        zdl  = sum(1 for r in all_rows if r["outcome"] == "ZDL")
+        wins = zdw + dw
+        name_display = self._matchup_poke_name.replace("-", " ").title()
+        status = (
+            f"{name_display} — {wins}W / {len(all_rows) - wins}L  "
+            f"({zdw} ZDW  {dw} DW  {dl} DL  {zdl} ZDL)"
+        )
+        if len(rows) != len(all_rows):
+            status += f"  ·  showing {len(rows)} of {len(all_rows)}"
+        self._matchups_status.setText(status)
+
+    def _on_matchups_header_click(self, col: int):
+        if col == 1:  # Types — not sortable
+            return
+        if self._matchup_sort_col == col:
+            self._matchup_sort_asc = not self._matchup_sort_asc
+        else:
+            self._matchup_sort_col = col
+            self._matchup_sort_asc = col in {0, 2, 3, 4}  # strings default ascending
+        order = (Qt.SortOrder.AscendingOrder if self._matchup_sort_asc
+                 else Qt.SortOrder.DescendingOrder)
+        self._matchups_table.horizontalHeader().setSortIndicator(col, order)
+        self._apply_matchup_filter()
