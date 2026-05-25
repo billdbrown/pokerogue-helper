@@ -28,7 +28,7 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 35
+CACHE_VERSION  = 36
 
 # Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
 _EXCLUDED_FORMS: frozenset[str] = frozenset({
@@ -297,6 +297,23 @@ ABILITY_EFFECTS: dict[str, dict] = {
     "filter":          {"filter_se": 0.75},
     "solid-rock":      {"filter_se": 0.75},
     "prism-armor":     {"filter_se": 0.75},
+    # ── Weather setters (both sides feel the weather) ─────────────────────────
+    "drizzle":        {"off": [("water", None, 1.5), ("fire",  None, 0.5)],
+                       "def": [("water", None, 1.5), ("fire",  None, 0.5)]},
+    "primordial-sea": {"off": [("water", None, 1.5), ("fire",  None, 0.0)],
+                       "def": [("water", None, 1.5), ("fire",  None, 0.0)]},
+    "drought":        {"off": [("fire",  None, 1.5), ("water", None, 0.5)],
+                       "def": [("fire",  None, 1.5), ("water", None, 0.5)]},
+    "desolate-land":  {"off": [("fire",  None, 1.5), ("water", None, 0.0)],
+                       "def": [("fire",  None, 1.5), ("water", None, 0.0)]},
+    # ── Terrain setters ────────────────────────────────────────────────────────
+    "grassy-surge":   {"off": [("grass",    None, 1.3)],
+                       "def": [("grass",    None, 1.3), ("ground", None, 0.5)]},
+    "electric-surge": {"off": [("electric", None, 1.3)],
+                       "def": [("electric", None, 1.3)]},
+    "psychic-surge":  {"off": [("psychic",  None, 1.3)],
+                       "def": [("psychic",  None, 1.3)]},
+    "misty-surge":    {"def": [("dragon",   None, 0.5)]},
     # ── Immunity (water redirect) ──────────────────────────────────────────────
     "storm-drain":     {"immune": {"water"}},
 }
@@ -343,10 +360,10 @@ KNOWN_ABILITIES: frozenset[str] = frozenset(ABILITY_EFFECTS) | frozenset({
     "overcoat", "hydration", "leaf-guard", "ice-body",
     "sand-force", "snow-cloak", "rain-dish",
     "solar-power", "sand-rush", "snow-warning", "protosynthesis", "quark-drive",
-    "cloud-nine", "slush-rush", "sand-stream", "drought", "grassy-surge", "orichalcum-pulse",
-    "hadron-engine", "forecast", "drizzle", "sand-spit", "psychic-surge",
-    "grass-pelt", "electric-surge", "misty-surge", "wind-power",
-    "air-lock", "primordial-sea", "desolate-land", "delta-stream",
+    "cloud-nine", "slush-rush", "sand-stream", "orichalcum-pulse",
+    "hadron-engine", "forecast", "sand-spit",
+    "grass-pelt", "wind-power",
+    "air-lock", "delta-stream",
     "surge-surfer", "mimicry",
     # Deferred — needs status mechanic
     "static", "own-tempo",
@@ -1128,7 +1145,8 @@ def matchup_details(name: str) -> list[dict]:
 
         # A's best P(OHKO) vs B
         pohko_a = 0.0
-        best_move_a: str | None = None
+        best_move_a:       str | None = None
+        best_move_a_etype: str | None = None
         for m in a_moves:
             mtype = m["type"]
             cat   = m["category"]
@@ -1156,12 +1174,14 @@ def matchup_details(name: str) -> list[dict]:
                 avg_def = t_def if cat == "physical" else t_sp_def
                 pohko = min(base * eff * _OHKO_K / (t_hp * avg_def), 1.0)
                 if pohko > pohko_a:
-                    pohko_a = pohko
-                    best_move_a = m["name"]
+                    pohko_a    = pohko
+                    best_move_a      = m["name"]
+                    best_move_a_etype = etype
 
         # B's best P(OHKO) vs A
         pohko_b = 0.0
         best_move_b: str | None = None
+        best_move_b_mtype: str | None = None
         for m in t_moves:
             mtype = m["type"]
             cat   = m["category"]
@@ -1186,8 +1206,9 @@ def matchup_details(name: str) -> list[dict]:
                 avg_def = a_def if cat == "physical" else a_sp_def
                 pohko = min(base * dmg_mult * eff * _OHKO_K / (a_hp * avg_def), 1.0)
                 if pohko > pohko_b:
-                    pohko_b = pohko
-                    best_move_b = m["name"]
+                    pohko_b           = pohko
+                    best_move_b       = m["name"]
+                    best_move_b_mtype = mtype
 
         a_final, b_final = _simulate_battle(pohko_a, pohko_b, 0 if _always_last else a_speed, t_speed)
 
@@ -1201,8 +1222,13 @@ def matchup_details(name: str) -> list[dict]:
         results.append({
             "opponent":       tgt_name,
             "opponent_types": t_types,
+            "a_types":        a_types,
+            "a_speed":        a_speed,
+            "b_speed":        t_speed,
             "move_used":      best_move_a or "—",
+            "move_a_type":    best_move_a_etype or "",
             "move_against":   best_move_b or "—",
+            "move_b_type":    best_move_b_mtype or "",
             "outcome":        outcome,
             "pohko_a":        pohko_a,
             "pohko_b":        pohko_b,

@@ -125,6 +125,84 @@ def _bulbapedia_url(name: str, display: str) -> str:
     return f"https://bulbapedia.bulbagarden.net/wiki/{slug}_(Pok%C3%A9mon)"
 
 
+_OUTCOME_RANK: dict[str, int] = {"ZDW": 0, "DW": 1, "DL": 2, "ZDL": 3, "Draw": 4}
+
+
+def _type_tag_html(t: str) -> str:
+    bg, fg = TYPE_COLORS.get(t, ("#888", "#fff"))
+    return (f'<span style="background:{bg}; color:{fg}; border-radius:2px; '
+            f'padding:1px 3px; font-size:10px; font-weight:bold;">{t[:4].upper()}</span>')
+
+
+def _types_html(types: list[str]) -> str:
+    return " ".join(_type_tag_html(t) for t in types)
+
+
+def _poke_html(name: str) -> str:
+    return f'<span style="color:#89b4fa; font-weight:bold;">{name.replace("-", " ").title()}</span>'
+
+
+def _move_html(move_name: str, move_type: str) -> str:
+    tag  = _type_tag_html(move_type) + " " if move_type else ""
+    text = f'<span style="color:#cdd6f4;">{move_name.replace("-", " ").title()}</span>'
+    return tag + text
+
+
+def _matchup_narrative(row: dict, a_slug: str) -> str:
+    """Generate a natural-language HTML description of one matchup row."""
+    a_types = row.get("a_types", [])
+    b_types = row.get("opponent_types", [])
+    move_a  = row.get("move_used",    "—")
+    move_b  = row.get("move_against", "—")
+    mat     = row.get("move_a_type",  "")
+    mbt     = row.get("move_b_type",  "")
+    a_final = row.get("a_final", 0.0)
+    b_final = row.get("b_final", 0.0)
+    pohko_a = row.get("pohko_a", 0.0)
+    pohko_b = row.get("pohko_b", 0.0)
+    a_speed = row.get("a_speed", 0)
+    b_speed = row.get("b_speed", 0)
+    outcome = row.get("outcome", "")
+
+    atags = _types_html(a_types)
+    btags = _types_html(b_types)
+    apoke = _poke_html(a_slug)
+    bpoke = _poke_html(row["opponent"])
+    amove = _move_html(move_a, mat) if move_a != "—" else ""
+    bmove = _move_html(move_b, mbt) if move_b != "—" else ""
+
+    if outcome == "ZDW":
+        ko = "OHKOs" if pohko_a >= 1.0 else "cleanly KOs"
+        if amove:
+            return f"{atags} {apoke} uses {amove} to {ko} {btags} {bpoke}."
+        return f"{atags} {apoke} {ko} {btags} {bpoke}."
+
+    if outcome == "DW":
+        dmg    = round((1 - a_final) * 100)
+        timing = "first" if a_speed < b_speed else "in the process"
+        base   = f"{atags} {apoke}"
+        base  += f" uses {amove} to KO {btags} {bpoke}" if amove else f" KOs {btags} {bpoke}"
+        tail   = f", but takes {dmg}% damage from {bpoke}'s {bmove} {timing}." if bmove \
+                 else f", but takes {dmg}% damage {timing}."
+        return base + tail
+
+    if outcome == "ZDL":
+        ko = "OHKO'd" if pohko_b >= 1.0 else "KO'd without dealing damage"
+        if bmove:
+            return f"{atags} {apoke} is {ko} by {btags} {bpoke}, who uses {bmove}."
+        return f"{atags} {apoke} is {ko} by {btags} {bpoke}."
+
+    if outcome == "DL":
+        dmg  = round((1 - b_final) * 100)
+        base = f"{atags} {apoke} uses {amove} to deal {dmg}% damage to {btags} {bpoke}" if amove \
+               else f"{atags} {apoke} deals {dmg}% damage to {btags} {bpoke}"
+        tail = f", but is KO'd by {bpoke}'s {bmove}." if bmove \
+               else f", but is KO'd by {btags} {bpoke}."
+        return base + tail
+
+    return f"{atags} {apoke} vs {btags} {bpoke}: {outcome}"
+
+
 # col index → (row key, ascending-by-default)
 _SORTABLE = {
     0: ("rank",       True),
@@ -174,9 +252,9 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                       "sim_desc": "Punching moves deal ×1.2 damage (18 moves: Fire/Ice/Thunder Punch, Bullet/Mach/Drain Punch, etc.)."},
     "adaptability":  {"status": "modeled", "category": "Offensive",
                       "sim_desc": "STAB multiplier raised from ×1.5 to ×2.0."},
-    "rock-head":     {"status": "modeled", "category": "Offensive",
+    "rock-head":     {"status": "modeled", "category": "Defensive",
                       "sim_desc": "Recoil moves included in clean-mode scoring (no HP lost from recoil in sim)."},
-    "magic-guard":   {"status": "modeled", "category": "Offensive",
+    "magic-guard":   {"status": "modeled", "category": "Defensive",
                       "sim_desc": "Recoil moves included in clean-mode scoring (no recoil damage taken)."},
     "truant":         {"status": "modeled", "category": "Offensive",
                        "sim_desc": "All moves ×0.5 (skip every other turn = half effective output)."},
@@ -202,7 +280,7 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                          "sim_desc": "Electric moves deal ×2 when moving second (Pawmot); speed-checked per matchup."},
     "minds-eye":        {"status": "modeled", "category": "Offensive",
                          "sim_desc": "Normal and Fighting moves hit Ghost types at ×1 (neutral) — identical to Scrappy."},
-    "stall":          {"status": "modeled", "category": "Offensive",
+    "stall":          {"status": "modeled", "category": "Tactical",
                        "sim_desc": "Always goes last in battle sim (speed treated as 0 for turn-order purposes)."},
     "victory-star":   {"status": "modeled", "category": "Offensive",
                        "sim_desc": "Accuracy of sub-100% moves multiplied by ×1.1."},
@@ -327,6 +405,23 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
     # ── Deferred: Sim architecture ───────────────────────────────────────────
     "sturdy": {"status": "deferred", "category": "Defensive",
                "sim_desc": "Survives any OHKO at full HP — requires multi-hit sim rework."},
+    # ── Modeled: Weather / Terrain setters ───────────────────────────────────
+    "drizzle":        {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Rain: Water ×1.5, Fire ×0.5 for both sides (Pelipper, Politoed, Kyogre)."},
+    "primordial-sea": {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Extreme Rain: Water ×1.5 both sides; Fire moves fail (Primal Kyogre)."},
+    "drought":        {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Sun: Fire ×1.5, Water ×0.5 for both sides (Ninetales, Torkoal, Exeggutor-Alola, Groudon)."},
+    "desolate-land":  {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Extreme Sun: Fire ×1.5 both sides; Water moves fail (Primal Groudon)."},
+    "grassy-surge":   {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Grassy Terrain: Grass ×1.3 both sides; incoming Ground ×0.5 (Rillaboom, Tapu Bulu)."},
+    "electric-surge": {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Electric Terrain: Electric ×1.3 both sides (Tapu Koko, Pincurchin)."},
+    "psychic-surge":  {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Psychic Terrain: Psychic ×1.3 both sides (Tapu Lele)."},
+    "misty-surge":    {"status": "modeled", "category": "Weather",
+                       "sim_desc": "Misty Terrain: Incoming Dragon moves ×0.5 for all grounded Pokémon (Tapu Fini)."},
     # ── Deferred: Scaling ────────────────────────────────────────────────────
     "supreme-overlord": {"status": "deferred", "category": "Scaling",
                          "sim_desc": "Atk/SpAtk +10% per fainted ally (up to +50%) — 1v1 sim never fires."},
@@ -389,7 +484,7 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                     "sim_desc": "Speed +1 when hit by Bug/Ghost/Dark — speed boosts not tracked in sim."},
     "damp":        {"status": "ignored", "category": "No Effect",
                     "sim_desc": "Prevents Explosion/Self-Destruct — those moves are already excluded from the pool."},
-    "prankster":      {"status": "ignored", "category": "No Effect",
+    "prankster":      {"status": "ignored", "category": "Tactical",
                        "sim_desc": "Gives priority to status moves — status moves not scored."},
     "clear-body":     {"status": "ignored", "category": "No Effect",
                        "sim_desc": "Prevents stat reduction — no stat modifier tracking."},
@@ -585,7 +680,7 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                        "sim_desc": "Dondozo/Tatsugiri combo — doubles mechanic only."},
     "liquid-ooze":    {"status": "ignored", "category": "No Effect",
                        "sim_desc": "Drain moves damage the user instead of healing — niche interaction."},
-    "gale-wings":     {"status": "ignored", "category": "No Effect",
+    "gale-wings":     {"status": "ignored", "category": "Tactical",
                        "sim_desc": "Flying moves gain priority at full HP — no priority mechanic."},
     "stamina":        {"status": "ignored", "category": "No Effect",
                        "sim_desc": "Def +1 when hit — stat modifier."},
@@ -619,55 +714,55 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                          "sim_desc": "Darmanitan form change at 50% HP — HP-conditional form change."},
     "defeatist":        {"status": "modeled", "category": "Offensive",
                          "sim_desc": "All moves ×0.75 (Atk and SpAtk halved below 50% HP; expected value under uniform HP distribution)."},
-    "mummy":            {"status": "deferred", "category": "HP Conditional",
+    "mummy":            {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Changes physical attacker's ability to Mummy on contact — per-matchup ability swap."},
-    "lingering-aroma":  {"status": "deferred", "category": "HP Conditional",
+    "lingering-aroma":  {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Changes attacker's ability to Lingering Aroma on contact — per-matchup ability swap."},
     "seed-sower":       {"status": "deferred", "category": "Weather",
                          "sim_desc": "Sets Grassy Terrain when hit — no terrain mechanic."},
     "anger-shell":      {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Atk/SpAtk/Speed +1, Def/SpDef −1 when HP drops below 50% — HP-conditional stat change."},
-    "opportunist":      {"status": "deferred", "category": "HP Conditional",
+    "opportunist":      {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Copies opponent's positive stat boosts — no stat modifier tracking."},
-    "armor-tail":       {"status": "deferred", "category": "HP Conditional",
+    "armor-tail":       {"status": "deferred", "category": "Tactical",
                          "sim_desc": "Prevents opponent from using priority moves — no priority mechanic."},
-    "quick-draw":       {"status": "deferred", "category": "HP Conditional",
+    "quick-draw":       {"status": "deferred", "category": "Tactical",
                          "sim_desc": "30% chance to go first regardless of speed — probability mechanic."},
     "tera-shift":       {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Ogerpon Tera form on entry — Pokémon-specific."},
     "tera-shell":       {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "At full HP, SE moves deal neutral damage — Terapagos-specific."},
-    "teraform-zero":    {"status": "deferred", "category": "HP Conditional",
+    "teraform-zero":    {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Removes weather and terrain — too complex."},
     "poison-puppeteer": {"status": "deferred", "category": "Status",
                          "sim_desc": "Poisons opponents Pecharunt poisons — no status mechanic."},
-    "multitype":        {"status": "deferred", "category": "HP Conditional",
+    "multitype":        {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Arceus changes type based on held plate — Pokémon-specific + items."},
-    "flower-gift":      {"status": "deferred", "category": "HP Conditional",
+    "flower-gift":      {"status": "deferred", "category": "Weather",
                          "sim_desc": "Raises Atk and SpDef of allies in harsh sun — weather + team."},
-    "imposter":         {"status": "deferred", "category": "HP Conditional",
+    "imposter":         {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Transforms into target on entry — would require full per-matchup stat/move copy."},
     "wimp-out":         {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Switches out when HP drops below 50% — no switching mechanic."},
     "emergency-exit":   {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Switches out when HP drops below 50% — no switching mechanic."},
-    "rks-system":       {"status": "deferred", "category": "HP Conditional",
+    "rks-system":       {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Silvally changes type based on memory — Pokémon-specific + items."},
-    "stance-change":    {"status": "deferred", "category": "HP Conditional",
+    "stance-change":    {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Aegislash toggles Blade/Shield form on attack vs protect — form-specific."},
     "schooling":        {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Wishiwashi school/solo form based on HP — HP-conditional form change."},
-    "battle-bond":      {"status": "deferred", "category": "HP Conditional",
+    "battle-bond":      {"status": "deferred", "category": "Scaling",
                          "sim_desc": "Greninja transforms after KO — also excluded from scoring pool."},
     "ice-face":         {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Eiscue blocks one physical hit — requires multi-hit sim change."},
-    "wandering-spirit": {"status": "deferred", "category": "HP Conditional",
+    "wandering-spirit": {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Swaps ability with physical attacker on contact — per-matchup."},
-    "mirror-armor":     {"status": "deferred", "category": "HP Conditional",
+    "mirror-armor":     {"status": "deferred", "category": "No Effect",
                          "sim_desc": "Reflects stat drops back at user — no stat modifier tracking."},
     "hunger-switch":    {"status": "deferred", "category": "HP Conditional",
                          "sim_desc": "Morpeko form switch each turn — Pokémon-specific."},
-    "zero-to-hero":     {"status": "deferred", "category": "HP Conditional",
+    "zero-to-hero":     {"status": "deferred", "category": "Scaling",
                          "sim_desc": "Palafin transforms into hero form after fainting — Pokémon-specific."},
     "disguise":       {"status": "deferred", "category": "HP Conditional",
                        "sim_desc": "Mimikyu blocks one hit — would require multi-hit sim change."},
@@ -845,8 +940,8 @@ class ImpactTableDialog(QDialog):
         # Matchups tab state
         self._matchup_all_rows: list[dict] = []
         self._matchup_poke_name: str = ""
-        self._matchup_sort_col: int = 5   # Our POHKO, descending
-        self._matchup_sort_asc: bool = False
+        self._matchup_sort_col: int = 0   # Outcome, ascending (ZDW first)
+        self._matchup_sort_asc: bool = True
 
         self._build_ui()
 
@@ -1699,6 +1794,8 @@ class ImpactTableDialog(QDialog):
             "Immunity":       "#89b4fa",
             "Type Remap":     "#cba6f7",
             "Weather":        "#94e2d5",
+            "Tactical":       "#89dceb",
+            "Scaling":        "#cba6f7",
             "Status":         "#f9e2af",
             "Flinching":      "#f9e2af",
             "Critical Hit":   "#f9e2af",
@@ -1787,37 +1884,25 @@ class ImpactTableDialog(QDialog):
 
         layout.addLayout(top)
 
-        # Cols: Opponent | Types | Move Used | Opponent Move | Outcome | Our POHKO | Their POHKO
+        # Cols: Outcome | Description (narrative)
         self._matchups_table = QTableWidget()
-        self._matchups_table.setColumnCount(7)
-        self._matchups_table.setHorizontalHeaderLabels([
-            "Opponent", "Types", "Move Used", "Opponent Move", "Outcome", "Our POHKO", "Their POHKO",
-        ])
+        self._matchups_table.setColumnCount(2)
+        self._matchups_table.setHorizontalHeaderLabels(["Outcome", "Description"])
         self._matchups_table.setSortingEnabled(False)
         self._matchups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._matchups_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._matchups_table.verticalHeader().setVisible(False)
-        self._matchups_table.verticalHeader().setDefaultSectionSize(30)
+        self._matchups_table.verticalHeader().setDefaultSectionSize(32)
         self._matchups_table.setWordWrap(False)
 
         hdr = self._matchups_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSortIndicatorShown(True)
-        hdr.setSortIndicator(5, Qt.SortOrder.DescendingOrder)
+        hdr.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         hdr.sectionClicked.connect(self._on_matchups_header_click)
 
-        self._matchups_table.setColumnWidth(0, 200)
-        self._matchups_table.setColumnWidth(1, 110)
-        self._matchups_table.setColumnWidth(2, 185)
-        self._matchups_table.setColumnWidth(4, 62)
-        self._matchups_table.setColumnWidth(5, 90)
-        self._matchups_table.setColumnWidth(6, 90)
+        self._matchups_table.setColumnWidth(0, 70)
 
         layout.addWidget(self._matchups_table)
 
@@ -1865,19 +1950,9 @@ class ImpactTableDialog(QDialog):
         rows = self._matchup_all_rows
         if outcome_filter != "All outcomes":
             rows = [r for r in rows if r["outcome"] == outcome_filter]
-
-        _sort_keys = {
-            0: ("opponent",     True),
-            2: ("move_used",    True),
-            3: ("move_against", True),
-            4: ("outcome",      True),
-            5: ("pohko_a",      False),
-            6: ("pohko_b",      False),
-        }
-        field, _ = _sort_keys.get(self._matchup_sort_col, ("pohko_a", False))
         rows = sorted(
             rows,
-            key=lambda r: r[field] if isinstance(r[field], float) else r[field].lower(),
+            key=lambda r: _OUTCOME_RANK.get(r["outcome"], 9),
             reverse=not self._matchup_sort_asc,
         )
         self._populate_matchups(rows)
@@ -1895,43 +1970,18 @@ class ImpactTableDialog(QDialog):
         t.setRowCount(len(rows))
 
         for i, row in enumerate(rows):
-            name_item = QTableWidgetItem(row["opponent"].replace("-", " ").title())
-            name_item.setForeground(QColor("#89b4fa"))
-            t.setItem(i, 0, name_item)
-
-            t.setCellWidget(i, 1, _badges(row["opponent_types"]))
-
-            move_item = QTableWidgetItem(row["move_used"].replace("-", " ").title())
-            move_item.setForeground(QColor("#cba6f7"))
-            t.setItem(i, 2, move_item)
-
-            opp_item = QTableWidgetItem(row["move_against"].replace("-", " ").title())
-            opp_item.setForeground(QColor("#f38ba8"))
-            t.setItem(i, 3, opp_item)
-
-            outcome = row["outcome"]
+            outcome  = row["outcome"]
             out_item = QTableWidgetItem(outcome)
             out_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             out_item.setForeground(QColor(_OUTCOME_COLORS.get(outcome, "#cdd6f4")))
-            t.setItem(i, 4, out_item)
+            t.setItem(i, 0, out_item)
 
-            pa_item = QTableWidgetItem(f"{row['pohko_a'] * 100:.0f}%")
-            pa_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            pa_item.setForeground(QColor("#a6e3a1"))
-            pa_item.setToolTip(
-                f"Our best move: {row['move_used'].replace('-', ' ').title()}\n"
-                f"P(OHKO) = {row['pohko_a']*100:.1f}%"
-            )
-            t.setItem(i, 5, pa_item)
-
-            pb_item = QTableWidgetItem(f"{row['pohko_b'] * 100:.0f}%")
-            pb_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            pb_item.setForeground(QColor("#f38ba8"))
-            pb_item.setToolTip(
-                f"Opponent's best move: {row['move_against'].replace('-', ' ').title()}\n"
-                f"P(OHKO) = {row['pohko_b']*100:.1f}%"
-            )
-            t.setItem(i, 6, pb_item)
+            html = _matchup_narrative(row, self._matchup_poke_name)
+            lbl  = QLabel(html)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setStyleSheet("background: transparent; padding-left: 6px;")
+            t.setCellWidget(i, 1, lbl)
 
         all_rows = self._matchup_all_rows
         zdw  = sum(1 for r in all_rows if r["outcome"] == "ZDW")
@@ -1949,13 +1999,13 @@ class ImpactTableDialog(QDialog):
         self._matchups_status.setText(status)
 
     def _on_matchups_header_click(self, col: int):
-        if col == 1:  # Types — not sortable
+        if col != 0:  # only Outcome is sortable
             return
         if self._matchup_sort_col == col:
             self._matchup_sort_asc = not self._matchup_sort_asc
         else:
             self._matchup_sort_col = col
-            self._matchup_sort_asc = col in {0, 2, 3, 4}  # strings default ascending
+            self._matchup_sort_asc = True  # ZDW first
         order = (Qt.SortOrder.AscendingOrder if self._matchup_sort_asc
                  else Qt.SortOrder.DescendingOrder)
         self._matchups_table.horizontalHeader().setSortIndicator(col, order)
