@@ -22,9 +22,9 @@ import numpy as np
 # ── cache loading ─────────────────────────────────────────────────────────────
 
 def _load_impact_cache(egg: bool = False) -> dict:
-    base  = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PokerogueHelper")
+    from app_dirs import data_path
     fname = "impact_cache_egg.json" if egg else "impact_cache.json"
-    path  = os.path.join(base, fname)
+    path  = data_path(fname)
     if not os.path.exists(path):
         sys.exit(f"Cache not found: {path}\nRun the app first to build the impact cache.")
     with open(path) as f:
@@ -35,8 +35,8 @@ def _load_impact_cache(egg: bool = False) -> dict:
 
 
 def _load_stats_cache() -> dict:
-    base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PokerogueHelper")
-    path = os.path.join(base, "stats_cache.json")
+    from app_dirs import data_path
+    path = data_path("stats_cache.json")
     if not os.path.exists(path):
         sys.exit(f"Stats cache not found: {path}\nRun the app first.")
     with open(path) as f:

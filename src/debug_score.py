@@ -6,6 +6,8 @@ Usage (run from src/):
     python debug_score.py skeledirge --egg 1      # at most 1 egg move in the final 4
 """
 
+from __future__ import annotations
+
 import argparse
 import requests
 from concurrent.futures import ThreadPoolExecutor

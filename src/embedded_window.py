@@ -17,6 +17,8 @@ _inject_phaser_capture catches the Phaser.Game instance at boot and stashes it
 on window.__pokerogue_game__ for the extractor to read.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import window_state

@@ -5,6 +5,8 @@ hook in embedded_window._inject_phaser_capture) every interval_ms and emits a
 snapshot dict whenever the state changes.
 """
 
+from __future__ import annotations
+
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 

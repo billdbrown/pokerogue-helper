@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.egg-info/
 .pytest_cache/
+venv/
 
 # PyInstaller build output
 build/
@@ -12,8 +13,8 @@ dist/
 # Embedded browser profile (cookies, cache, local storage) — per-user
 browser_data/
 
-# Runtime caches (regenerated on first run)
-stats_cache.json
+# Runtime caches (per-user, not in version control for packaged builds)
+# In development the app writes to data/ which IS tracked; nothing to ignore here.
 moves_cache.json
 tier_cache.json
 

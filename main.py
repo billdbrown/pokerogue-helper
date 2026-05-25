@@ -25,9 +25,10 @@ def _run_full():
 
 
 def _run_browser():
-    from PyQt6.QtCore import Qt, QMetaObject
+    from PyQt6.QtCore import Qt, QMetaObject, Q_ARG
     from impact_table import ImpactTableDialog
     import impact_db
+    import stats_db
 
     app = QApplication(sys.argv)
     dlg = ImpactTableDialog()
@@ -35,12 +36,28 @@ def _run_browser():
     dlg.finished.connect(app.quit)
     dlg.show()
 
-    if not impact_db.is_ready():
+    def _start_impact():
         impact_db.init(
+            on_progress=lambda msg: QMetaObject.invokeMethod(
+                dlg, "_on_status", Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, msg),
+            ) if hasattr(dlg, "_on_status") else None,
             on_ready=lambda: QMetaObject.invokeMethod(
                 dlg, "refresh", Qt.ConnectionType.QueuedConnection
-            )
+            ),
         )
+
+    if not impact_db.is_ready():
+        if stats_db.is_ready():
+            _start_impact()
+        else:
+            stats_db.init(
+                on_progress=lambda msg: QMetaObject.invokeMethod(
+                    dlg, "_on_status", Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, msg),
+                ) if hasattr(dlg, "_on_status") else None,
+                on_ready=_start_impact,
+            )
 
     signal.signal(signal.SIGINT, lambda *_: app.quit())
     sys.exit(app.exec())

@@ -149,6 +149,59 @@ _FEASIBILITY_COLORS = {
     "—":       "#6c7086",
 }
 
+# Abilities modeled in the battle sim.
+# Key = PokéAPI slug.  "sim_desc" explains exactly what is implemented.
+_ABILITY_SIM_INFO: dict[str, dict] = {
+    # ── Offensive ──────────────────────────────────────────────────────────────
+    "transistor": {
+        "sim_desc": "Electric moves deal ×1.5 damage (applied to base power in scoring).",
+    },
+    "dragons-maw": {
+        "sim_desc": "Dragon moves deal ×1.5 damage.",
+    },
+    "rocky-payload": {
+        "sim_desc": "Rock moves deal ×1.5 damage.",
+    },
+    "water-bubble": {
+        "sim_desc": "Water moves deal ×2.0 damage (off); incoming Fire moves deal ×0.5 damage (def).",
+    },
+    "aerilate": {
+        "sim_desc": "Normal moves treated as Flying-type with ×1.3 power; STAB re-evaluated on Flying.",
+    },
+    "pixilate": {
+        "sim_desc": "Normal moves treated as Fairy-type with ×1.3 power; STAB re-evaluated on Fairy.",
+    },
+    "refrigerate": {
+        "sim_desc": "Normal moves treated as Ice-type with ×1.3 power; STAB re-evaluated on Ice.",
+    },
+    # ── Defensive ──────────────────────────────────────────────────────────────
+    "thick-fat": {
+        "sim_desc": "Incoming Fire and Ice moves deal ×0.5 damage.",
+    },
+    "fur-coat": {
+        "sim_desc": "Incoming physical moves deal ×0.5 damage.",
+    },
+    "ice-scales": {
+        "sim_desc": "Incoming special moves deal ×0.5 damage.",
+    },
+    "heatproof": {
+        "sim_desc": "Incoming Fire moves deal ×0.5 damage.",
+    },
+    "multiscale": {
+        "sim_desc": "All incoming moves deal ×0.5 damage (assumes full HP).",
+    },
+    "shadow-shield": {
+        "sim_desc": "All incoming moves deal ×0.5 damage (assumes full HP).",
+    },
+    "purifying-salt": {
+        "sim_desc": "Incoming Ghost moves deal ×0.5 damage.",
+    },
+    # ── Immunity ───────────────────────────────────────────────────────────────
+    "well-baked-body": {
+        "sim_desc": "Immune to Fire-type moves (eff = 0 in bulk/battle scoring).",
+    },
+}
+
 
 def _badges(types: list[str], small: bool = False) -> QWidget:
     w = QWidget()
@@ -194,12 +247,13 @@ class ImpactTableDialog(QDialog):
 
         # Moves tab state
         self._moves_all_rows: list[dict] = []
-        self._moves_sort_col = 3   # Power, descending
+        self._moves_sort_col = 0   # # Sets, descending
         self._moves_sort_asc = False
         self._moves_loaded = False
         self._moves_init_started = False
         self._moves_adoptions_all:   dict[str, int] = {}
         self._moves_adoptions_clean: dict[str, int] = {}
+        self._moves_debug = False
 
         # Abilities tab state
         self._abilities_all_rows: list[dict] = []
@@ -207,6 +261,7 @@ class ImpactTableDialog(QDialog):
         self._abilities_sort_asc = False
         self._abilities_loaded = False
         self._abilities_init_started = False
+        self._abilities_debug = False
 
         self._build_ui()
 
@@ -323,7 +378,7 @@ class ImpactTableDialog(QDialog):
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(26)
+        self._table.verticalHeader().setDefaultSectionSize(36)
         self._table.setWordWrap(False)
 
         hdr = self._table.horizontalHeader()
@@ -379,13 +434,17 @@ class ImpactTableDialog(QDialog):
         self._moves_cat_cb.currentIndexChanged.connect(self._apply_moves_filter)
         top.addWidget(self._moves_cat_cb)
 
+        self._moves_debug_cb = QCheckBox("Debug")
+        self._moves_debug_cb.toggled.connect(self._on_moves_debug_toggled)
+        top.addWidget(self._moves_debug_cb)
+
         layout.addLayout(top)
 
         self._moves_table = QTableWidget()
         self._moves_table.setColumnCount(11)
         self._moves_table.setHorizontalHeaderLabels(
-            ["Name", "Type", "Category", "Power", "Hits", "Accuracy", "PP", "Adverse",
-             "# Sets", "Sim Note", "Description"]
+            ["# Sets", "Name", "Type", "Category", "Power", "Hits", "Accuracy", "PP",
+             "Adverse", "Sim Note", "Description"]
         )
         self._moves_table.setSortingEnabled(False)
         self._moves_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -395,8 +454,8 @@ class ImpactTableDialog(QDialog):
         self._moves_table.setWordWrap(False)
 
         hdr = self._moves_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
@@ -407,19 +466,24 @@ class ImpactTableDialog(QDialog):
         hdr.setSectionResizeMode(9, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
         hdr.setSortIndicatorShown(True)
-        hdr.setSortIndicator(3, Qt.SortOrder.DescendingOrder)
+        hdr.setSortIndicator(0, Qt.SortOrder.DescendingOrder)
         hdr.sectionClicked.connect(self._on_moves_header_click)
 
-        self._moves_table.setColumnWidth(0, 170)
-        self._moves_table.setColumnWidth(1, 85)
-        self._moves_table.setColumnWidth(2, 80)
-        self._moves_table.setColumnWidth(3, 55)
-        self._moves_table.setColumnWidth(4, 50)
-        self._moves_table.setColumnWidth(5, 65)
-        self._moves_table.setColumnWidth(6, 42)
-        self._moves_table.setColumnWidth(7, 100)
-        self._moves_table.setColumnWidth(8, 65)
+        self._moves_table.setColumnWidth(0, 68)
+        self._moves_table.setColumnWidth(1, 170)
+        self._moves_table.setColumnWidth(2, 85)
+        self._moves_table.setColumnWidth(3, 80)
+        self._moves_table.setColumnWidth(4, 55)
+        self._moves_table.setColumnWidth(5, 50)
+        self._moves_table.setColumnWidth(6, 65)
+        self._moves_table.setColumnWidth(7, 42)
+        self._moves_table.setColumnWidth(8, 100)
         self._moves_table.setColumnWidth(9, 190)
+
+        # Debug columns hidden by default
+        self._moves_table.setColumnHidden(5, True)
+        self._moves_table.setColumnHidden(8, True)
+        self._moves_table.setColumnHidden(9, True)
 
         layout.addWidget(self._moves_table)
 
@@ -445,12 +509,24 @@ class ImpactTableDialog(QDialog):
         self._abilities_feas_cb.currentIndexChanged.connect(self._apply_abilities_filter)
         top.addWidget(self._abilities_feas_cb)
 
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setStyleSheet("color: #45475a;")
+        top.addWidget(sep)
+
+        self._abilities_debug_cb = QCheckBox("Debug")
+        self._abilities_debug_cb.setChecked(False)
+        self._abilities_debug_cb.toggled.connect(self._on_abilities_debug_toggled)
+        top.addWidget(self._abilities_debug_cb)
+
         layout.addLayout(top)
 
+        # Cols: 0 Ability | 1 # Pokémon | 2 Feasibility | 3 In Sim | 4 Sim Desc (debug) | 5 Description
         self._abilities_table = QTableWidget()
-        self._abilities_table.setColumnCount(4)
+        self._abilities_table.setColumnCount(6)
         self._abilities_table.setHorizontalHeaderLabels(
-            ["Ability", "# Pokémon", "Feasibility", "Description"]
+            ["Ability", "# Pokémon", "Feasibility", "In Sim", "Sim Description", "Description"]
         )
         self._abilities_table.setSortingEnabled(False)
         self._abilities_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -463,7 +539,9 @@ class ImpactTableDialog(QDialog):
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         hdr.setSortIndicatorShown(True)
         hdr.setSortIndicator(1, Qt.SortOrder.DescendingOrder)
         hdr.sectionClicked.connect(self._on_abilities_header_click)
@@ -471,6 +549,9 @@ class ImpactTableDialog(QDialog):
         self._abilities_table.setColumnWidth(0, 175)
         self._abilities_table.setColumnWidth(1, 85)
         self._abilities_table.setColumnWidth(2, 90)
+        self._abilities_table.setColumnWidth(3, 58)
+        self._abilities_table.setColumnWidth(4, 260)
+        self._abilities_table.setColumnHidden(4, True)
 
         layout.addWidget(self._abilities_table)
 
@@ -564,22 +645,24 @@ class ImpactTableDialog(QDialog):
                 active_impact = data["impact"]
 
             self._all_rows.append({
-                "rank":       rank,
-                "name":       name,
-                "display":    name.replace("-", " ").title(),
-                "impact":     active_impact,
-                "coverage":   data.get("coverage", data["impact"]),
-                "speed":      data.get("speed", 0),
-                "pct":        data["percentile"],
-                "def_score":  data.get("bulk", 0.0),
-                "types":      types,
-                "legendary":  data.get("legendary", False),
-                "paradox":    data.get("paradox", False),
-                "starter":    name in _STARTER_POKEMON,
-                "stab_cov":   sorted(stab_cov),
-                "moves":      raw_moves,
-                "outcomes":   data.get("outcomes", {}),
-                "move_usage": data.get("move_usage", {}),
+                "rank":            rank,
+                "name":            name,
+                "display":         name.replace("-", " ").title(),
+                "impact":          active_impact,
+                "coverage":        data.get("coverage", data["impact"]),
+                "speed":           data.get("speed", 0),
+                "pct":             data["percentile"],
+                "def_score":       data.get("bulk", 0.0),
+                "types":           types,
+                "legendary":       data.get("legendary", False),
+                "paradox":         data.get("paradox", False),
+                "starter":         name in _STARTER_POKEMON,
+                "stab_cov":        sorted(stab_cov),
+                "moves":           raw_moves,
+                "outcomes":        data.get("outcomes", {}),
+                "move_usage":      data.get("move_usage", {}),
+                "ability_used":    data.get("ability_used"),
+                "passive_ability": data.get("passive_ability"),
             })
 
         nonleg    = [r for r in self._all_rows if not r["legendary"] and not r["paradox"]]
@@ -660,12 +743,28 @@ class ImpactTableDialog(QDialog):
             self._table.setCellWidget(i, 2, _badges(row["types"]))
 
             prefix = "★ " if row["legendary"] else ""
-            name_item = QTableWidgetItem(prefix + row["display"])
-            name_item.setForeground(
-                QColor("#cba6f7") if row["legendary"] else QColor("#89b4fa")
-            )
-            name_item.setToolTip("Click to open Bulbapedia")
-            self._table.setItem(i, 3, name_item)
+            name_color = "#cba6f7" if row["legendary"] else "#89b4fa"
+            ability_used    = row.get("ability_used")
+            passive_ability = row.get("passive_ability")
+            ab_parts = []
+            if ability_used:
+                ab_parts.append(ability_used.replace("-", " ").title())
+            if passive_ability and passive_ability != ability_used:
+                ab_parts.append(passive_ability.replace("-", " ").title() + " (p)")
+            if ab_parts:
+                name_html = (
+                    f'<span style="color:{name_color};">{prefix}{row["display"]}</span>'
+                    f'<br><span style="color:#6c7086; font-size:10px; font-style:italic;">'
+                    f'{" · ".join(ab_parts)}</span>'
+                )
+            else:
+                name_html = f'<span style="color:{name_color};">{prefix}{row["display"]}</span>'
+            name_lbl = QLabel(name_html)
+            name_lbl.setTextFormat(Qt.TextFormat.RichText)
+            name_lbl.setStyleSheet("background: transparent; padding-left: 4px;")
+            name_lbl.setToolTip("Click to open Bulbapedia")
+            name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._table.setCellWidget(i, 3, name_lbl)
 
             combined_item = QTableWidgetItem(f"{row['combined']*100:.0f}")
             combined_item.setTextAlignment(
@@ -741,6 +840,16 @@ class ImpactTableDialog(QDialog):
 
     # ── Moves tab ─────────────────────────────────────────────────────────────
 
+    def _on_moves_debug_toggled(self, checked: bool):
+        self._moves_debug = checked
+        self._moves_table.setColumnHidden(5, not checked)
+        self._moves_table.setColumnHidden(8, not checked)
+        self._moves_table.setColumnHidden(9, not checked)
+
+    def _on_abilities_debug_toggled(self, checked: bool):
+        self._abilities_debug = checked
+        self._abilities_table.setColumnHidden(4, not checked)
+
     def _init_moves_tab(self):
         def on_prog(msg: str):
             QMetaObject.invokeMethod(
@@ -787,20 +896,20 @@ class ImpactTableDialog(QDialog):
 
         adopt_all   = self._moves_adoptions_all
         adopt_clean = self._moves_adoptions_clean
-        # col → (field, asc_default); None = special-cased below
+        # col → (field, asc_default); None = special-cased
         _moves_sort_keys = {
-            0: ("display",  True),
-            1: ("type",     True),
-            2: ("category", True),
-            3: ("power",    False),
-            4: ("min_hits", False),
-            5: ("accuracy", False),
-            6: ("pp",       False),
-            7: ("adverse",  True),
-            8: None,   # # Sets — sorted by adoption count
+            0: None,            # # Sets — sorted by adoption count
+            1: ("display",  True),
+            2: ("type",     True),
+            3: ("category", True),
+            4: ("power",    False),
+            5: ("min_hits", False),
+            6: ("accuracy", False),
+            7: ("pp",       False),
+            8: ("adverse",  True),
             9: ("excluded", True),
         }
-        if self._moves_sort_col == 8:
+        if self._moves_sort_col == 0:
             rows.sort(
                 key=lambda r: adopt_all.get(r["name"], 0),
                 reverse=not self._moves_sort_asc,
@@ -825,79 +934,95 @@ class ImpactTableDialog(QDialog):
         _cat_colors = {"Physical": "#fab387", "Special": "#89b4fa", "Status": "#a6adc8"}
 
         for i, row in enumerate(rows):
-            name_item = QTableWidgetItem(row["display"])
-            name_item.setForeground(QColor("#cdd6f4"))
-            t.setItem(i, 0, name_item)
+            mn    = row["name"]
+            excl  = row.get("excluded", "")
+            adv   = row["adverse"]
 
-            t.setCellWidget(i, 1, _badges([row["type"]], small=True))
-
-            cat = row["category"].title()
-            cat_item = QTableWidgetItem(cat)
-            cat_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            cat_item.setForeground(QColor(_cat_colors.get(cat, "#cdd6f4")))
-            t.setItem(i, 2, cat_item)
-
-            pwr = row["power"]
-            pwr_item = QTableWidgetItem(str(pwr) if pwr else "—")
-            pwr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            pwr_item.setForeground(QColor("#cba6f7"))
-            t.setItem(i, 3, pwr_item)
-
-            min_h = row.get("min_hits") or 0
-            max_h = row.get("max_hits") or 0
-            if min_h and max_h:
-                hits_text = f"{min_h}×" if min_h == max_h else f"{min_h}-{max_h}×"
-                avg = (min_h + max_h) / 2.0
-                hits_tip = f"Hits {min_h}-{max_h} times; avg ×{avg:.1f} effective power in sim"
-                hits_color = "#f9e2af"
-            else:
-                hits_text = "—"
-                hits_tip  = "Single hit"
-                hits_color = "#6c7086"
-            hits_item = QTableWidgetItem(hits_text)
-            hits_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            hits_item.setForeground(QColor(hits_color))
-            hits_item.setToolTip(hits_tip)
-            t.setItem(i, 4, hits_item)
-
-            acc = row["accuracy"]
-            acc_item = QTableWidgetItem(f"{acc}%" if acc else "—")
-            acc_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            acc_item.setForeground(QColor("#cdd6f4"))
-            t.setItem(i, 5, acc_item)
-
-            pp_item = QTableWidgetItem(str(row["pp"]) if row["pp"] else "—")
-            pp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            pp_item.setForeground(QColor("#6c7086"))
-            t.setItem(i, 6, pp_item)
-
-            adv = row["adverse"]
-            adv_item = QTableWidgetItem(adv)
-            adv_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            adv_item.setForeground(QColor(_ADVERSE_COLORS.get(adv, "#cdd6f4")))
-            t.setItem(i, 7, adv_item)
-
-            mn = row["name"]
+            # col 0: # Sets
             n_all   = adopt_all.get(mn, 0)
             n_clean = adopt_clean.get(mn, 0)
-            sets_text = str(n_all) if n_all else "—"
-            sets_item = QTableWidgetItem(sets_text)
+            sets_item = QTableWidgetItem(str(n_all) if n_all else "—")
             sets_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             sets_item.setForeground(QColor("#a6e3a1" if n_all else "#6c7086"))
             sets_item.setToolTip(
                 f"All mode (incl. recoil/stat-drop): {n_all} forms\n"
                 f"Clean mode (no recoil/stat-drop):  {n_clean} forms"
             )
-            t.setItem(i, 8, sets_item)
+            t.setItem(i, 0, sets_item)
 
-            excl = row.get("excluded", "")
+            # col 1: Name — colored by adverse/exclusion status
+            if excl.startswith("Always excluded"):
+                name_color = "#6c7086"   # grey — never used in sim
+            elif adv == "Self-damaging":
+                name_color = "#f38ba8"   # red
+            elif adv == "Self-reducing":
+                name_color = "#f9e2af"   # yellow
+            else:
+                name_color = "#cdd6f4"
+            name_item = QTableWidgetItem(row["display"])
+            name_item.setForeground(QColor(name_color))
+            t.setItem(i, 1, name_item)
+
+            # col 2: Type badge
+            t.setCellWidget(i, 2, _badges([row["type"]], small=True))
+
+            # col 3: Category
+            cat = row["category"].title()
+            cat_item = QTableWidgetItem(cat)
+            cat_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            cat_item.setForeground(QColor(_cat_colors.get(cat, "#cdd6f4")))
+            t.setItem(i, 3, cat_item)
+
+            # col 4: Power
+            pwr = row["power"]
+            pwr_item = QTableWidgetItem(str(pwr) if pwr else "—")
+            pwr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pwr_item.setForeground(QColor("#cba6f7"))
+            t.setItem(i, 4, pwr_item)
+
+            # col 5: Hits (debug)
+            min_h = row.get("min_hits") or 0
+            max_h = row.get("max_hits") or 0
+            if min_h and max_h:
+                hits_text  = f"{min_h}×" if min_h == max_h else f"{min_h}-{max_h}×"
+                hits_tip   = f"Hits {min_h}-{max_h} times; avg ×{(min_h+max_h)/2:.1f} effective power in sim"
+                hits_color = "#f9e2af"
+            else:
+                hits_text  = "—"
+                hits_tip   = "Single hit"
+                hits_color = "#6c7086"
+            hits_item = QTableWidgetItem(hits_text)
+            hits_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            hits_item.setForeground(QColor(hits_color))
+            hits_item.setToolTip(hits_tip)
+            t.setItem(i, 5, hits_item)
+
+            # col 6: Accuracy
+            acc = row["accuracy"]
+            acc_item = QTableWidgetItem(f"{acc}%" if acc else "—")
+            acc_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            acc_item.setForeground(QColor("#cdd6f4"))
+            t.setItem(i, 6, acc_item)
+
+            # col 7: PP
+            pp_item = QTableWidgetItem(str(row["pp"]) if row["pp"] else "—")
+            pp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pp_item.setForeground(QColor("#6c7086"))
+            t.setItem(i, 7, pp_item)
+
+            # col 8: Adverse (debug)
+            adv_item = QTableWidgetItem(adv)
+            adv_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            adv_item.setForeground(QColor(_ADVERSE_COLORS.get(adv, "#cdd6f4")))
+            t.setItem(i, 8, adv_item)
+
+            # col 9: Sim Note (debug)
             excl_item = QTableWidgetItem(excl if excl else "—")
             excl_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            excl_item.setForeground(
-                QColor("#f38ba8") if excl else QColor("#a6e3a1")
-            )
+            excl_item.setForeground(QColor("#f38ba8") if excl else QColor("#a6e3a1"))
             t.setItem(i, 9, excl_item)
 
+            # col 10: Description
             eff_item = QTableWidgetItem(row["effect"])
             eff_item.setForeground(QColor("#a6adc8"))
             t.setItem(i, 10, eff_item)
@@ -911,7 +1036,7 @@ class ImpactTableDialog(QDialog):
             self._moves_sort_asc = not self._moves_sort_asc
         else:
             self._moves_sort_col = col
-            self._moves_sort_asc = col in {0, 1, 2, 7, 9}  # strings default ascending
+            self._moves_sort_asc = col in {1, 2, 3, 8, 9}  # strings default ascending
         order = (Qt.SortOrder.AscendingOrder if self._moves_sort_asc
                  else Qt.SortOrder.DescendingOrder)
         self._moves_table.horizontalHeader().setSortIndicator(col, order)
@@ -950,17 +1075,20 @@ class ImpactTableDialog(QDialog):
         q           = self._abilities_search.text().strip().lower()
         feas_choice = self._abilities_feas_cb.currentText()
 
-        rows = [
-            r for r in self._abilities_all_rows
-            if (not q or q in r["name"] or q in r["display"].lower()
-                or q in r["effect"].lower())
-            and (feas_choice == "All feasibility" or r["feasibility"] == feas_choice)
-        ]
+        rows = []
+        for r in self._abilities_all_rows:
+            if q and q not in r["name"] and q not in r["display"].lower() and q not in r["effect"].lower():
+                continue
+            if feas_choice != "All feasibility" and r["feasibility"] != feas_choice:
+                continue
+            sim_info = _ABILITY_SIM_INFO.get(r["name"], {})
+            rows.append({**r, "in_sim": "✓" if sim_info else "", "sim_desc": sim_info.get("sim_desc", "")})
 
         _abil_sort_keys = {
             0: ("display",     True),
             1: ("total",       False),
             2: ("feasibility", True),
+            3: ("in_sim",      False),
         }
         key_field, _ = _abil_sort_keys.get(self._abilities_sort_col, ("total", False))
         rows.sort(
@@ -1003,20 +1131,30 @@ class ImpactTableDialog(QDialog):
             )
             t.setItem(i, 2, feas_item)
 
+            in_sim = row.get("in_sim", "")
+            sim_item = QTableWidgetItem(in_sim)
+            sim_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            sim_item.setForeground(QColor("#a6e3a1" if in_sim else "#45475a"))
+            t.setItem(i, 3, sim_item)
+
+            sim_desc_item = QTableWidgetItem(row.get("sim_desc", ""))
+            sim_desc_item.setForeground(QColor("#a6adc8"))
+            t.setItem(i, 4, sim_desc_item)
+
             eff_item = QTableWidgetItem(row["effect"])
             eff_item.setForeground(QColor("#a6adc8"))
-            t.setItem(i, 3, eff_item)
+            t.setItem(i, 5, eff_item)
 
         self._abilities_status.setText(f"{len(rows):,} abilities")
 
     def _on_abilities_header_click(self, col: int):
-        if col not in {0, 1, 2}:
+        if col not in {0, 1, 2, 3}:  # cols 4 (Sim Desc) and 5 (Description) not sortable
             return
         if self._abilities_sort_col == col:
             self._abilities_sort_asc = not self._abilities_sort_asc
         else:
             self._abilities_sort_col = col
-            self._abilities_sort_asc = col in {0, 2}  # strings default ascending
+            self._abilities_sort_asc = col in {0, 2}  # strings default ascending; In Sim defaults desc
         order = (Qt.SortOrder.AscendingOrder if self._abilities_sort_asc
                  else Qt.SortOrder.DescendingOrder)
         self._abilities_table.horizontalHeader().setSortIndicator(col, order)

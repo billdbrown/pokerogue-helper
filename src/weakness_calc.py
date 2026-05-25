@@ -1,3 +1,4 @@
+from __future__ import annotations
 from pokemon_api import fetch_type_relations
 
 ALL_TYPES = [

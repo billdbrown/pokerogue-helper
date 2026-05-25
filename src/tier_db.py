@@ -3,6 +3,8 @@ Fetches Smogon tier assignments from Pokemon Showdown's formats-data.ts and
 caches them to tier_cache.json. Tiers reflect Gen 9 (SV) singles viability.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re

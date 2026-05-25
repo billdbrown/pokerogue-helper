@@ -28,7 +28,7 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 23
+CACHE_VERSION  = 25
 
 # Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
 _EXCLUDED_FORMS: frozenset[str] = frozenset({
@@ -129,6 +129,119 @@ def _is_self_reducing(effect: str) -> bool:
         if _re.search(pat, e):
             return True
     return False
+
+
+# ─── Ability effects ──────────────────────────────────────────────────────────
+# Each entry may have:
+#   "off"   : list of (type_filter, category_filter, multiplier)  — attacker bonus
+#   "remap" : (from_type, to_type, multiplier)  — -ate abilities (Normal→X)
+#   "def"   : list of (type_filter, category_filter, multiplier)  — damage reduction
+#   "immune": set of incoming move types that deal 0 damage
+# None in a filter position means "any".
+ABILITY_EFFECTS: dict[str, dict] = {
+    # ── Offensive ──────────────────────────────────────────────────────────────
+    "transistor":     {"off": [("electric", None,       1.5)]},
+    "dragons-maw":    {"off": [("dragon",   None,       1.5)]},
+    "rocky-payload":  {"off": [("rock",     None,       1.5)]},
+    "water-bubble":   {"off": [("water",    None,       2.0)],
+                       "def": [("fire",     None,       0.5)]},
+    # -ate: Normal moves become new type + ×1.3 power; STAB re-evaluated on new type
+    "aerilate":       {"remap": ("normal", "flying",    1.3)},
+    "pixilate":       {"remap": ("normal", "fairy",     1.3)},
+    "refrigerate":    {"remap": ("normal", "ice",       1.3)},
+    # ── Defensive ──────────────────────────────────────────────────────────────
+    "thick-fat":      {"def": [("fire",     None,       0.5),
+                                ("ice",      None,       0.5)]},
+    "fur-coat":       {"def": [(None,       "physical", 0.5)]},
+    "ice-scales":     {"def": [(None,       "special",  0.5)]},
+    "heatproof":      {"def": [("fire",     None,       0.5)]},
+    "multiscale":     {"def": [(None,       None,       0.5)]},
+    "shadow-shield":  {"def": [(None,       None,       0.5)]},
+    "purifying-salt": {"def": [("ghost",    None,       0.5)]},
+    # ── Immunity ───────────────────────────────────────────────────────────────
+    "well-baked-body": {"immune": {"fire"}},
+}
+
+
+def _off_effect(abilities: list[str], move_type: str, category: str) -> tuple[str, float]:
+    """Return (effective_type, power_multiplier) after applying all active abilities."""
+    etype = move_type
+    mult = 1.0
+    for ability in abilities:
+        fx = ABILITY_EFFECTS.get(ability, {})
+        if "remap" in fx:
+            from_t, to_t, rmult = fx["remap"]
+            if etype == from_t:
+                etype = to_t
+                mult *= rmult
+        for t, cat, m in fx.get("off", []):
+            if (t is None or t == move_type) and (cat is None or cat == category):
+                mult *= m
+    return etype, mult
+
+
+def _def_mult(abilities: list[str], move_type: str, category: str) -> float:
+    """Return combined incoming damage multiplier (0.0 = immune) across all abilities."""
+    mult = 1.0
+    for ability in abilities:
+        fx = ABILITY_EFFECTS.get(ability, {})
+        if move_type in fx.get("immune", set()):
+            return 0.0
+        for t, cat, m in fx.get("def", []):
+            if (t is None or t == move_type) and (cat is None or cat == category):
+                mult *= m
+    return mult
+
+
+def _pick_ability(api_abilities: list[str]) -> str | None:
+    """Return the first modeled regular ability in slot order (slot1 → slot2 → hidden)."""
+    for ab in api_abilities:
+        if ab in ABILITY_EFFECTS:
+            return ab
+    return None
+
+
+_PASSIVE_URL = (
+    "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
+    "/src/data/balance/passives.ts"
+)
+_KNOWN_REGIONS = {"alola", "galar", "hisui", "paldea"}
+
+
+def _fetch_pokerogue_passives() -> dict[str, str]:
+    """Return {form_slug: passive_ability_slug} parsed from Pokerogue's passives.ts.
+
+    Regional forms like 'typhlosion-hisui' are resolved via HISUI_TYPHLOSION entries.
+    Forms without an explicit entry fall back to the base species form-0 passive.
+    """
+    r = requests.get(_PASSIVE_URL, timeout=30)
+    r.raise_for_status()
+
+    # Parse each [SpeciesId.NAME]: { formIdx: AbilityId.NAME, ... } block
+    raw: dict[str, dict[int, str]] = {}
+    for species_key, forms_str in re.findall(
+        r"\[SpeciesId\.(\w+)\]:\s*\{([^}]+)\}", r.text
+    ):
+        form_map: dict[int, str] = {}
+        for idx_str, ab_key in re.findall(r"(\d+):\s*AbilityId\.(\w+)", forms_str):
+            form_map[int(idx_str)] = ab_key.replace("_", "-").lower()
+        if form_map:
+            raw[species_key] = form_map  # e.g. "HISUI_TYPHLOSION": {0: "drought"}
+
+    result: dict[str, str] = {}
+    for species_key, form_map in raw.items():
+        passive = form_map.get(0)
+        if not passive:
+            continue
+        # Derive PokéAPI slug from SpeciesId key
+        # HISUI_TYPHLOSION → "typhlosion-hisui"  |  VENUSAUR → "venusaur"
+        parts = species_key.lower().split("_")
+        if parts[0] in _KNOWN_REGIONS:
+            slug = "-".join(parts[1:]) + "-" + parts[0]
+        else:
+            slug = "-".join(parts)
+        result[slug] = passive
+    return result
 
 
 # PokeAPI does not reliably set recharge_turn / min_turns — detect from effect text.
@@ -749,6 +862,7 @@ def _compute_score(
     moves: list[dict],
     targets: list[dict],
     eff_memo: dict,
+    abilities: list[str] | None = None,
 ) -> tuple[float, list[dict]]:
     """Returns (coverage_score, selected_moves) via pairwise individual-target scoring.
 
@@ -762,11 +876,14 @@ def _compute_score(
     if not damaging:
         return 0.0, []
 
+    _abs = abilities or []
     move_pv: list[tuple[dict, dict[int, float]]] = []
     for m in damaging:
         mtype = m["type"]
-        stat  = atk if m["category"] == "physical" else sp_atk
-        stab  = 1.5 if mtype in pokemon_types else 1.0
+        cat   = m["category"]
+        etype, ab_mult = _off_effect(_abs, mtype, cat)
+        stat  = atk if cat == "physical" else sp_atk
+        stab  = 1.5 if etype in pokemon_types else 1.0
         acc   = (m["accuracy"] or 100) / 100.0
         pwr = float(m["power"] or 0)
         if m.get("recharge") or m.get("two_turn"):
@@ -774,17 +891,17 @@ def _compute_score(
         min_h, max_h = m.get("min_hits") or 0, m.get("max_hits") or 0
         if min_h and max_h:
             pwr *= (min_h + max_h) / 2.0
-        base  = stat * pwr * acc * stab
+        base  = stat * pwr * ab_mult * acc * stab
 
         pv: dict[int, float] = {}
         for t_idx, tgt in enumerate(targets):
-            types_key = (mtype, tuple(tgt["types"]))
+            types_key = (etype, tuple(tgt["types"]))
             eff = eff_memo.get(types_key)
             if eff is None:
-                eff = _effectiveness(mtype, tgt["types"])
+                eff = _effectiveness(etype, tgt["types"])
                 eff_memo[types_key] = eff
             if eff > 1.0:
-                avg_def = tgt["def"] if m["category"] == "physical" else tgt["sp_def"]
+                avg_def = tgt["def"] if cat == "physical" else tgt["sp_def"]
                 pv[t_idx] = min(base * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
         if pv:
             move_pv.append((m, pv))
@@ -822,12 +939,14 @@ def _compute_bulk_pairwise(
     defender_sp_def: float,
     targets: list[dict],
     eff_memo: dict,
+    defender_abilities: list[str] | None = None,
 ) -> float:
     """Σ sqrt(hits-to-KO) from each non-legendary attacker in the target pool.
 
     Each attacker uses its cached optimal 4 moves. Immune matchups are capped at
     _IMMUNE_CAP hits. sqrt gives ~4-5x range across the population.
     """
+    _dabs = defender_abilities or []
     bulk = 0.0
     for tgt in targets:
         if not tgt.get("moves"):
@@ -835,6 +954,10 @@ def _compute_bulk_pairwise(
         best_pohko = 0.0
         for m in tgt["moves"]:
             mtype = m["type"]
+            cat   = m["category"]
+            dmg_mult = _def_mult(_dabs, mtype, cat)
+            if dmg_mult == 0.0:
+                continue
             types_key = (mtype, tuple(defender_types))
             eff = eff_memo.get(types_key)
             if eff is None:
@@ -842,12 +965,12 @@ def _compute_bulk_pairwise(
                 eff_memo[types_key] = eff
             if eff == 0:
                 continue
-            stat = tgt["atk"] if m["category"] == "physical" else tgt["sp_atk"]
+            stat = tgt["atk"] if cat == "physical" else tgt["sp_atk"]
             stab = 1.5 if mtype in tgt["types"] else 1.0
             acc  = (m["accuracy"] or 100) / 100.0
             base = stat * m["power"] * acc * stab
-            avg_def = defender_def if m["category"] == "physical" else defender_sp_def
-            pohko = min(base * eff * _OHKO_K / (defender_hp * avg_def), 1.0)
+            avg_def = defender_def if cat == "physical" else defender_sp_def
+            pohko = min(base * dmg_mult * eff * _OHKO_K / (defender_hp * avg_def), 1.0)
             if pohko > best_pohko:
                 best_pohko = pohko
         hits_to_ko = (1.0 / best_pohko) if best_pohko > 0 else _IMMUNE_CAP
@@ -900,39 +1023,45 @@ def _compute_battle_score(
       DL  = hit B at least once but couldn't KO before B KO'd A
       ZDL = A never dealt any damage to B before being KO'd
       move_usage = {move_name: count} — how many targets each move was best against
-    attacker fields used: types, atk, sp_atk, speed, hp, defense, sp_def, moves.
+    attacker fields used: types, atk, sp_atk, speed, hp, defense, sp_def, moves, ability_used.
     target fields used:   types, atk, sp_atk, speed, hp, def, sp_def, moves.
     """
-    a_types  = attacker["types"]
-    a_atk    = attacker["atk"]
-    a_sp_atk = attacker["sp_atk"]
-    a_speed  = attacker["speed"]
-    a_hp     = float(attacker["hp"])
-    a_def    = float(attacker["defense"])
-    a_sp_def = float(attacker["sp_def"])
-    a_moves  = moves_override if moves_override is not None else attacker.get("moves", [])
+    a_types   = attacker["types"]
+    a_atk     = attacker["atk"]
+    a_sp_atk  = attacker["sp_atk"]
+    a_speed   = attacker["speed"]
+    a_hp      = float(attacker["hp"])
+    a_def     = float(attacker["defense"])
+    a_sp_def  = float(attacker["sp_def"])
+    a_moves   = moves_override if moves_override is not None else attacker.get("moves", [])
+    # Collect all active abilities (active + passive, non-None only)
+    a_abs: list[str] = [ab for ab in (
+        attacker.get("ability_used"), attacker.get("passive_ability")
+    ) if ab]
 
     _EPS = 1e-9
     zdw = dw = dl = zdl = 0
     move_usage: dict[str, int] = {}
     total = 0.0
     for tgt in targets:
-        # Best P(OHKO) of A on B
+        # Best P(OHKO) of A on B — apply A's offensive abilities
         pohko_a = 0.0
         best_move: str | None = None
         for m in a_moves:
             mtype = m["type"]
-            k = (mtype, tuple(tgt["types"]))
+            cat   = m["category"]
+            etype, ab_mult = _off_effect(a_abs, mtype, cat)
+            k = (etype, tuple(tgt["types"]))
             eff = eff_memo.get(k)
             if eff is None:
-                eff = _effectiveness(mtype, tgt["types"])
+                eff = _effectiveness(etype, tgt["types"])
                 eff_memo[k] = eff
             if eff > 0:
-                stat = a_atk if m["category"] == "physical" else a_sp_atk
-                stab = 1.5 if mtype in a_types else 1.0
+                stat = a_atk if cat == "physical" else a_sp_atk
+                stab = 1.5 if etype in a_types else 1.0
                 acc  = (m["accuracy"] or 100) / 100.0
-                base = stat * m["power"] * acc * stab
-                avg_def = tgt["def"] if m["category"] == "physical" else tgt["sp_def"]
+                base = stat * m["power"] * ab_mult * acc * stab
+                avg_def = tgt["def"] if cat == "physical" else tgt["sp_def"]
                 pohko = min(base * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
                 if pohko > pohko_a:
                     pohko_a = pohko
@@ -940,22 +1069,26 @@ def _compute_battle_score(
         if best_move:
             move_usage[best_move] = move_usage.get(best_move, 0) + 1
 
-        # Best P(OHKO) of B on A
+        # Best P(OHKO) of B on A — apply A's defensive abilities
         pohko_b = 0.0
         for m in tgt.get("moves", []):
             mtype = m["type"]
+            cat   = m["category"]
+            dmg_mult = _def_mult(a_abs, mtype, cat)
+            if dmg_mult == 0.0:
+                continue
             k = (mtype, tuple(a_types))
             eff = eff_memo.get(k)
             if eff is None:
                 eff = _effectiveness(mtype, a_types)
                 eff_memo[k] = eff
             if eff > 0:
-                stat = tgt["atk"] if m["category"] == "physical" else tgt["sp_atk"]
+                stat = tgt["atk"] if cat == "physical" else tgt["sp_atk"]
                 stab = 1.5 if mtype in tgt["types"] else 1.0
                 acc  = (m["accuracy"] or 100) / 100.0
                 base = stat * m["power"] * acc * stab
-                avg_def = a_def if m["category"] == "physical" else a_sp_def
-                pohko = min(base * eff * _OHKO_K / (a_hp * avg_def), 1.0)
+                avg_def = a_def if cat == "physical" else a_sp_def
+                pohko = min(base * dmg_mult * eff * _OHKO_K / (a_hp * avg_def), 1.0)
                 if pohko > pohko_b:
                     pohko_b = pohko
 
@@ -1165,6 +1298,8 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 "stats": {s["stat"]["name"]: s["base_stat"] for s in d["stats"]},
                 "move_names": [m["move"]["name"] for m in all_moves],
                 "species": d.get("species", {}).get("name", form),
+                "abilities": [a["ability"]["name"] for a in
+                               sorted(d.get("abilities", []), key=lambda a: a["slot"])],
             }
         except Exception:
             return form, None
@@ -1221,6 +1356,15 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 _prog(on_progress, f"Warning: could not fetch Pokerogue egg moves ({e}) — skipping.")
     except Exception as e:
         _prog(on_progress, f"Warning: could not fetch Pokerogue learnset ({e}) — using full PokéAPI movesets.")
+
+    # Step 3.7: fetch Pokerogue passive abilities
+    _prog(on_progress, "Fetching Pokerogue passive abilities…")
+    try:
+        passive_map = _fetch_pokerogue_passives()
+        _prog(on_progress, f"Passive map loaded — {len(passive_map)} entries.")
+    except Exception as e:
+        passive_map = {}
+        _prog(on_progress, f"Warning: could not fetch Pokerogue passives ({e}) — skipping.")
 
     # Step 4: collect unique move names and fetch details
     all_move_names: set[str] = set()
@@ -1342,6 +1486,10 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
         atk    = pd["stats"].get("attack", 0)
         sp_atk = pd["stats"].get("special-attack", 0)
         speed  = pd["stats"].get("speed", 0)
+        ability_used    = _pick_ability(pd.get("abilities", []))
+        passive_raw     = passive_map.get(form) or passive_map.get(pd.get("species", form))
+        passive_ability = passive_raw if passive_raw and passive_raw in ABILITY_EFFECTS else None
+        abilities = [ab for ab in (ability_used, passive_ability) if ab]
 
         all_eligible = [
             move_cache[mn] for mn in pd["move_names"]
@@ -1349,22 +1497,24 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
         ]
         clean_eligible = [m for m in all_eligible if not _is_adverse(m)]
 
-        coverage_all,   selected_all   = _compute_score(pd["types"], atk, sp_atk, all_eligible,   targets_build, eff_memo)
-        coverage_clean, selected_clean = _compute_score(pd["types"], atk, sp_atk, clean_eligible, targets_build, eff_memo)
+        coverage_all,   selected_all   = _compute_score(pd["types"], atk, sp_atk, all_eligible,   targets_build, eff_memo, abilities)
+        coverage_clean, selected_clean = _compute_score(pd["types"], atk, sp_atk, clean_eligible, targets_build, eff_memo, abilities)
 
         entry: dict = {
-            "coverage":     coverage_all,
-            "atk":          atk,
-            "sp_atk":       sp_atk,
-            "speed":        speed,
-            "hp":           pd["stats"].get("hp", 1),
-            "defense":      pd["stats"].get("defense", 1),
-            "sp_def":       pd["stats"].get("special-defense", 1),
-            "types":        pd["types"],
-            "legendary":    _is_legendary(pd.get("species", form), form, legendary_set),
-            "paradox":      form in _PARADOX_POKEMON,
-            "moves":        [_to_move_dict(m) for m in selected_all],
-            "moves_clean":  [_to_move_dict(m) for m in selected_clean],
+            "coverage":      coverage_all,
+            "atk":           atk,
+            "sp_atk":        sp_atk,
+            "speed":         speed,
+            "hp":            pd["stats"].get("hp", 1),
+            "defense":       pd["stats"].get("defense", 1),
+            "sp_def":        pd["stats"].get("special-defense", 1),
+            "types":         pd["types"],
+            "legendary":     _is_legendary(pd.get("species", form), form, legendary_set),
+            "paradox":       form in _PARADOX_POKEMON,
+            "ability_used":  ability_used,
+            "passive_ability": passive_ability,
+            "moves":         [_to_move_dict(m) for m in selected_all],
+            "moves_clean":   [_to_move_dict(m) for m in selected_clean],
         }
         if include_egg:
             egg_names = pd.get("_egg_move_set", set())
@@ -1389,6 +1539,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
     # Step 6b: Pass 2 — compute bulk and battle scores against filtered targets
     _prog(on_progress, "Computing bulk and battle scores (pass 2)…")
     for form, entry in db.items():
+        def_abs = [ab for ab in (entry.get("ability_used"), entry.get("passive_ability")) if ab]
         entry["bulk"] = _compute_bulk_pairwise(
             entry["types"],
             float(entry["hp"]),
@@ -1396,6 +1547,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             float(entry["sp_def"]),
             filtered_targets,
             eff_memo,
+            defender_abilities=def_abs,
         )
         score, zdw, dw, dl, zdl, move_usage = _compute_battle_score(entry, filtered_targets, eff_memo)
         entry["impact"]     = score
