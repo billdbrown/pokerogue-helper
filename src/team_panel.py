@@ -1568,7 +1568,9 @@ class TeamPanel(QWidget):
                     lbl.setText("—")
             self._last_potential = 0.0
             self._last_impact = 0.0
-            self._update_uncovered_display([])
+            if self._uncovered_lbl is not None:
+                self._uncovered_lbl.setText("")
+                self._uncovered_lbl.setToolTip("")
             self._update_per_slot_unique([0] * TEAM_SIZE)
             return
 
