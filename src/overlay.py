@@ -1208,58 +1208,69 @@ class OverlayPanel(QWidget):
 
         party_size = len([n for n in self._party_names if n])
         team_full  = party_size >= 6
+        team_names = [n for n in self._party_names if n]
 
         # ── Party not full ────────────────────────────────────────────────
         if not team_full:
             if wild_ai is not None and wild_ai >= 75:
                 contributing = self._ti_contributing_moves(slot, None, wild_entry)
+                # Coverage gain from adding this candidate (no replacement).
+                cov_before = impact_db.team_coverage(team_names)
+                cov_after  = impact_db.team_coverage(team_names + [cand_name])
+                delta_checks   = cov_after["checks"]   - cov_before["checks"]
+                delta_counters = cov_after["counters"] - cov_before["counters"]
                 self._signals.rec_ready.emit((slot, {
-                    'kind':          'catch',
-                    'name':          cand_name.replace('-', ' ').title(),
-                    'candidate_ai':  wild_ai,
-                    'moves':         wild_moves,
+                    'kind':            'catch',
+                    'name':            cand_name.replace('-', ' ').title(),
+                    'candidate_ai':    wild_ai,
+                    'moves':           wild_moves,
                     'ti_contributing': contributing,
+                    'delta_checks':    delta_checks,
+                    'delta_counters':  delta_counters,
                 }))
             else:
                 self._signals.rec_ready.emit((slot, None))
             return
 
-        # ── Full team: best swap by PI ─────────────────────────────────────
-        if not self._party_snapshot or not impact_db.is_ready():
+        # ── Full team: best swap by coverage delta ─────────────────────────
+        if not impact_db.is_ready() or not team_names:
             self._signals.rec_ready.emit((slot, None))
             return
 
-        swap = impact_db.best_swap_pi(self._party_snapshot, cand_name)
+        swap = impact_db.best_coverage_swap(team_names, cand_name)
 
         if swap is not None:
-            ti_delta     = self._ti_delta_for_swap(slot, swap['slot'], wild_entry)
             contributing = self._ti_contributing_moves(slot, swap['slot'], wild_entry)
+            replaced_name = swap['replaced_name']
+            replaced_entry = impact_db.get(impact_db._final_evo_for(replaced_name.lower()))
+            replaced_ai = replaced_entry['percentile'] if replaced_entry else 0
             self._signals.rec_ready.emit((slot, {
-                'kind':            'replace',
-                'name':            swap['replaced_name'].replace('-', ' ').title(),
-                'candidate_ai':    swap['candidate_ai'],
-                'replaced_ai':     swap['replaced_ai'],
-                'pi_delta':        swap['pi_delta'],
-                'ti_delta':        ti_delta,
-                'moves':           wild_moves,
-                'ti_contributing': contributing,
+                'kind':             'replace',
+                'name':             replaced_name.replace('-', ' ').title(),
+                'candidate_ai':     wild_ai or 0,
+                'replaced_ai':      replaced_ai,
+                'delta_checks':     swap['delta_checks'],
+                'delta_counters':   swap['delta_counters'],
+                'newly_covered':    swap['newly_covered'][:5],
+                'newly_lost':       swap['newly_lost'][:5],
+                'newly_countered':  swap['newly_countered'][:5],
+                'lost_counters':    swap['lost_counters'][:5],
+                'moves':            wild_moves,
+                'ti_contributing':  contributing,
             }))
             return
 
-        # ── No PI benefit — check AI vs team members ───────────────────────
+        # ── No positive coverage swap — context for the player ─────────────
         if wild_ai is None:
             self._signals.rec_ready.emit((slot, None))
             return
 
-        # Best swap ignoring sign — gives pi/ti context even when PI decreases
-        consider_swap = impact_db.best_swap_pi(
-            self._party_snapshot, cand_name, require_positive=False
+        # Best swap allowing negative deltas — show the player what would happen.
+        consider_swap = impact_db.best_coverage_swap(
+            team_names, cand_name, require_positive=False
         )
-        consider_pi_delta = consider_swap['pi_delta'] if consider_swap else 0.0
-        consider_ti_delta = (
-            self._ti_delta_for_swap(slot, consider_swap['slot'], wild_entry)
-            if consider_swap else 0.0
-        )
+        consider_delta_checks   = consider_swap['delta_checks']   if consider_swap else 0
+        consider_delta_counters = consider_swap['delta_counters'] if consider_swap else 0
 
         team_ais: list[tuple[str, int]] = []
         for n in self._party_names:
@@ -1273,14 +1284,14 @@ class OverlayPanel(QWidget):
 
         if weakest and wild_ai > weakest[1]:
             self._signals.rec_ready.emit((slot, {
-                'kind':          'consider',
-                'name':          cand_name.replace('-', ' ').title(),
-                'candidate_ai':  wild_ai,
-                'weakest_name':  weakest[0],
-                'weakest_ai':    weakest[1],
-                'moves':         wild_moves,
-                'pi_delta':      consider_pi_delta,
-                'ti_delta':      consider_ti_delta,
+                'kind':            'consider',
+                'name':            cand_name.replace('-', ' ').title(),
+                'candidate_ai':    wild_ai,
+                'weakest_name':    weakest[0],
+                'weakest_ai':      weakest[1],
+                'moves':           wild_moves,
+                'delta_checks':    consider_delta_checks,
+                'delta_counters':  consider_delta_counters,
             }))
         elif wild_ai > 0:
             self._signals.rec_ready.emit((slot, {
@@ -1311,11 +1322,18 @@ class OverlayPanel(QWidget):
 
         if kind == 'catch':
             ai        = rec['candidate_ai']
+            d_checks   = rec.get('delta_checks', 0)
+            d_counters = rec.get('delta_counters', 0)
             move_line = _moves_html(rec.get('moves', []), contributing)
+            cov_line = (
+                f"<span style='font-size:14px; color:#cba6f7'>+{d_checks} checks</span>"
+                f"&nbsp;&nbsp;<span style='font-size:14px; color:#a6e3a1'>+{d_counters} counters</span><br>"
+            ) if (d_checks or d_counters) else ""
             html = (
                 f"<span style='font-size:22px; font-weight:bold; color:#89dceb'>"
                 f"Catch {rec['name']}!</span>"
                 f"<span style='font-size:14px; color:#89dceb'>&nbsp;ai{ai}</span><br>"
+                f"{cov_line}"
                 f"{move_line}"
             )
             lbl.setStyleSheet(
@@ -1327,21 +1345,37 @@ class OverlayPanel(QWidget):
             if pulse: pulse.start()
 
         elif kind == 'replace':
-            old_ai    = rec.get('replaced_ai', 0)
-            new_ai    = rec.get('candidate_ai', 0)
-            pi_delta  = rec.get('pi_delta', 0.0)
-            ti_delta  = rec.get('ti_delta', 0.0)
-            ti_color  = "#a6e3a1" if ti_delta >= 0 else "#f38ba8"
-            border_col = "#52f07a" if ti_delta >= 0 else "#a6e3a1"
-            bg_col     = "#0c1c10" if ti_delta >= 0 else "#0a1810"
-            move_line  = _moves_html(rec.get('moves', []), contributing)
-            pi_str = f"+pi{int(pi_delta):,}" if pi_delta >= 0 else f"-pi{int(-pi_delta):,}"
-            ti_str = f"+ti{int(ti_delta):,}" if ti_delta >= 0 else f"-ti{int(-ti_delta):,}"
+            old_ai      = rec.get('replaced_ai', 0)
+            new_ai      = rec.get('candidate_ai', 0)
+            d_checks    = rec.get('delta_checks', 0)
+            d_counters  = rec.get('delta_counters', 0)
+            newly_cov   = rec.get('newly_covered', []) or []
+            newly_lost  = rec.get('newly_lost', []) or []
+            positive    = d_checks > 0 or (d_checks == 0 and d_counters > 0)
+            border_col  = "#52f07a" if positive else "#a6e3a1"
+            bg_col      = "#0c1c10" if positive else "#0a1810"
+            move_line   = _moves_html(rec.get('moves', []), contributing)
+            sign_ch = "+" if d_checks   >= 0 else "-"
+            sign_co = "+" if d_counters >= 0 else "-"
+            color_ch = "#a6e3a1" if d_checks   >= 0 else "#f38ba8"
+            color_co = "#a6e3a1" if d_counters >= 0 else "#f38ba8"
+            fills = ", ".join(n.replace('-', ' ').title() for n in newly_cov[:3])
+            loses = ", ".join(n.replace('-', ' ').title() for n in newly_lost[:3])
+            fills_line = (
+                f"<span style='font-size:12px; color:#a6adc8'>Fills: {fills}"
+                f"{'…' if len(newly_cov) > 3 else ''}</span><br>"
+            ) if fills else ""
+            loses_line = (
+                f"<span style='font-size:12px; color:#f38ba8'>Loses: {loses}"
+                f"{'…' if len(newly_lost) > 3 else ''}</span><br>"
+            ) if loses else ""
             html = (
                 f"<span style='font-size:20px; font-weight:bold; color:#a6e3a1'>"
                 f"Replace {rec['name']}</span><br>"
-                f"<span style='font-size:15px; color:#cba6f7'>{pi_str}</span><br>"
-                f"<span style='font-size:15px; color:{ti_color}'>{ti_str}</span><br>"
+                f"<span style='font-size:18px; color:{color_ch}'>{sign_ch}{abs(d_checks)} checks</span>"
+                f"&nbsp;&nbsp;<span style='font-size:15px; color:{color_co}'>"
+                f"{sign_co}{abs(d_counters)} counters</span><br>"
+                f"{fills_line}{loses_line}"
                 f"<span style='font-size:13px; color:#6c7086'>"
                 f"ai{old_ai} → ai{new_ai}</span><br>"
                 f"<br>{move_line}"
@@ -1355,14 +1389,15 @@ class OverlayPanel(QWidget):
             if pulse: pulse.start()
 
         elif kind == 'consider':
-            cand_ai   = rec['candidate_ai']
-            weak_name = rec['weakest_name']
-            weak_ai   = rec['weakest_ai']
-            pi_delta  = rec.get('pi_delta', 0.0)
-            ti_delta  = rec.get('ti_delta', 0.0)
-            ti_color  = "#a6e3a1" if ti_delta >= 0 else "#f38ba8"
-            pi_str    = f"+pi{int(pi_delta):,}" if pi_delta >= 0 else f"-pi{int(-pi_delta):,}"
-            ti_str    = f"+ti{int(ti_delta):,}" if ti_delta >= 0 else f"-ti{int(-ti_delta):,}"
+            cand_ai     = rec['candidate_ai']
+            weak_name   = rec['weakest_name']
+            weak_ai     = rec['weakest_ai']
+            d_checks    = rec.get('delta_checks', 0)
+            d_counters  = rec.get('delta_counters', 0)
+            sign_ch = "+" if d_checks   >= 0 else "-"
+            sign_co = "+" if d_counters >= 0 else "-"
+            color_ch = "#a6e3a1" if d_checks   >= 0 else "#f38ba8"
+            color_co = "#a6e3a1" if d_counters >= 0 else "#f38ba8"
             move_line = _moves_html(rec.get('moves', []))
             html = (
                 f"<span style='font-size:20px; font-weight:bold; color:#f9e2af'>"
@@ -1370,8 +1405,9 @@ class OverlayPanel(QWidget):
                 f"<span style='font-size:13px; color:#f9e2af'>&nbsp;ai{cand_ai}</span><br>"
                 f"<span style='font-size:13px; color:#a09070'>"
                 f"Beats {weak_name} (ai{weak_ai})</span><br>"
-                f"<span style='font-size:15px; color:#cba6f7'>{pi_str}</span><br>"
-                f"<span style='font-size:15px; color:{ti_color}'>{ti_str}</span><br>"
+                f"<span style='font-size:15px; color:{color_ch}'>{sign_ch}{abs(d_checks)} checks</span>"
+                f"&nbsp;&nbsp;<span style='font-size:15px; color:{color_co}'>"
+                f"{sign_co}{abs(d_counters)} counters</span><br>"
                 f"<br>{move_line}"
             )
             lbl.setStyleSheet(

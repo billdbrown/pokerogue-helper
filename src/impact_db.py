@@ -28,7 +28,7 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 42
+CACHE_VERSION  = 43
 
 # Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
 _EXCLUDED_FORMS: frozenset[str] = frozenset({
@@ -139,6 +139,8 @@ _IMMUNE_CAP: int = 50          # hits-to-KO cap for immune matchups in bulk scor
 
 _move_adoptions_all:   dict[str, int] = {}  # move_name → # forms that selected it (all mode)
 _move_adoptions_clean: dict[str, int] = {}  # same, clean mode (no recoil/self-reducing)
+
+_target_order_list: list[str] = []  # opponent pool order — each entry's outcomes_vec aligns to this
 
 
 def _is_self_reducing(effect: str) -> bool:
@@ -1121,6 +1123,223 @@ def best_swap_pi(
     }
 
 
+# ── Coverage (checks / counters) ──────────────────────────────────────────────
+#
+# Outcome chars in the per-pokemon outcomes_vec string (length = pool size):
+#   'Z' = ZDW (counter — won without taking damage)
+#   'W' = DW  (check — won but took damage)
+#   'L' = DL  (loss — dealt damage but couldn't KO first)
+#   'l' = ZDL (loss — never dealt damage)
+#   '-' = draw / unscoreable
+#
+# A team checks an opponent if at least one member's char is Z or W.
+# A team counters an opponent if at least one member's char is Z.
+
+_CHECK_CHARS = frozenset({'Z', 'W'})
+_COUNTER_CHARS = frozenset({'Z'})
+
+
+def _team_outcomes_vectors(team_names: list[str]) -> tuple[list[str], list[str]]:
+    """Resolve each team member to its projected (final-evo) outcomes_vec.
+
+    Returns (projected_names, vectors) — same length as team_names. Missing or
+    empty entries map to "" vectors so position indexing matches the team.
+    """
+    projected: list[str] = []
+    vectors:   list[str] = []
+    for name in team_names:
+        n = (name or "").lower()
+        if not n:
+            projected.append("")
+            vectors.append("")
+            continue
+        final = _final_evo_for(n)
+        with _lock:
+            entry = _db_noegg.get(final)
+        projected.append(final)
+        vectors.append(entry.get("outcomes_vec", "") if entry else "")
+    return projected, vectors
+
+
+def team_coverage(team_names: list[str]) -> dict:
+    """Team checks/counters coverage against the impact opponent pool.
+
+    Each member is resolved to its projected (final-evo) form before lookup.
+    The opponent pool is the same non-legendary, non-paradox set used by
+    `_compute_battle_score` during the cache build.
+
+    Returns:
+      checks:     int — opponents the team has at least one check (W or Z) against
+      counters:   int — opponents the team has at least one counter (Z) against
+      uncovered:  list[str] — opponent form names with no team check
+      pool_size:  int
+      per_member: list[dict] parallel to team_names; each entry:
+                  {name, projected_name, checks, counters,
+                   unique_checks, unique_counters}
+                  unique_* = opponents only this member checks/counters
+                  (i.e. removing the member loses that coverage tier)
+    """
+    if not _ready or not _target_order_list:
+        return {"checks": 0, "counters": 0, "uncovered": [],
+                "pool_size": 0, "per_member": []}
+
+    projected, vectors = _team_outcomes_vectors(team_names)
+    n = len(_target_order_list)
+
+    checks = counters = 0
+    uncovered: list[str] = []
+    per_member = [
+        {"name": team_names[i] or "", "projected_name": projected[i],
+         "checks": 0, "counters": 0,
+         "unique_checks": 0, "unique_counters": 0}
+        for i in range(len(team_names))
+    ]
+
+    for i in range(n):
+        check_members:   list[int] = []
+        counter_members: list[int] = []
+        for m_idx, v in enumerate(vectors):
+            if i >= len(v):
+                continue
+            c = v[i]
+            if c == 'Z':
+                check_members.append(m_idx)
+                counter_members.append(m_idx)
+                per_member[m_idx]["checks"]   += 1
+                per_member[m_idx]["counters"] += 1
+            elif c == 'W':
+                check_members.append(m_idx)
+                per_member[m_idx]["checks"] += 1
+
+        if check_members:
+            checks += 1
+        else:
+            uncovered.append(_target_order_list[i])
+        if counter_members:
+            counters += 1
+        if len(check_members) == 1:
+            per_member[check_members[0]]["unique_checks"] += 1
+        if len(counter_members) == 1:
+            per_member[counter_members[0]]["unique_counters"] += 1
+
+    return {
+        "checks":     checks,
+        "counters":   counters,
+        "uncovered":  uncovered,
+        "pool_size":  n,
+        "per_member": per_member,
+    }
+
+
+def swap_coverage_delta(
+    team_names: list[str], slot_to_replace: int, candidate_name: str
+) -> dict:
+    """Coverage change if candidate_name replaces team_names[slot_to_replace].
+
+    Returns:
+      delta_checks, delta_counters:        signed ints
+      new_total_checks, new_total_counters: post-swap absolute totals
+      newly_covered:    list[str] — opponents now checked that weren't before
+      newly_lost:       list[str] — opponents no longer checked
+      newly_countered:  list[str] — opponents now countered (Z) that weren't before
+      lost_counters:    list[str] — opponents no longer countered (may still be checked)
+    """
+    empty = {"delta_checks": 0, "delta_counters": 0,
+             "new_total_checks": 0, "new_total_counters": 0,
+             "newly_covered": [], "newly_lost": [],
+             "newly_countered": [], "lost_counters": []}
+    if not _ready or not _target_order_list:
+        return empty
+    if slot_to_replace < 0 or slot_to_replace >= len(team_names):
+        return empty
+
+    new_team = list(team_names)
+    new_team[slot_to_replace] = candidate_name
+
+    _, old_vecs = _team_outcomes_vectors(team_names)
+    _, new_vecs = _team_outcomes_vectors(new_team)
+
+    def best(vectors: list[str], i: int) -> str:
+        b = ''
+        for v in vectors:
+            if i >= len(v):
+                continue
+            c = v[i]
+            if c == 'Z':
+                return 'Z'
+            if c == 'W':
+                b = 'W'
+            elif not b and c in ('L', 'l', '-'):
+                b = c
+        return b
+
+    new_total_checks = new_total_counters = 0
+    old_total_checks = old_total_counters = 0
+    newly_covered:   list[str] = []
+    newly_lost:      list[str] = []
+    newly_countered: list[str] = []
+    lost_counters:   list[str] = []
+
+    for i in range(len(_target_order_list)):
+        o = best(old_vecs, i)
+        n = best(new_vecs, i)
+        if o in _CHECK_CHARS:
+            old_total_checks += 1
+        if o in _COUNTER_CHARS:
+            old_total_counters += 1
+        if n in _CHECK_CHARS:
+            new_total_checks += 1
+        if n in _COUNTER_CHARS:
+            new_total_counters += 1
+        if n in _CHECK_CHARS and o not in _CHECK_CHARS:
+            newly_covered.append(_target_order_list[i])
+        elif o in _CHECK_CHARS and n not in _CHECK_CHARS:
+            newly_lost.append(_target_order_list[i])
+        if n in _COUNTER_CHARS and o not in _COUNTER_CHARS:
+            newly_countered.append(_target_order_list[i])
+        elif o in _COUNTER_CHARS and n not in _COUNTER_CHARS:
+            lost_counters.append(_target_order_list[i])
+
+    return {
+        "delta_checks":      new_total_checks - old_total_checks,
+        "delta_counters":    new_total_counters - old_total_counters,
+        "new_total_checks":  new_total_checks,
+        "new_total_counters": new_total_counters,
+        "newly_covered":     newly_covered,
+        "newly_lost":        newly_lost,
+        "newly_countered":   newly_countered,
+        "lost_counters":     lost_counters,
+    }
+
+
+def best_coverage_swap(
+    team_names: list[str], candidate_name: str, require_positive: bool = True
+) -> dict | None:
+    """Find the team slot to replace with candidate_name that maximises Δchecks.
+
+    Tiebreak by Δcounters. Returns a dict with the swap_coverage_delta payload
+    plus 'slot' (the index to replace) and 'replaced_name', or None if no
+    candidate slot can be evaluated (or, when require_positive, no positive
+    Δchecks swap exists).
+    """
+    if not _ready or not _target_order_list:
+        return None
+    if not team_names:
+        return None
+
+    best: dict | None = None
+    best_key = (0, 0) if require_positive else (-(10 ** 9), -(10 ** 9))
+    for i, name in enumerate(team_names):
+        if not name:
+            continue
+        delta = swap_coverage_delta(team_names, i, candidate_name)
+        key = (delta["delta_checks"], delta["delta_counters"])
+        if key > best_key:
+            best_key = key
+            best = {**delta, "slot": i, "replaced_name": name}
+    return best
+
+
 def matchup_details(name: str) -> list[dict]:
     """Per-matchup battle detail for one Pokémon vs every non-legendary pool target.
 
@@ -1525,15 +1744,16 @@ def _compute_battle_score(
     targets: list[dict],
     eff_memo: dict,
     moves_override: list[dict] | None = None,
-) -> tuple[float, int, int, int, int, dict]:
+) -> tuple[float, int, int, int, int, dict, str]:
     """Σ (A_final_hp − B_final_hp + 1) / 2 across all target matchups.
 
-    Returns (total_score, zdw, dw, dl, zdl, move_usage) where:
+    Returns (total_score, zdw, dw, dl, zdl, move_usage, outcome_vec) where:
       ZDW = won without taking any damage
       DW  = won but took some damage en route
       DL  = hit B at least once but couldn't KO before B KO'd A
       ZDL = A never dealt any damage to B before being KO'd
       move_usage = {move_name: count} — how many targets each move was best against
+      outcome_vec = string of one char per target (Z=ZDW, W=DW, L=DL, l=ZDL, -=draw)
     attacker fields used: types, atk, sp_atk, speed, hp, defense, sp_def, moves, ability_used.
     target fields used:   types, atk, sp_atk, speed, hp, def, sp_def, moves.
     """
@@ -1567,6 +1787,7 @@ def _compute_battle_score(
     _EPS = 1e-9
     zdw = dw = dl = zdl = 0
     move_usage: dict[str, int] = {}
+    outcome_chars: list[str] = []
     total = 0.0
     for tgt in targets:
         analytic_mult = 1.3 if _analytic and a_speed < tgt["speed"] else 1.0
@@ -1641,16 +1862,21 @@ def _compute_battle_score(
         if b_final < _EPS:          # A wins (B KO'd)
             if a_final >= 1.0 - _EPS:
                 zdw += 1
+                outcome_chars.append('Z')
             else:
                 dw += 1
+                outcome_chars.append('W')
         elif a_final < _EPS:        # B wins (A KO'd)
             if b_final >= 1.0 - _EPS:
                 zdl += 1
+                outcome_chars.append('l')
             else:
                 dl += 1
-        # else: draw (0.5, 0.5) — both had no moves
+                outcome_chars.append('L')
+        else:                       # draw (0.5, 0.5) — both had no moves
+            outcome_chars.append('-')
 
-    return total, zdw, dw, dl, zdl, move_usage
+    return total, zdw, dw, dl, zdl, move_usage, ''.join(outcome_chars)
 
 
 def _is_legendary(species: str, form: str, legendary_set: set[str]) -> bool:
@@ -1806,7 +2032,7 @@ def _evo_finals(node: dict) -> list[str]:
 # ── cache build ───────────────────────────────────────────────────────────────
 
 def _build_or_load(on_progress, on_ready, include_egg: bool = False):
-    global _db_noegg, _db_egg, _ready, _ready_egg, _starters, _move_adoptions_all, _move_adoptions_clean
+    global _db_noegg, _db_egg, _ready, _ready_egg, _starters, _move_adoptions_all, _move_adoptions_clean, _target_order_list
 
     cache_file = CACHE_FILE_EGG if include_egg else CACHE_FILE
     label      = "egg" if include_egg else "standard"
@@ -1821,6 +2047,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 starters_raw    = data.pop("_starters", {})
                 adopt_all_raw   = data.pop("_adoptions_all",   {})
                 adopt_clean_raw = data.pop("_adoptions_clean", {})
+                target_order    = data.pop("_target_order", [])
                 data.pop("_pairing_def", None)  # compat: ignore old field if present
                 with _lock:
                     if include_egg:
@@ -1828,6 +2055,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                     else:
                         _db_noegg = data
                         _starters = {int(k): v for k, v in starters_raw.items()}
+                        _target_order_list[:] = target_order
                     _move_adoptions_all   = adopt_all_raw
                     _move_adoptions_clean = adopt_clean_raw
                 if not _EFF:
@@ -2191,6 +2419,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
 
     no_move_forms = sorted(form for form, entry in db.items() if not entry.get("moves"))
     filtered_targets = [tgt for tgt in targets_build if tgt.get("moves")]
+    target_order = [tgt["name"] for tgt in filtered_targets]
     _prog(on_progress,
           f"  {len(filtered_targets)} battle targets "
           f"({len(targets_build) - len(filtered_targets)} no-move forms excluded).")
@@ -2208,12 +2437,15 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             eff_memo,
             defender_abilities=def_abs,
         )
-        score, zdw, dw, dl, zdl, move_usage = _compute_battle_score(entry, filtered_targets, eff_memo)
-        entry["impact"]     = score
-        entry["outcomes"]   = {"zdw": zdw, "dw": dw, "dl": dl, "zdl": zdl}
-        entry["move_usage"] = move_usage
+        score, zdw, dw, dl, zdl, move_usage, outcome_vec = _compute_battle_score(
+            entry, filtered_targets, eff_memo
+        )
+        entry["impact"]       = score
+        entry["outcomes"]     = {"zdw": zdw, "dw": dw, "dl": dl, "zdl": zdl}
+        entry["outcomes_vec"] = outcome_vec
+        entry["move_usage"]   = move_usage
 
-        score_clean, _, _, _, _, _ = _compute_battle_score(
+        score_clean, *_ = _compute_battle_score(
             entry, filtered_targets, eff_memo,
             moves_override=entry.get("moves_clean", []),
         )
@@ -2342,10 +2574,11 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
     _prog(on_progress, f"Saving {label} impact cache…")
     with open(cache_file, "w") as f:
         json.dump({
-            "_version":        CACHE_VERSION,
-            "_starters":       _si,
+            "_version":         CACHE_VERSION,
+            "_starters":        _si,
             "_adoptions_all":   adoptions_all,
             "_adoptions_clean": adoptions_clean,
+            "_target_order":    target_order,
             **db,
         }, f)
 
@@ -2354,6 +2587,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             _db_egg = db
         else:
             _db_noegg = db
+            _target_order_list[:] = target_order
     if include_egg:
         _ready_egg = True
     else:

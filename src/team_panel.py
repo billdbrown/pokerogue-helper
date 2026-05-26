@@ -177,6 +177,8 @@ class TeamPanel(QWidget):
         self._last_active_position: int = 0
         self._potential_lbl: QLabel | None = None
         self._impact_lbl:    QLabel | None = None
+        self._uncovered_lbl: QLabel | None = None
+        self._unique_lbls: list[QLabel | None] = [None] * TEAM_SIZE
         self._last_potential: float = 0.0
         self._last_impact:    float = 0.0
         self._potential_pulse_timer: QTimer | None = None
@@ -263,7 +265,7 @@ class TeamPanel(QWidget):
         inner.addLayout(title_row)
 
         scores_row = QHBoxLayout()
-        pot_hdr = QLabel("Potential")
+        pot_hdr = QLabel("Checks")
         pot_hdr.setStyleSheet("color:#6c7086; font-size:14px;")
         self._potential_lbl = QLabel("—")
         self._potential_lbl.setStyleSheet("color:#cba6f7; font-size:39px; font-weight:bold;")
@@ -276,7 +278,7 @@ class TeamPanel(QWidget):
         scores_row.addSpacing(6)
         scores_row.addWidget(self._potential_delta_lbl)
         scores_row.addStretch()
-        imp_hdr = QLabel("Team Impact")
+        imp_hdr = QLabel("Counters")
         imp_hdr.setStyleSheet("color:#6c7086; font-size:14px;")
         self._impact_lbl = QLabel("—")
         self._impact_lbl.setStyleSheet("color:#a6e3a1; font-size:39px; font-weight:bold;")
@@ -289,6 +291,11 @@ class TeamPanel(QWidget):
         scores_row.addSpacing(4)
         scores_row.addWidget(imp_hdr)
         inner.addLayout(scores_row)
+
+        self._uncovered_lbl = QLabel("")
+        self._uncovered_lbl.setStyleSheet("color:#6c7086; font-size:11px;")
+        self._uncovered_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inner.addWidget(self._uncovered_lbl)
 
         inner.addWidget(self._divider())
 
@@ -363,7 +370,7 @@ class TeamPanel(QWidget):
 
         hdr_row = QHBoxLayout()
         hdr_row.setContentsMargins(0, 0, 0, 0)
-        pot_hdr_s = QLabel("Potential")
+        pot_hdr_s = QLabel("Checks")
         pot_hdr_s.setStyleSheet("color:#6c7086; font-size:14px;")
         self._potential_lbl = QLabel("—")
         self._potential_lbl.setStyleSheet("color:#cba6f7; font-size:33px; font-weight:bold;")
@@ -376,12 +383,12 @@ class TeamPanel(QWidget):
         hdr_row.addSpacing(4)
         hdr_row.addWidget(self._potential_delta_lbl)
         hdr_row.addStretch(1)
-        team_lbl = QLabel("Team")
-        team_lbl.setStyleSheet("color:#cdd6f4; font-size:13px; font-weight:bold;")
-        team_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hdr_row.addWidget(team_lbl)
+        self._uncovered_lbl = QLabel("")
+        self._uncovered_lbl.setStyleSheet("color:#6c7086; font-size:11px;")
+        self._uncovered_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hdr_row.addWidget(self._uncovered_lbl)
         hdr_row.addStretch(1)
-        imp_hdr_s = QLabel("Impact")
+        imp_hdr_s = QLabel("Counters")
         imp_hdr_s.setStyleSheet("color:#6c7086; font-size:14px;")
         self._impact_lbl = QLabel("—")
         self._impact_lbl.setStyleSheet("color:#a6e3a1; font-size:33px; font-weight:bold;")
@@ -807,8 +814,18 @@ class TeamPanel(QWidget):
         level_lbl.setVisible(False)
         self._level_lbls[slot] = level_lbl
 
+        unique_lbl = QLabel("")
+        unique_lbl.setStyleSheet(
+            "color:#f9e2af; font-size:9px; font-weight:bold;" if self._strip
+            else "color:#f9e2af; font-size:11px; font-weight:bold;"
+        )
+        unique_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        unique_lbl.setVisible(False)
+        self._unique_lbls[slot] = unique_lbl
+
         header.addWidget(type_container)
         header.addWidget(name_lbl, 1)
+        header.addWidget(unique_lbl)
         header.addWidget(level_lbl)
         layout.addLayout(header)
 
@@ -1551,71 +1568,77 @@ class TeamPanel(QWidget):
                     lbl.setText("—")
             self._last_potential = 0.0
             self._last_impact = 0.0
+            self._update_uncovered_display([])
+            self._update_per_slot_unique([0] * TEAM_SIZE)
             return
 
-        # ── Team Impact (TI): live stats + actual equipped moves ──────────
-        best: dict = {}
-        for s in range(TEAM_SIZE):
-            pokemon = self._team_data[s]
-            if pokemon is None:
-                continue
-            live = self._live_stats[s]
-            atk    = live["atk"]    if live else pokemon.stats.get("attack", 0)
-            sp_atk = live["spa"]    if live else pokemon.stats.get("special-attack", 0)
-            entry     = impact_db.get(pokemon.name.lower())
-            speed_pct = entry.get("speed_pct", 50) if entry else 50
-            factor    = 1.0 if speed_pct >= 70 else 0.4 + 0.6 * (speed_pct / 70)
-            types     = pokemon.types
-            for move in self._team_moves[s]:
-                if move is None or not move.power or move.category == "status":
-                    continue
-                if move.name.lower() in impact_db._EXCLUDED_MOVES:
-                    continue
-                stat = atk if move.category == "physical" else sp_atk
-                stab = 1.5 if move.type in types else 1.0
-                acc  = (move.accuracy or 100) / 100.0
-                base = stat * move.power * acc * stab * factor
-                for pairing in impact_db.ALL_PAIRINGS:
-                    se = impact_db._EFF.get((move.type, pairing), 0.0)
-                    if se > 1.0:
-                        val = base * se
-                        if val > best.get(pairing, 0.0):
-                            best[pairing] = val
-        new_impact = sum(best.values())
+        # Projected team coverage — checks (W or Z) and counters (Z) against
+        # the impact opponent pool. Uses each member's final-evo + cached optimal moveset.
+        team_names = [p.name.lower() if p is not None else "" for p in self._team_data]
+        cov = impact_db.team_coverage(team_names)
+        new_checks   = float(cov["checks"])
+        new_counters = float(cov["counters"])
 
-        # ── Potential Impact (PI): final-evo BST + nature + cached learnset ─
-        pi_best: dict = {}
-        for s in range(TEAM_SIZE):
-            pokemon = self._team_data[s]
-            if pokemon is None:
-                continue
-            live      = self._live_stats[s]
-            nature_id = live.get("nature") if live else None
-            final_name = impact_db._final_evo_for(pokemon.name.lower())
-            for pairing, val in impact_db._pi_pairing_vector(final_name, nature_id).items():
-                if val > pi_best.get(pairing, 0.0):
-                    pi_best[pairing] = val
-        new_potential = sum(pi_best.values())
-
-        # ── Update Potential label ─────────────────────────────────────────
+        # Update the "Checks" label (formerly Potential — purple).
         if self._potential_lbl:
-            self._potential_lbl.setText(self._fmt_score(new_potential) if new_potential > 0 else "—")
-            if new_potential > self._last_potential + 1:
-                delta = new_potential - self._last_potential
+            self._potential_lbl.setText(self._fmt_score(new_checks) if new_checks > 0 else "—")
+            if new_checks > self._last_potential + 0.5:
+                delta = new_checks - self._last_potential
                 self._pulse_label(self._potential_lbl, "potential")
                 self._show_delta(self._potential_delta_lbl, delta, "potential",
                                  "#cba6f7")
-            self._last_potential = new_potential
+            self._last_potential = new_checks
 
-        # ── Update Impact label ────────────────────────────────────────────
+        # Update the "Counters" label (formerly Team Impact — green).
         if self._impact_lbl:
-            self._impact_lbl.setText(self._fmt_score(new_impact) if new_impact > 0 else "—")
-            if new_impact > self._last_impact + 1:
-                delta = new_impact - self._last_impact
+            self._impact_lbl.setText(self._fmt_score(new_counters) if new_counters > 0 else "—")
+            if new_counters > self._last_impact + 0.5:
+                delta = new_counters - self._last_impact
                 self._pulse_label(self._impact_lbl, "impact")
                 self._show_delta(self._impact_delta_lbl, delta, "impact",
                                  "#a6e3a1")
-            self._last_impact = new_impact
+            self._last_impact = new_counters
+
+        self._update_uncovered_display(cov["uncovered"])
+        self._update_per_slot_unique([m["unique_checks"] for m in cov["per_member"]])
+
+    def _update_uncovered_display(self, uncovered: list[str]) -> None:
+        """Refresh the 'Uncovered: N' label and its tooltip listing the species."""
+        lbl = getattr(self, "_uncovered_lbl", None)
+        if lbl is None:
+            return
+        n = len(uncovered)
+        if n == 0:
+            lbl.setText("All opponents checked")
+            lbl.setStyleSheet("color:#a6e3a1; font-size:11px;")
+            lbl.setToolTip("")
+        else:
+            lbl.setText(f"Uncovered: {n}")
+            lbl.setStyleSheet("color:#f38ba8; font-size:11px;")
+            # Show top names in tooltip — truncate to keep it manageable.
+            preview = uncovered[:60]
+            more = f"\n… and {n - len(preview)} more" if n > len(preview) else ""
+            pretty = "\n".join(
+                name.replace("-", " ").title() for name in preview
+            )
+            lbl.setToolTip(pretty + more)
+
+    def _update_per_slot_unique(self, unique_checks_by_slot: list[int]) -> None:
+        """Per-slot 'carries N' badge — visible when this slot is the sole checker for N opponents."""
+        for s in range(TEAM_SIZE):
+            lbl = self._unique_lbls[s] if s < len(self._unique_lbls) else None
+            if lbl is None:
+                continue
+            n = unique_checks_by_slot[s] if s < len(unique_checks_by_slot) else 0
+            if n > 0 and self._team_data[s] is not None:
+                lbl.setText(f"carries {n}")
+                lbl.setToolTip(
+                    f"This slot uniquely checks {n} opponent(s) — "
+                    "removing it would un-cover them."
+                )
+                lbl.setVisible(True)
+            else:
+                lbl.setVisible(False)
 
     def _show_delta(self, lbl: QLabel | None, delta: float, which: str, color: str):
         """Show '+N' delta label for 3 seconds then hide it."""
