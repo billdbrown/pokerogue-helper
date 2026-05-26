@@ -128,14 +128,14 @@ def _bulbapedia_url(name: str, display: str) -> str:
 _OUTCOME_RANK: dict[str, int] = {"ZDW": 0, "DW": 1, "DL": 2, "ZDL": 3, "Draw": 4}
 
 
-def _type_tag_html(t: str) -> str:
+def _type_tag_html(t: str, font_size: int = 10) -> str:
     bg, fg = TYPE_COLORS.get(t, ("#888", "#fff"))
     return (f'<span style="background:{bg}; color:{fg}; border-radius:2px; '
-            f'padding:1px 3px; font-size:10px; font-weight:bold;">{t[:4].upper()}</span>')
+            f'padding:1px 4px; font-size:{font_size}px; font-weight:bold;"> {t[:4].upper()} </span>')
 
 
-def _types_html(types: list[str]) -> str:
-    return " ".join(_type_tag_html(t) for t in types)
+def _types_html(types: list[str], font_size: int = 10) -> str:
+    return " ".join(_type_tag_html(t, font_size) for t in types)
 
 
 def _poke_html(name: str) -> str:
@@ -143,7 +143,7 @@ def _poke_html(name: str) -> str:
 
 
 def _move_html(move_name: str, move_type: str) -> str:
-    tag  = _type_tag_html(move_type) + " " if move_type else ""
+    tag  = _type_tag_html(move_type, 10) + " " if move_type else ""
     text = f'<span style="color:#cdd6f4;">{move_name.replace("-", " ").title()}</span>'
     return tag + text
 
@@ -287,7 +287,7 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
     "intrepid-sword": {"status": "modeled", "category": "Offensive",
                        "sim_desc": "Physical moves deal ×1.5 damage (Atk +1 on entry)."},
     "normalize":      {"status": "modeled", "category": "Type Remap",
-                       "sim_desc": "All moves become Normal-type with ×1.2 power boost; STAB re-evaluated on Normal."},
+                       "sim_desc": "All moves become Normal-type with ×1.2 power boost; STAB re-evaluated on Normal. Moveset fills remaining slots with highest-power moves when SE coverage is zero."},
     "download":      {"status": "modeled", "category": "Offensive",
                       "sim_desc": "Atk or SpA +1 (×1.5) per matchup: Atk if target's Def < SpDef, SpA otherwise."},
     "libero":        {"status": "modeled", "category": "Offensive",
@@ -407,9 +407,9 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                "sim_desc": "Survives any OHKO at full HP — requires multi-hit sim rework."},
     # ── Modeled: Weather / Terrain setters ───────────────────────────────────
     "drizzle":        {"status": "modeled", "category": "Weather",
-                       "sim_desc": "Rain: Water ×1.5, Fire ×0.5 for both sides (Pelipper, Politoed, Kyogre)."},
+                       "sim_desc": "Rain: Water ×1.5, Fire ×0.5 both sides; Hurricane/Thunder → 100% acc (Pelipper, Politoed, Kyogre)."},
     "primordial-sea": {"status": "modeled", "category": "Weather",
-                       "sim_desc": "Extreme Rain: Water ×1.5 both sides; Fire moves fail (Primal Kyogre)."},
+                       "sim_desc": "Extreme Rain: Water ×1.5 both sides; Fire fails; Hurricane/Thunder → 100% acc (Primal Kyogre)."},
     "drought":        {"status": "modeled", "category": "Weather",
                        "sim_desc": "Sun: Fire ×1.5, Water ×0.5 for both sides (Ninetales, Torkoal, Exeggutor-Alola, Groudon)."},
     "desolate-land":  {"status": "modeled", "category": "Weather",
@@ -690,12 +690,8 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                        "sim_desc": "Boosts highest stat on Electric Terrain — no terrain mechanic."},
     "forecast":       {"status": "deferred", "category": "Weather",
                        "sim_desc": "Castform changes type with weather — no weather mechanic."},
-    "drizzle":        {"status": "deferred", "category": "Weather",
-                       "sim_desc": "Summons rain on entry — no weather mechanic."},
     "sand-spit":      {"status": "deferred", "category": "Weather",
                        "sim_desc": "Summons sandstorm when hit — no weather mechanic."},
-    "psychic-surge":  {"status": "deferred", "category": "Weather",
-                       "sim_desc": "Sets Psychic Terrain — no terrain mechanic."},
     "immunity":       {"status": "deferred", "category": "Status",
                        "sim_desc": "Prevents poison — no status mechanic."},
     "magma-armor":    {"status": "deferred", "category": "Status",
@@ -812,20 +808,12 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                          "sim_desc": "Def raised on Grassy Terrain — no terrain mechanic."},
     "air-lock":         {"status": "deferred", "category": "Weather",
                          "sim_desc": "Suppresses all weather effects — no weather mechanic."},
-    "primordial-sea":   {"status": "deferred", "category": "Weather",
-                         "sim_desc": "Summons extremely heavy rain — no weather mechanic."},
-    "desolate-land":    {"status": "deferred", "category": "Weather",
-                         "sim_desc": "Summons extremely harsh sun — no weather mechanic."},
     "delta-stream":     {"status": "deferred", "category": "Weather",
                          "sim_desc": "Summons strong winds — no weather mechanic."},
     "surge-surfer":     {"status": "deferred", "category": "Weather",
                          "sim_desc": "Speed ×2 on Electric Terrain — no terrain mechanic."},
     "mimicry":          {"status": "deferred", "category": "Weather",
                          "sim_desc": "Changes type based on active terrain — no terrain mechanic."},
-    "electric-surge":   {"status": "deferred", "category": "Weather",
-                       "sim_desc": "Sets Electric Terrain on entry — no terrain mechanic."},
-    "misty-surge":    {"status": "deferred", "category": "Weather",
-                       "sim_desc": "Sets Misty Terrain on entry — no terrain mechanic."},
     "wind-power":     {"status": "deferred", "category": "Weather",
                        "sim_desc": "Becomes Charged when hit by wind moves — no terrain/field mechanic."},
     "cloud-nine":     {"status": "deferred", "category": "Weather",
@@ -834,10 +822,6 @@ _ABILITY_SIM_INFO: dict[str, dict] = {
                        "sim_desc": "Speed ×2 in snow/hail — no weather mechanic."},
     "sand-stream":    {"status": "deferred", "category": "Weather",
                        "sim_desc": "Summons sandstorm on entry — no weather mechanic."},
-    "drought":        {"status": "deferred", "category": "Weather",
-                       "sim_desc": "Summons harsh sun on entry — no weather mechanic."},
-    "grassy-surge":   {"status": "deferred", "category": "Weather",
-                       "sim_desc": "Sets Grassy Terrain on entry — no terrain mechanic."},
     "orichalcum-pulse": {"status": "deferred", "category": "Weather",
                          "sim_desc": "Summons harsh sun + Atk boost in sun — no weather mechanic."},
     "corrosion":      {"status": "deferred", "category": "Status",
@@ -1012,17 +996,20 @@ class ImpactTableDialog(QDialog):
         top.addSpacing(10)
         top.addWidget(_sep())
         top.addSpacing(6)
-        top.addWidget(_group_label("FILTER"))
+        top.addWidget(_group_label("SHOW"))
         top.addSpacing(6)
-        self._hide_leg = QCheckBox("Legendaries")
-        self._hide_leg.toggled.connect(self._apply_filter)
-        top.addWidget(self._hide_leg)
-        self._hide_paradox = QCheckBox("Paradox")
-        self._hide_paradox.toggled.connect(self._apply_filter)
-        top.addWidget(self._hide_paradox)
-        self._only_starters = QCheckBox("Starters only")
-        self._only_starters.toggled.connect(self._apply_filter)
-        top.addWidget(self._only_starters)
+        for attr, label in (
+            ("_show_common",   "Common"),
+            ("_show_starters", "Starters"),
+            ("_show_paradox",  "Paradox"),
+            ("_show_mega",     "Megas"),
+            ("_show_leg",      "Legendaries"),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(self._apply_filter)
+            setattr(self, attr, cb)
+            top.addWidget(cb)
 
         top.addSpacing(10)
         top.addWidget(_sep())
@@ -1361,18 +1348,33 @@ class ImpactTableDialog(QDialog):
 
     def _apply_filter(self):
         q = self._search.text().strip().lower()
-        hide_leg      = self._hide_leg.isChecked()
-        hide_paradox  = self._hide_paradox.isChecked()
-        only_starters = self._only_starters.isChecked()
-        is_filtered   = bool(q or hide_leg or hide_paradox or only_starters)
+        show_common   = self._show_common.isChecked()
+        show_starters = self._show_starters.isChecked()
+        show_paradox  = self._show_paradox.isChecked()
+        show_mega     = self._show_mega.isChecked()
+        show_leg      = self._show_leg.isChecked()
+        all_shown     = show_common and show_starters and show_paradox and show_mega and show_leg
+        is_filtered   = bool(q or not all_shown)
         self._table.setColumnHidden(1, not is_filtered)
-        rows = [
-            r for r in self._all_rows
-            if (not q or q in r["name"])
-            and (not hide_leg or not r["legendary"])
-            and (not hide_paradox or not r["paradox"])
-            and (not only_starters or r["starter"])
-        ]
+
+        def _visible(r: dict) -> bool:
+            is_leg     = bool(r.get("legendary"))
+            is_paradox = bool(r.get("paradox"))
+            is_mega    = "-mega" in r["name"]
+            is_starter = bool(r.get("starter"))
+            is_common  = not is_leg and not is_paradox and not is_mega and not is_starter
+            return (
+                (not q or q in r["name"])
+                and (
+                    (show_common   and is_common)
+                    or (show_starters and is_starter)
+                    or (show_paradox  and is_paradox)
+                    or (show_mega     and is_mega)
+                    or (show_leg      and is_leg)
+                )
+            )
+
+        rows = [r for r in self._all_rows if _visible(r)]
         if self._sort_col in _SORTABLE:
             field, asc_default = _SORTABLE[self._sort_col]
             rows.sort(key=lambda r: r[field], reverse=not self._sort_asc)
@@ -1892,7 +1894,7 @@ class ImpactTableDialog(QDialog):
         self._matchups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._matchups_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._matchups_table.verticalHeader().setVisible(False)
-        self._matchups_table.verticalHeader().setDefaultSectionSize(32)
+        self._matchups_table.verticalHeader().setDefaultSectionSize(40)
         self._matchups_table.setWordWrap(False)
 
         hdr = self._matchups_table.horizontalHeader()
@@ -1980,7 +1982,7 @@ class ImpactTableDialog(QDialog):
             lbl  = QLabel(html)
             lbl.setTextFormat(Qt.TextFormat.RichText)
             lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            lbl.setStyleSheet("background: transparent; padding-left: 6px;")
+            lbl.setStyleSheet("background: transparent; padding-left: 6px; color: #cdd6f4; font-size: 12px;")
             t.setCellWidget(i, 1, lbl)
 
         all_rows = self._matchup_all_rows

@@ -28,12 +28,17 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 36
+CACHE_VERSION  = 42
 
 # Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
 _EXCLUDED_FORMS: frozenset[str] = frozenset({
     "greninja-ash",         # Battle Bond — mechanic not present in Pokerogue
     "greninja-battle-bond", # alternate PokéAPI slug for the same form
+    "magearna-original-mega",  # keep only magearna-mega
+    "ditto",                # only Transform — no scoreable moves
+    "smeargle",             # only Sketch — no scoreable moves
+    "wobbuffet",            # Counter/Mirror Coat have null power in PokéAPI
+    "pyukumuku",            # only Bide/Purify — no fixed-power offensive moves
 })
 
 
@@ -42,6 +47,10 @@ def _is_excluded_form(form: str) -> bool:
     if form in _EXCLUDED_FORMS:
         return True
     if "-totem" in form:      # totem variants (incl. raticate-totem-alola)
+        return True
+    if "-gmax" in form:       # Gigantamax: cosmetic-only, same moveset as base form
+        return True
+    if form == "unown" or form.startswith("unown-"):  # 28 forms, all only know Hidden Power (null power)
         return True
     # Alternate ride/battle builds — same base stats, just mechanical variants.
     # Keep base koraidon / miraidon; drop everything else.
@@ -85,6 +94,18 @@ _POKEROGUE_EGG_MOVES_URL = (
     "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
     "/src/data/balance/moves/egg-moves.ts"
 )
+_POKEROGUE_SPECIES_URL = (
+    "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
+    "/src/data/balance/pokemon-species.ts"
+)
+
+# SpeciesFormKey enum → URL slug used in PokéAPI / our cache keys
+_FORM_KEY_MAP: dict[str, str] = {
+    "MEGA":   "mega",
+    "MEGA_X": "mega-x",
+    "MEGA_Y": "mega-y",
+    "MEGA_Z": "mega-z",
+}
 
 # Evolutions that don't work in Pokerogue despite PokéAPI saying they should.
 # Maps Pokerogue starter slug → cache key of the actual final form to use.
@@ -157,10 +178,13 @@ _RECKLESS_MOVES: frozenset[str] = frozenset({
 })
 
 _SOUNDPROOF_MOVES: frozenset[str] = frozenset({
-    "boomburst", "bug-buzz", "chatter", "clanging-scales", "clangorous-soul",
-    "disarming-voice", "echoed-voice", "hyper-voice", "metal-sound", "noble-roar",
-    "parting-shot", "perish-song", "relic-song", "round", "screech", "sing",
-    "snarl", "sparkling-aria", "supersonic", "uproar",
+    "alluring-voice", "boomburst", "bug-buzz", "chatter", "clanging-scales",
+    "clangorous-soul", "clangorous-soulblaze", "confide", "disarming-voice",
+    "echoed-voice", "eerie-spell", "grass-whistle", "growl", "heal-bell",
+    "howl", "hyper-voice", "metal-sound", "noble-roar", "overdrive",
+    "parting-shot", "perish-song", "psychic-noise", "relic-song", "roar",
+    "round", "screech", "sing", "snarl", "snore", "sparkling-aria",
+    "supersonic", "torch-song", "uproar",
 })
 
 _BULLETPROOF_MOVES: frozenset[str] = frozenset({
@@ -299,9 +323,11 @@ ABILITY_EFFECTS: dict[str, dict] = {
     "prism-armor":     {"filter_se": 0.75},
     # ── Weather setters (both sides feel the weather) ─────────────────────────
     "drizzle":        {"off": [("water", None, 1.5), ("fire",  None, 0.5)],
-                       "def": [("water", None, 1.5), ("fire",  None, 0.5)]},
+                       "def": [("water", None, 1.5), ("fire",  None, 0.5)],
+                       "move_acc_override": {"hurricane": 100, "thunder": 100}},
     "primordial-sea": {"off": [("water", None, 1.5), ("fire",  None, 0.0)],
-                       "def": [("water", None, 1.5), ("fire",  None, 0.0)]},
+                       "def": [("water", None, 1.5), ("fire",  None, 0.0)],
+                       "move_acc_override": {"hurricane": 100, "thunder": 100}},
     "drought":        {"off": [("fire",  None, 1.5), ("water", None, 0.5)],
                        "def": [("fire",  None, 1.5), ("water", None, 0.5)]},
     "desolate-land":  {"off": [("fire",  None, 1.5), ("water", None, 0.0)],
@@ -436,6 +462,15 @@ def _acc_mult(abilities: list[str]) -> float:
         if m:
             return m
     return 1.0
+
+
+def _move_acc_overrides(abilities: list[str]) -> dict[str, int]:
+    """Return move slug → forced accuracy from weather/ability effects (e.g. Hurricane→100 in rain)."""
+    result: dict[str, int] = {}
+    for ab in abilities:
+        for slug, acc in ABILITY_EFFECTS.get(ab, {}).get("move_acc_override", {}).items():
+            result[slug] = acc
+    return result
 
 
 def _def_mult(abilities: list[str], move_type: str, category: str,
@@ -875,13 +910,14 @@ def pairing_vector(name: str) -> dict[tuple, float]:
     abs_         = [ab for ab in (entry.get("ability_used"), entry.get("passive_ability")) if ab]
     stab_base    = _stab_mult(abs_)
     acc_m        = _acc_mult(abs_)
+    acc_ovr      = _move_acc_overrides(abs_)
     has_no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in abs_)
     has_protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in abs_)
     has_skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in abs_)
     result: dict[tuple, float] = {}
     for m in entry.get("moves", []):
         mtype    = m.get("type", "")
-        raw_acc  = m.get("accuracy") or 0
+        raw_acc  = acc_ovr.get(m.get("name", ""), m.get("accuracy") or 0)
         category = m.get("category", "special")
         power    = m.get("power_max", m.get("power") or 0) if has_skill_lk else (m.get("power") or 0)
         if not power:
@@ -1124,6 +1160,7 @@ def matchup_details(name: str) -> list[dict]:
     _charge_elec   = max((ABILITY_EFFECTS.get(ab, {}).get("charge_electric", 1.0) for ab in a_abs), default=1.0)
     _wonder_guard  = any(ABILITY_EFFECTS.get(ab, {}).get("wonder_guard")   for ab in a_abs)
     _acc_m         = _acc_mult(a_abs)
+    _acc_ovr       = _move_acc_overrides(a_abs)
 
     eff_memo: dict = {}
     _EPS = 1e-9
@@ -1163,7 +1200,7 @@ def matchup_details(name: str) -> list[dict]:
             if eff > 0:
                 stat = a_atk if cat == "physical" else a_sp_atk
                 stab = _stab_mult(a_abs) if (_protean or etype in a_types) else 1.0
-                raw_acc = m["accuracy"] or 0
+                raw_acc = _acc_ovr.get(m.get("name", ""), m["accuracy"] or 0)
                 acc = 1.0 if _no_guard else (min(raw_acc * _acc_m, 100) if raw_acc else 100) / 100.0
                 pwr     = m.get("power_max", m["power"]) if _skill_lk else m["power"]
                 dl_mult = dl_phys_mult if cat == "physical" else dl_spec_mult
@@ -1320,19 +1357,21 @@ def _compute_score(
 
     _abs      = abilities or []
     _acc_m    = _acc_mult(_abs)
+    _acc_ovr  = _move_acc_overrides(_abs)
     _no_guard = any(ABILITY_EFFECTS.get(ab, {}).get("no_guard")   for ab in _abs)
     _protean  = any(ABILITY_EFFECTS.get(ab, {}).get("protean")    for ab in _abs)
     _skill_lk = any(ABILITY_EFFECTS.get(ab, {}).get("skill_link") for ab in _abs)
     _download = any(ABILITY_EFFECTS.get(ab, {}).get("download")   for ab in _abs)
     _off_se   = max((ABILITY_EFFECTS.get(ab, {}).get("off_se", 1.0) for ab in _abs), default=1.0)
-    move_pv: list[tuple[dict, dict[int, float]]] = []
+    # (move, se_pv, base_power) — se_pv empty means no SE targets for this move
+    move_pv: list[tuple[dict, dict[int, float], float]] = []
     for m in damaging:
         mtype = m["type"]
         cat   = m["category"]
         etype, ab_mult = _off_effect(_abs, mtype, cat, m.get("name", ""), m.get("power") or 0)
         stat  = atk if cat == "physical" else sp_atk
         stab  = _stab_mult(_abs) if (_protean or etype in pokemon_types) else 1.0
-        raw_acc = m["accuracy"] or 0
+        raw_acc = _acc_ovr.get(m.get("name", ""), m["accuracy"] or 0)
         acc     = 1.0 if _no_guard else (min(raw_acc * _acc_m, 100) if raw_acc else 100) / 100.0
         pwr = float(m["power"] or 0)
         if m.get("recharge") or m.get("two_turn"):
@@ -1356,31 +1395,44 @@ def _compute_score(
                 ) else 1.0
                 avg_def = tgt["def"] if cat == "physical" else tgt["sp_def"]
                 pv[t_idx] = min(base * dl_mult * _off_se * eff * _OHKO_K / (tgt["hp"] * avg_def), 1.0)
-        if pv:
-            move_pv.append((m, pv))
+        move_pv.append((m, pv, base))
 
     if not move_pv:
         return 0.0, []
 
-    # Greedy moveset: pick up to 4 moves by marginal gain
+    # Greedy moveset: pick up to 4 moves by marginal SE gain
+    se_pool = [(m, pv, base) for m, pv, base in move_pv if pv]
     current_best: dict[int, float] = {}
     selected: list[dict] = []
-    for _ in range(min(4, len(move_pv))):
+    for _ in range(min(4, len(se_pool))):
         best_gain = 0.0
         best_idx  = -1
-        for idx, (_, pv) in enumerate(move_pv):
-            gain = sum(max(0.0, v - current_best.get(t, 0.0)) for t, v in pv.items())
+        for idx, (_, se_pv, _) in enumerate(se_pool):
+            gain = sum(max(0.0, v - current_best.get(t, 0.0)) for t, v in se_pv.items())
             if gain > best_gain:
                 best_gain = gain
                 best_idx  = idx
         if best_idx == -1:
             break
-        m, pv = move_pv[best_idx]
-        for t, v in pv.items():
+        m, se_pv, _ = se_pool[best_idx]
+        for t, v in se_pv.items():
             if v > current_best.get(t, 0.0):
                 current_best[t] = v
         selected.append(m)
-        move_pv.pop(best_idx)
+        se_pool.pop(best_idx)
+
+    # Fill remaining slots (up to 4 total) with highest-power non-SE moves
+    if len(selected) < 4:
+        selected_ids = {id(m) for m in selected}
+        extras = sorted(
+            [(m, base) for m, pv, base in move_pv if not pv and id(m) not in selected_ids] +
+            [(m, base) for m, pv, base in se_pool if id(m) not in selected_ids],
+            key=lambda x: x[1], reverse=True,
+        )
+        for m, _ in extras:
+            if len(selected) >= 4:
+                break
+            selected.append(m)
 
     return sum(current_best.values()), selected
 
@@ -1510,6 +1562,7 @@ def _compute_battle_score(
     _always_last   = any(ABILITY_EFFECTS.get(ab, {}).get("always_last")    for ab in a_abs)
     _charge_elec   = max((ABILITY_EFFECTS.get(ab, {}).get("charge_electric", 1.0) for ab in a_abs), default=1.0)
     _wonder_guard  = any(ABILITY_EFFECTS.get(ab, {}).get("wonder_guard")   for ab in a_abs)
+    _acc_ovr       = _move_acc_overrides(a_abs)
 
     _EPS = 1e-9
     zdw = dw = dl = zdl = 0
@@ -1538,7 +1591,7 @@ def _compute_battle_score(
             if eff > 0:
                 stat = a_atk if cat == "physical" else a_sp_atk
                 stab = _stab_mult(a_abs) if (_protean or etype in a_types) else 1.0
-                raw_acc = m["accuracy"] or 0
+                raw_acc = _acc_ovr.get(m.get("name", ""), m["accuracy"] or 0)
                 acc     = 1.0 if _no_guard else (min(raw_acc * _acc_m, 100) if raw_acc else 100) / 100.0
                 pwr     = m.get("power_max", m["power"]) if _skill_lk else m["power"]
                 dl_mult = dl_phys_mult if cat == "physical" else dl_spec_mult
@@ -1666,6 +1719,61 @@ def _fetch_pokerogue_egg_moves() -> dict[str, set[str]]:
     return egg_moves
 
 
+_FORM_RE = re.compile(
+    r'new PokemonForm\s*\(\s*"([^"]+)",\s*'          # form display name
+    r'(?:SpeciesFormKey\.(\w+)|"([^"]*)")\s*,\s*'    # form key (enum or string)
+    r'PokemonType\.(\w+)\s*,\s*'                      # type1
+    r'(?:PokemonType\.(\w+)|null)\s*,\s*'             # type2 or null
+    r'[\d.]+\s*,\s*[\d.]+\s*,\s*'                    # height, weight
+    r'AbilityId\.(\w+)\s*,\s*AbilityId\.\w+\s*,\s*AbilityId\.\w+\s*,\s*'  # abilities (capture first)
+    r'\d+,\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)'          # bst(skip), hp,atk,def,spa,spd,spe
+)
+
+
+def _fetch_pokerogue_form_stats() -> dict[str, dict]:
+    """Parse Pokerogue's balance/pokemon-species.ts and return Mega form stats.
+
+    Returns {form_slug: {types, ability, stats}} for every PokemonForm whose key
+    contains 'mega'. Only Mega forms are extracted — other forms are ignored.
+    """
+    r = requests.get(_POKEROGUE_SPECIES_URL, timeout=60)
+    r.raise_for_status()
+    # Collapse whitespace so multiline constructor calls become single lines.
+    text = re.sub(r'\s+', ' ', r.text)
+
+    results: dict[str, dict] = {}
+    for species_m in re.finditer(r'new PokemonSpecies\s*\(\s*SpeciesId\.(\w+)', text):
+        species_slug = species_m.group(1).lower().replace("_", "-")
+        start = species_m.start()
+        next_start = text.find('new PokemonSpecies(', start + 20)
+        block = text[start:next_start] if next_start != -1 else text[start:]
+
+        for fm in _FORM_RE.finditer(block):
+            key_enum = fm.group(2)
+            key_str  = fm.group(3)
+            if key_enum:
+                suffix = _FORM_KEY_MAP.get(key_enum, key_enum.lower().replace("_", "-"))
+            else:
+                suffix = (key_str or "").lower()
+            if "mega" not in suffix:
+                continue
+
+            type2 = fm.group(5)
+            results[f"{species_slug}-{suffix}"] = {
+                "types":   [fm.group(4).lower()] + ([type2.lower()] if type2 else []),
+                "ability": fm.group(6).lower().replace("_", "-"),
+                "stats": {
+                    "hp":               int(fm.group(7)),
+                    "attack":           int(fm.group(8)),
+                    "defense":          int(fm.group(9)),
+                    "special-attack":   int(fm.group(10)),
+                    "special-defense":  int(fm.group(11)),
+                    "speed":            int(fm.group(12)),
+                },
+            }
+    return results
+
+
 def _fetch_starter_costs() -> dict[str, int]:
     """Parse Pokerogue's speciesStarterCosts map → {species_slug: cost}."""
     r = requests.get(_STARTERS_URL, timeout=30)
@@ -1772,7 +1880,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             all_forms.extend(varieties)
     all_forms = sorted(
         f for f in set(all_forms)
-        if "-mega" not in f and not _is_excluded_form(f)
+        if not _is_excluded_form(f)
     )
     _prog(on_progress, f"{len(all_forms)} total forms to score…")
 
@@ -1809,6 +1917,39 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
     try:
         pokerogue_learnset = _fetch_pokerogue_learnset()
         _prog(on_progress, f"Learnset loaded — {len(pokerogue_learnset)} species entries.")
+
+        # Inject Pokerogue-exclusive Mega forms that PokéAPI doesn't know about.
+        # These are forms the learnset references but that never came back from fetch_poke.
+        injected_forms: set[str] = set()
+        for form in list(pokerogue_learnset):
+            if "-mega" not in form or form in pokemon_data or _is_excluded_form(form):
+                continue
+            base = re.sub(r"-mega.*$", "", form)
+            base_pd = pokemon_data.get(base)
+            if base_pd:
+                pokemon_data[form] = {**base_pd, "move_names": list(base_pd["move_names"]), "species": base}
+                injected_forms.add(form)
+        if injected_forms:
+            _prog(on_progress, f"  Injected {len(injected_forms)} Pokerogue-exclusive Mega forms.")
+
+        # Apply real stats/types/ability from Pokerogue's species data for injected forms.
+        if injected_forms:
+            try:
+                poke_form_stats = _fetch_pokerogue_form_stats()
+                applied = 0
+                for form in injected_forms:
+                    info = poke_form_stats.get(form)
+                    if not info:
+                        continue
+                    pd = pokemon_data[form]
+                    pd["stats"]   = info["stats"]
+                    pd["types"]   = info["types"]
+                    pd["abilities"] = [info["ability"]] + pd.get("abilities", [])[1:]
+                    applied += 1
+                _prog(on_progress, f"  Applied Pokerogue form stats to {applied}/{len(injected_forms)} injected Megas.")
+            except Exception as e:
+                _prog(on_progress, f"  Warning: could not fetch Pokerogue form stats ({e}) — using base-form stats.")
+
         filtered = 0
         for form, pd in pokemon_data.items():
             species = pd.get("species", form)
@@ -1818,6 +1959,18 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                 pd["move_names"] = [m for m in pd["move_names"] if m in allowed]
                 filtered += before - len(pd["move_names"])
         _prog(on_progress, f"Filtered {filtered} non-level-up moves from learnsets.")
+
+        # Final fallback: any Mega still with no moves inherits the base form's moveset.
+        mega_fallback = 0
+        for form, pd in pokemon_data.items():
+            if "-mega" in form and not pd["move_names"]:
+                base = re.sub(r"-mega.*$", "", form)
+                base_pd = pokemon_data.get(base)
+                if base_pd and base_pd["move_names"]:
+                    pd["move_names"] = list(base_pd["move_names"])
+                    mega_fallback += 1
+        if mega_fallback:
+            _prog(on_progress, f"  {mega_fallback} Mega forms fell back to base-form moveset.")
 
         if include_egg:
             _prog(on_progress, "Fetching Pokerogue egg moves…")
