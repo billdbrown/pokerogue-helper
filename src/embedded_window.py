@@ -56,6 +56,7 @@ from team_panel import TeamPanel
 from team_builder_panel import TeamBuilderPanel
 from impact_table import ImpactTableDialog
 import impact_db
+import biome_db
 from wave_panel import WavePanel
 from analysis_panel import AnalysisPanel
 from turn_order import make_fighter
@@ -244,6 +245,7 @@ class EmbeddedMainWindow(QMainWindow):
         # ── Impact score browser ─────────────────────────────────────────
         self._impact_dlg: ImpactTableDialog | None = None
         impact_db.init(on_ready=self._on_impact_ready)
+        biome_db.init()
 
         # ── Settings dialog (single checkbox: opponent weaknesses) ───────
         self._settings_dlg = SettingsDialog(self, self._enemy)
@@ -441,6 +443,7 @@ class EmbeddedMainWindow(QMainWindow):
             self._enemy._signals.slot_cleared.emit(1)
             self._team.set_party([])
             self._turn_order_panel.update_fighters([])
+            self._wave.clear_biome()
             self._battle_badge.setVisible(False)
             if self._in_fight:
                 self._in_fight = False
@@ -455,12 +458,14 @@ class EmbeddedMainWindow(QMainWindow):
 
         self._left_stack.setCurrentIndex(0)
 
-        # Wave
+        # Wave + biome
         wave = snap.get('wave')
+        biome_id = snap.get('biome')
         if wave is not None:
             self._wave.receive_wave_text(str(wave))
             self._check_rival_warning(wave)
             self._prev_wave = wave
+        self._wave.set_biome(biome_id)
 
         # Pre-populate the full team (all 6 slots) — HP, level, types, abilities,
         # moves, plus auto-fetch + form override per slot.
@@ -511,6 +516,15 @@ class EmbeddedMainWindow(QMainWindow):
                 self._enemy.receive_opponent_abilities(slot, e.get('ability'), e.get('passive'),
                                                        e.get('abilityIndex'), e.get('nature'))
                 self._enemy.receive_opponent_moves(slot, e.get('moves') or [])
+                # Biome rarity — wild encounters only; trainer mons aren't drawn
+                # from the biome's wild pool.
+                if snap.get('battleType', 0) == 0:
+                    tier, is_boss = biome_db.rarity_for(
+                        biome_id, e.get('speciesId'), e.get('name'))
+                    self._enemy.receive_opponent_biome_rarity(
+                        slot, biome_db.biome_display(biome_id), tier, is_boss)
+                else:
+                    self._enemy.receive_opponent_biome_rarity(slot, None, None, False)
                 ebs = e.get('battleStats') or {}
                 _ebs_vals = [ebs.get(k) for k in ('atk', 'def', 'spa', 'spd')]
                 _enemy_total = (

@@ -1,4 +1,5 @@
 import re
+import biome_db
 import window_state
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
@@ -68,9 +69,10 @@ class _Signals(QObject):
 class WavePanel(QWidget):
     def __init__(self, wave_box=None, embedded: bool = False):
         super().__init__()
-        self._drag_pos     = None
-        self._embedded     = embedded
-        self._current_wave = None
+        self._drag_pos      = None
+        self._embedded      = embedded
+        self._current_wave  = None
+        self._current_biome = None
 
         self._signals = _Signals()
 
@@ -135,6 +137,14 @@ class WavePanel(QWidget):
             "color:#cdd6f4; font-size:22px; font-weight:bold; padding:4px 0;"
         )
         inner.addWidget(self._wave_lbl)
+
+        self._biome_lbl = QLabel("")
+        self._biome_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._biome_lbl.setWordWrap(True)
+        self._biome_lbl.setStyleSheet("color:#94e2d5; font-size:12px; font-weight:bold;")
+        self._biome_lbl.setVisible(False)
+        inner.addWidget(self._biome_lbl)
+
         inner.addWidget(self._hline())
 
         hdr = QLabel("UPCOMING")
@@ -176,6 +186,17 @@ class WavePanel(QWidget):
         sep.setStyleSheet("background:#44475a;")
         root.addWidget(sep)
 
+        self._biome_lbl = QLabel("")
+        self._biome_lbl.setStyleSheet("color:#94e2d5; font-size:10px; font-weight:bold;")
+        self._biome_lbl.setVisible(False)
+        root.addWidget(self._biome_lbl)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setFixedWidth(1)
+        sep2.setStyleSheet("background:#44475a;")
+        root.addWidget(sep2)
+
         self._event_rows = []
         for _ in range(5):
             w_lbl = QLabel("")
@@ -212,6 +233,13 @@ class WavePanel(QWidget):
         self._signals.wave_changed.emit(val)
         self._render_wave(val)
 
+    def set_biome(self, biome_id) -> None:
+        """Called by the JSStateService dispatcher with the live biome id."""
+        if biome_id == self._current_biome:
+            return
+        self._current_biome = biome_id
+        self._render_biome()
+
     def clear_wave(self) -> None:
         """Reset wave display. Called by New Run."""
         self._current_wave = None
@@ -220,6 +248,13 @@ class WavePanel(QWidget):
         for w_lbl, n_lbl in getattr(self, '_event_rows', []):
             w_lbl.setText("")
             n_lbl.setText("")
+        self.clear_biome()
+
+    def clear_biome(self) -> None:
+        self._current_biome = None
+        if hasattr(self, '_biome_lbl'):
+            self._biome_lbl.setText("")
+            self._biome_lbl.setVisible(False)
 
     # ── Display ───────────────────────────────────────────────────────────────
 
@@ -238,6 +273,29 @@ class WavePanel(QWidget):
             else:
                 w_lbl.setText("")
                 n_lbl.setText("")
+        self._render_biome()
+        if not self._embedded:
+            self.adjustSize()
+
+    def _render_biome(self):
+        lbl = getattr(self, '_biome_lbl', None)
+        if lbl is None:
+            return
+        name = biome_db.biome_display(self._current_biome)
+        if not name:
+            lbl.setText("")
+            lbl.setVisible(False)
+            return
+        text = name.upper()
+        nexts = biome_db.next_biomes(self._current_biome)
+        if nexts:
+            nxt = " / ".join(n["display"] for n in nexts[:2])
+            wave = self._current_wave or 0
+            rem = 10 - (wave % 10) if wave else 0
+            ctd = f" (in {rem})" if 1 <= rem <= 9 else ""
+            text = f"{text} → {nxt}{ctd}"
+        lbl.setText(text)
+        lbl.setVisible(True)
         if not self._embedded:
             self.adjustSize()
 

@@ -143,12 +143,15 @@ EXTRACTOR_JS = r"""
         const unlockedIds = [];
         const wonIds = [];
         const valueReductions = {};
+        const eggMovesOwned = {};
         for (const [id, d] of Object.entries(starterData)) {
             if (d && d.abilityAttr > 0) {
                 const sid = parseInt(id);
                 unlockedIds.push(sid);
                 if (d.classicWinCount > 0) wonIds.push(sid);
                 if (d.valueReduction > 0) valueReductions[sid] = d.valueReduction;
+                // eggMoves is a bitmask: bit i set = egg move i unlocked (bit 3 = rare).
+                if (d.eggMoves) eggMovesOwned[sid] = d.eggMoves;
             }
         }
         const selectedIds = tryGet(() => {
@@ -172,6 +175,7 @@ EXTRACTOR_JS = r"""
             won_ids: wonIds,
             selected_ids: selectedIds,
             value_reductions: valueReductions,
+            egg_moves_owned: eggMovesOwned,
             _handler_keys: _handler_keys,
             wave: null, player: [], enemies: [], party: [],
             _active_scenes: _active_scenes,
@@ -182,6 +186,7 @@ EXTRACTOR_JS = r"""
         return {
             wave: battle.currentBattle ? battle.currentBattle.waveIndex : null,
             battleType: tryGet(() => battle.currentBattle && battle.currentBattle.battleType) || 0,
+            biome: tryGet(() => battle.arena && battle.arena.biomeType),
             weather: tryGet(() => battle.arena.weather && battle.arena.weather.weatherType),
             terrain: tryGet(() => battle.arena.terrain && battle.arena.terrain.terrainType),
             trickRoom: trickRoom,

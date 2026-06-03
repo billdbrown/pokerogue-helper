@@ -115,6 +115,15 @@ TYPE_COLORS = {
 NUM_SLOTS      = 2
 BADGES_PER_ROW = 3
 
+# Biome wild-encounter rarity → (label, colour).
+_RARITY_STYLE = {
+    "COMMON":     ("Common",     "#a6adc8"),
+    "UNCOMMON":   ("Uncommon",   "#a6e3a1"),
+    "RARE":       ("Rare",       "#89b4fa"),
+    "SUPER_RARE": ("Super Rare", "#cba6f7"),
+    "ULTRA_RARE": ("Ultra Rare", "#f5c2e7"),
+}
+
 
 def _resolve_name(query: str, names: list) -> str | None:
     if query in names:
@@ -295,6 +304,7 @@ class OverlayPanel(QWidget):
         self._level_lbls       = [None] * NUM_SLOTS
         self._level_vals: list[int | None] = [None] * NUM_SLOTS  # parsed opponent level per slot, for turn-order calc
         self._hp_lbls          = [None] * NUM_SLOTS
+        self._biome_rarity_lbls = [None] * NUM_SLOTS
         self._ability_lbls     = [None] * NUM_SLOTS
         self._moves_containers = [None] * NUM_SLOTS
         self._moves_rows       = [None] * NUM_SLOTS   # QGridLayout holding move cells (2×2)
@@ -551,6 +561,12 @@ class OverlayPanel(QWidget):
 
         inner.addLayout(lv_hp_row)
 
+        biome_rarity_lbl = QLabel("")
+        biome_rarity_lbl.setStyleSheet("color:#a6adc8; font-size:13px; font-weight:bold;")
+        biome_rarity_lbl.setVisible(False)
+        inner.addWidget(biome_rarity_lbl)
+        self._biome_rarity_lbls[slot] = biome_rarity_lbl
+
         ability_lbl = QLabel("")
         ability_lbl.setStyleSheet("color:#cba6f7; font-size:15px;")
         ability_lbl.setWordWrap(True)
@@ -690,6 +706,28 @@ class OverlayPanel(QWidget):
             _, weaknesses = data
             self._display_matchup(slot, weaknesses)
 
+    def receive_opponent_biome_rarity(self, slot: int, biome_display, tier, is_boss):
+        """Show how common this species is for the current biome (wild battles only).
+
+        Called by the JS-state dispatcher. `tier` is a wild tier constant
+        (COMMON/…/ULTRA_RARE) or None to hide the badge.
+        """
+        lbl = self._biome_rarity_lbls[slot]
+        if lbl is None:
+            return
+        style = _RARITY_STYLE.get(tier or "")
+        if style is None:
+            lbl.setText("")
+            lbl.setVisible(False)
+            return
+        label, color = style
+        text = f"{label.upper()} in {biome_display}" if biome_display else label.upper()
+        if is_boss:
+            text += "  ·  BOSS pool"
+        lbl.setText(text)
+        lbl.setStyleSheet(f"color:{color}; font-size:13px; font-weight:bold;")
+        lbl.setVisible(True)
+
     def _clear_slot_display(self, slot: int):
         if self._slot_data[slot] is None:
             return
@@ -743,6 +781,8 @@ class OverlayPanel(QWidget):
             self._tier_badges[slot].setVisible(False)
         self._level_lbls[slot].setVisible(False)
         self._hp_lbls[slot].setVisible(False)
+        if self._biome_rarity_lbls[slot] is not None:
+            self._biome_rarity_lbls[slot].setVisible(False)
         if self._ability_lbls[slot] is not None:
             self._ability_lbls[slot].setVisible(False)
 
@@ -1205,6 +1245,7 @@ class OverlayPanel(QWidget):
         wild_ai    = wild_entry["percentile"] if wild_entry else None
         wild_moves = wild_entry.get("moves", []) if wild_entry else []
         cand_name  = evo_name if (wild_entry and impact_db.get(evo_name)) else enemy_name
+        wild_score = impact_db.impact_score(cand_name) if wild_entry else None
 
         party_size = len([n for n in self._party_names if n])
         team_full  = party_size >= 6
@@ -1223,6 +1264,7 @@ class OverlayPanel(QWidget):
                     'kind':            'catch',
                     'name':            cand_name.replace('-', ' ').title(),
                     'candidate_ai':    wild_ai,
+                    'candidate_score': wild_score,
                     'moves':           wild_moves,
                     'ti_contributing': contributing,
                     'delta_checks':    delta_checks,
@@ -1242,13 +1284,17 @@ class OverlayPanel(QWidget):
         if swap is not None:
             contributing = self._ti_contributing_moves(slot, swap['slot'], wild_entry)
             replaced_name = swap['replaced_name']
-            replaced_entry = impact_db.get(impact_db._final_evo_for(replaced_name.lower()))
+            replaced_final = impact_db._final_evo_for(replaced_name.lower())
+            replaced_entry = impact_db.get(replaced_final)
             replaced_ai = replaced_entry['percentile'] if replaced_entry else 0
+            replaced_score = impact_db.impact_score(replaced_final) if replaced_entry else 0
             self._signals.rec_ready.emit((slot, {
                 'kind':             'replace',
                 'name':             replaced_name.replace('-', ' ').title(),
                 'candidate_ai':     wild_ai or 0,
+                'candidate_score':  wild_score or 0,
                 'replaced_ai':      replaced_ai,
+                'replaced_score':   replaced_score,
                 'delta_checks':     swap['delta_checks'],
                 'delta_counters':   swap['delta_counters'],
                 'newly_covered':    swap['newly_covered'][:5],
@@ -1272,13 +1318,15 @@ class OverlayPanel(QWidget):
         consider_delta_checks   = consider_swap['delta_checks']   if consider_swap else 0
         consider_delta_counters = consider_swap['delta_counters'] if consider_swap else 0
 
-        team_ais: list[tuple[str, int]] = []
+        team_ais: list[tuple[str, int, int]] = []
         for n in self._party_names:
             if not n:
                 continue
-            e = impact_db.get(n) or impact_db.get(impact_db._final_evo_for(n))
+            lookup = n if impact_db.get(n) else impact_db._final_evo_for(n)
+            e = impact_db.get(lookup)
             if e:
-                team_ais.append((n.replace('-', ' ').title(), e['percentile']))
+                team_ais.append((n.replace('-', ' ').title(), e['percentile'],
+                                 impact_db.impact_score(lookup)))
 
         weakest = min(team_ais, key=lambda x: x[1]) if team_ais else None
 
@@ -1287,17 +1335,20 @@ class OverlayPanel(QWidget):
                 'kind':            'consider',
                 'name':            cand_name.replace('-', ' ').title(),
                 'candidate_ai':    wild_ai,
+                'candidate_score': wild_score,
                 'weakest_name':    weakest[0],
                 'weakest_ai':      weakest[1],
+                'weakest_score':   weakest[2],
                 'moves':           wild_moves,
                 'delta_checks':    consider_delta_checks,
                 'delta_counters':  consider_delta_counters,
             }))
         elif wild_ai > 0:
             self._signals.rec_ready.emit((slot, {
-                'kind':         'skip',
-                'name':         cand_name.replace('-', ' ').title(),
-                'candidate_ai': wild_ai,
+                'kind':            'skip',
+                'name':            cand_name.replace('-', ' ').title(),
+                'candidate_ai':    wild_ai,
+                'candidate_score': wild_score,
             }))
         else:
             self._signals.rec_ready.emit((slot, None))
@@ -1321,7 +1372,7 @@ class OverlayPanel(QWidget):
         contributing = rec.get('ti_contributing') or set()
 
         if kind == 'catch':
-            ai        = rec['candidate_ai']
+            score     = rec.get('candidate_score', rec.get('candidate_ai', 0))
             d_checks   = rec.get('delta_checks', 0)
             d_counters = rec.get('delta_counters', 0)
             move_line = _moves_html(rec.get('moves', []), contributing)
@@ -1332,7 +1383,7 @@ class OverlayPanel(QWidget):
             html = (
                 f"<span style='font-size:22px; font-weight:bold; color:#89dceb'>"
                 f"Catch {rec['name']}!</span>"
-                f"<span style='font-size:14px; color:#89dceb'>&nbsp;ai{ai}</span><br>"
+                f"<span style='font-size:14px; color:#89dceb'>&nbsp;Impact {score}</span><br>"
                 f"{cov_line}"
                 f"{move_line}"
             )
@@ -1345,8 +1396,8 @@ class OverlayPanel(QWidget):
             if pulse: pulse.start()
 
         elif kind == 'replace':
-            old_ai      = rec.get('replaced_ai', 0)
-            new_ai      = rec.get('candidate_ai', 0)
+            old_score   = rec.get('replaced_score', rec.get('replaced_ai', 0))
+            new_score   = rec.get('candidate_score', rec.get('candidate_ai', 0))
             d_checks    = rec.get('delta_checks', 0)
             d_counters  = rec.get('delta_counters', 0)
             newly_cov   = rec.get('newly_covered', []) or []
@@ -1377,7 +1428,7 @@ class OverlayPanel(QWidget):
                 f"{sign_co}{abs(d_counters)} counters</span><br>"
                 f"{fills_line}{loses_line}"
                 f"<span style='font-size:13px; color:#6c7086'>"
-                f"ai{old_ai} → ai{new_ai}</span><br>"
+                f"Impact {old_score} → {new_score}</span><br>"
                 f"<br>{move_line}"
             )
             lbl.setStyleSheet(
@@ -1389,9 +1440,9 @@ class OverlayPanel(QWidget):
             if pulse: pulse.start()
 
         elif kind == 'consider':
-            cand_ai     = rec['candidate_ai']
+            cand_score  = rec.get('candidate_score', rec.get('candidate_ai', 0))
             weak_name   = rec['weakest_name']
-            weak_ai     = rec['weakest_ai']
+            weak_score  = rec.get('weakest_score', rec.get('weakest_ai', 0))
             d_checks    = rec.get('delta_checks', 0)
             d_counters  = rec.get('delta_counters', 0)
             sign_ch = "+" if d_checks   >= 0 else "-"
@@ -1402,9 +1453,9 @@ class OverlayPanel(QWidget):
             html = (
                 f"<span style='font-size:20px; font-weight:bold; color:#f9e2af'>"
                 f"Consider {rec['name']}</span>"
-                f"<span style='font-size:13px; color:#f9e2af'>&nbsp;ai{cand_ai}</span><br>"
+                f"<span style='font-size:13px; color:#f9e2af'>&nbsp;Impact {cand_score}</span><br>"
                 f"<span style='font-size:13px; color:#a09070'>"
-                f"Beats {weak_name} (ai{weak_ai})</span><br>"
+                f"Beats {weak_name} (Impact {weak_score})</span><br>"
                 f"<span style='font-size:15px; color:{color_ch}'>{sign_ch}{abs(d_checks)} checks</span>"
                 f"&nbsp;&nbsp;<span style='font-size:15px; color:{color_co}'>"
                 f"{sign_co}{abs(d_counters)} counters</span><br>"
@@ -1419,10 +1470,10 @@ class OverlayPanel(QWidget):
             if pulse: pulse.stop()
 
         else:  # skip
-            cand_ai = rec.get('candidate_ai', 0)
+            cand_score = rec.get('candidate_score', rec.get('candidate_ai', 0))
             html = (
                 f"<span style='font-size:16px; color:#45475a'>"
-                f"{rec['name']} — ai{cand_ai} — team already stronger</span>"
+                f"{rec['name']} — Impact {cand_score} — team already stronger</span>"
             )
             lbl.setStyleSheet(
                 "QLabel { background:#13131f; border-left:2px solid #313244;"
@@ -1666,7 +1717,7 @@ class OverlayPanel(QWidget):
                 if impact_entry:
                     pct = impact_entry["percentile"]
                     color = _pct_color(pct)
-                    self._pct_lbls[slot].setText(f"ai{pct}")
+                    self._pct_lbls[slot].setText(f"Impact {impact_db.impact_score(evo_name)}")
                     self._pct_lbls[slot].setStyleSheet(f"color:{color}; font-size:14px;")
                     self._pct_lbls[slot].setToolTip(_impact_tooltip(impact_entry, evo_line))
                     self._pct_lbls[slot].setVisible(True)
@@ -1722,7 +1773,7 @@ class OverlayPanel(QWidget):
         if impact_entry:
             pct = impact_entry["percentile"]
             color = _pct_color(pct)
-            self._pct_lbls[slot].setText(f"ai{pct}")
+            self._pct_lbls[slot].setText(f"Impact {impact_db.impact_score(pokemon.name.lower())}")
             self._pct_lbls[slot].setStyleSheet(f"color:{color}; font-size:14px;")
             self._pct_lbls[slot].setToolTip(_impact_tooltip(impact_entry))
             self._pct_lbls[slot].setVisible(True)
