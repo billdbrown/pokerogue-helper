@@ -83,6 +83,33 @@ class AnalysisPanel(QWidget):
         )
         root.addWidget(hdr)
 
+        # Team coverage summary — moved here from the team strip so the Pokémon
+        # slots get that vertical real estate back. Values pushed by the team panel.
+        cov_row = QHBoxLayout()
+        cov_row.setContentsMargins(8, 0, 8, 2)
+        cov_row.setSpacing(4)
+        chk_hdr = QLabel("Potential")
+        chk_hdr.setStyleSheet("color:#6c7086; font-size:13px; background:transparent;")
+        self._checks_lbl = QLabel("—")
+        self._checks_lbl.setStyleSheet("color:#cba6f7; font-size:24px; font-weight:bold; background:transparent;")
+        cnt_hdr = QLabel("Current")
+        cnt_hdr.setStyleSheet("color:#6c7086; font-size:13px; background:transparent;")
+        self._counters_lbl = QLabel("—")
+        self._counters_lbl.setStyleSheet("color:#a6e3a1; font-size:24px; font-weight:bold; background:transparent;")
+        cov_row.addWidget(chk_hdr)
+        cov_row.addSpacing(3)
+        cov_row.addWidget(self._checks_lbl)
+        cov_row.addStretch()
+        cov_row.addWidget(cnt_hdr)
+        cov_row.addSpacing(3)
+        cov_row.addWidget(self._counters_lbl)
+        root.addLayout(cov_row)
+
+        self._uncovered_lbl = QLabel("")
+        self._uncovered_lbl.setStyleSheet("color:#6c7086; font-size:11px; padding: 0 8px 2px 8px; background:transparent;")
+        self._uncovered_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self._uncovered_lbl)
+
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet(_TAB_STYLE)
         self._tabs.setDocumentMode(True)
@@ -113,6 +140,48 @@ class AnalysisPanel(QWidget):
         self._rebuild_danger(None)
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def update_coverage(self, checks, counters, uncovered, pool_size=None):
+        """Set the team checks/counters coverage (computed and pushed by the team panel).
+
+        checks/counters are absolute opponent counts; pool_size is the total
+        opponent pool so they can be shown as a percentage of all opponents.
+        Pass uncovered=None (with falsy checks/counters) to clear for an empty team.
+        """
+        def _pct(n):
+            if not n or not pool_size:
+                return "—"
+            return f"{round(n / pool_size * 100)}%"
+
+        self._checks_lbl.setText(_pct(checks))
+        self._counters_lbl.setText(_pct(counters))
+
+        if not checks and not counters and not uncovered:
+            self._uncovered_lbl.setText("")
+            self._uncovered_lbl.setToolTip("")
+            return
+
+        n = len(uncovered) if uncovered else 0
+        if n == 0:
+            self._uncovered_lbl.setText("All opponents checked")
+            self._uncovered_lbl.setStyleSheet(
+                "color:#a6e3a1; font-size:11px; padding: 0 8px 2px 8px; background:transparent;")
+            self._uncovered_lbl.setToolTip("")
+        else:
+            self._uncovered_lbl.setText(f"Uncovered: {n}")
+            self._uncovered_lbl.setStyleSheet(
+                "color:#f38ba8; font-size:11px; padding: 0 8px 2px 8px; background:transparent;")
+            preview = uncovered[:60]
+            more = f"\n… and {n - len(preview)} more" if n > len(preview) else ""
+            self._uncovered_lbl.setToolTip(
+                "\n".join(name.replace("-", " ").title() for name in preview) + more)
+
+    def set_current(self, current, pool_size):
+        """Update only the 'Current' counters label (async result from the team panel)."""
+        if not current or not pool_size:
+            self._counters_lbl.setText("—")
+        else:
+            self._counters_lbl.setText(f"{round(current / pool_size * 100)}%")
 
     def on_analysis_ready(self, payload):
         (full, partial, gaps, suggestions, danger,

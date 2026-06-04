@@ -4,10 +4,10 @@ import difflib
 import window_state
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
-    QPushButton, QFrame, QScrollArea,
+    QPushButton, QFrame, QScrollArea, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QPainter, QColor
+from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QGraphicsOpacityEffect
 
 from pokemon_api import fetch_pokemon, fetch_final_evolutions, fetch_ability, fetch_move, fetch_learnable_coverage, nature_mod_str, MoveData, PokemonData
@@ -142,10 +142,10 @@ def _ordinal(n: int) -> str:
 
 
 def _pct_color(pct: int) -> str:
-    if pct >= 75: return "#a6e3a1"
-    if pct >= 50: return "#f9e2af"
-    if pct >= 25: return "#fab387"
-    return "#f38ba8"
+    if pct <= 50: return "#f38ba8"   # red
+    if pct <= 80: return "#f9e2af"   # yellow
+    if pct <= 90: return "#a6e3a1"   # green
+    return "#89dceb"                  # cyan / bright blue
 
 
 def _impact_tooltip(entry: dict, evo_line: str = "") -> str:
@@ -331,6 +331,9 @@ class OverlayPanel(QWidget):
         self._active_pokemon  = ""
 
         self._last_abilities = [(None, None)] * NUM_SLOTS
+        self._slot_new_hidden = [False] * NUM_SLOTS  # wild mon would unlock a new hidden ability
+        self._wave_no: int | None = None             # live wave — catching is disabled on 190-200
+        self._is_classic: bool = False               # catch restriction only applies in classic mode
 
         # Catch recommendation
         self._rec_lbls: list[QLabel | None]          = [None] * NUM_SLOTS
@@ -502,28 +505,35 @@ class OverlayPanel(QWidget):
         inp = QLineEdit()
         inp.setPlaceholderText(f"slot {slot + 1}…")
         inp.setMinimumWidth(0)
+        _name_font = QFont()
+        _name_font.setPixelSize(22)
+        _name_font.setBold(True)
+        inp.setFont(_name_font)
         inp.setStyleSheet(
             "QLineEdit{background:transparent;color:#cdd6f4;border:none;"
             "border-bottom:1px solid transparent;font-size:22px;font-weight:bold;padding:0 1px;}"
             "QLineEdit:focus{border-bottom:1px solid #89b4fa;}"
         )
+        inp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         inp.returnPressed.connect(lambda s=slot: self._lookup_from_input(s))
         inp.textEdited.connect(lambda _, s=slot: self._set_user_active(s))
-        name_row.addWidget(inp, 1)
+        # Size the field to its text so the rarity badge hugs the name's right edge.
+        def _fit_name(text, w=inp):
+            disp = text if text else w.placeholderText()
+            w.setFixedWidth(min(300, max(50, w.fontMetrics().horizontalAdvance(disp) + 16)))
+        inp.textChanged.connect(_fit_name)
+        _fit_name(inp.text())
+        name_row.addWidget(inp, 0)
         self._name_inputs[slot] = inp
         self._name_lbls[slot]   = None
+
+        name_row.addStretch(1)
 
         bst_lbl = QLabel("")
         bst_lbl.setStyleSheet("color:#a6adc8; font-size:14px;")
         bst_lbl.setVisible(False)
         name_row.addWidget(bst_lbl)
         self._bst_lbls[slot] = bst_lbl
-
-        pct_lbl = QLabel("")
-        pct_lbl.setStyleSheet("color:#a6adc8; font-size:14px;")
-        pct_lbl.setVisible(False)
-        name_row.addWidget(pct_lbl)
-        self._pct_lbls[slot] = pct_lbl
 
         type_row = QHBoxLayout()
         type_row.setSpacing(3)
@@ -532,23 +542,31 @@ class OverlayPanel(QWidget):
 
         self._tier_badges[slot] = None  # removed from layout
 
-        leg_lbl = QLabel("")
-        leg_lbl.setVisible(False)
-        name_row.addWidget(leg_lbl)
-        self._leg_lbls[slot] = leg_lbl
-
         inner.addLayout(name_row)
 
-        # Row 2: level (left) | HP (right)
+        # Row 2: Impact %ile (left) | HP (right)
         lv_hp_row = QHBoxLayout()
         lv_hp_row.setSpacing(4)
         lv_hp_row.setContentsMargins(0, 0, 0, 0)
 
-        level_lbl = QLabel("")
-        level_lbl.setStyleSheet("color:#89b4fa; font-size:13px;")
-        level_lbl.setVisible(False)
-        lv_hp_row.addWidget(level_lbl)
-        self._level_lbls[slot] = level_lbl
+        pct_lbl = QLabel("")
+        pct_lbl.setStyleSheet("color:#a6adc8; font-size:14px;")
+        pct_lbl.setVisible(False)
+        lv_hp_row.addWidget(pct_lbl)
+        self._pct_lbls[slot] = pct_lbl
+        self._level_lbls[slot] = None  # level no longer shown (reiterated elsewhere)
+
+        leg_lbl = QLabel("")
+        leg_lbl.setVisible(False)
+        lv_hp_row.addWidget(leg_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._leg_lbls[slot] = leg_lbl
+
+        rarity_badge = QLabel("")
+        rarity_badge.setFixedHeight(15)
+        rarity_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rarity_badge.setVisible(False)
+        lv_hp_row.addWidget(rarity_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._biome_rarity_lbls[slot] = rarity_badge
 
         lv_hp_row.addStretch()
 
@@ -560,12 +578,6 @@ class OverlayPanel(QWidget):
         self._hp_lbls[slot] = hp_lbl
 
         inner.addLayout(lv_hp_row)
-
-        biome_rarity_lbl = QLabel("")
-        biome_rarity_lbl.setStyleSheet("color:#a6adc8; font-size:13px; font-weight:bold;")
-        biome_rarity_lbl.setVisible(False)
-        inner.addWidget(biome_rarity_lbl)
-        self._biome_rarity_lbls[slot] = biome_rarity_lbl
 
         ability_lbl = QLabel("")
         ability_lbl.setStyleSheet("color:#cba6f7; font-size:15px;")
@@ -718,14 +730,19 @@ class OverlayPanel(QWidget):
         style = _RARITY_STYLE.get(tier or "")
         if style is None:
             lbl.setText("")
+            lbl.setToolTip("")
             lbl.setVisible(False)
             return
         label, color = style
-        text = f"{label.upper()} in {biome_display}" if biome_display else label.upper()
+        lbl.setText(label.upper())
+        lbl.setStyleSheet(
+            f"background:{color}; color:#11111b; font-size:8px; font-weight:bold;"
+            f"border-radius:5px; padding:0px 4px;"
+        )
+        tip = f"{label} encounter" + (f" in {biome_display}" if biome_display else "")
         if is_boss:
-            text += "  ·  BOSS pool"
-        lbl.setText(text)
-        lbl.setStyleSheet(f"color:{color}; font-size:13px; font-weight:bold;")
+            tip += " · also in this biome's boss pool"
+        lbl.setToolTip(tip)
         lbl.setVisible(True)
 
     def _clear_slot_display(self, slot: int):
@@ -740,6 +757,7 @@ class OverlayPanel(QWidget):
         self._form_lookup_pending.discard(slot)
         self._level_vals[slot] = None
         self._last_abilities[slot] = (None, None)
+        self._slot_new_hidden[slot] = False
         self._last_move_names[slot] = []
         self._enemy_moves[slot] = []
         self._moves_cells[slot] = []
@@ -779,7 +797,8 @@ class OverlayPanel(QWidget):
         self._slot_bst_pcts[slot] = None
         if self._tier_badges[slot] is not None:
             self._tier_badges[slot].setVisible(False)
-        self._level_lbls[slot].setVisible(False)
+        if self._level_lbls[slot] is not None:
+            self._level_lbls[slot].setVisible(False)
         self._hp_lbls[slot].setVisible(False)
         if self._biome_rarity_lbls[slot] is not None:
             self._biome_rarity_lbls[slot].setVisible(False)
@@ -1102,6 +1121,16 @@ class OverlayPanel(QWidget):
             sum(s for s in (m.get('stats') or {}).values() if s is not None) or None
             for m in party
         ]
+        # The catch/replace recommendation depends on the team set + enemy, not on
+        # which Pokémon is currently active. Skip the (CPU-heavy) recompute when the
+        # party composition is unchanged — e.g. switching the active mon in battle.
+        sig = frozenset(
+            (m.get('name') or '', tuple(m.get('moves') or []))
+            for m in party if m.get('name')
+        )
+        if sig == getattr(self, '_last_party_rec_sig', None):
+            return
+        self._last_party_rec_sig = sig
         for slot in range(NUM_SLOTS):
             if self._enemy_moves[slot]:
                 threading.Thread(
@@ -1202,9 +1231,31 @@ class OverlayPanel(QWidget):
                     break
         return result
 
+    def set_wave(self, wave, is_classic: bool = False) -> None:
+        """Track the live wave + game mode so catch/replace banners can be hidden
+        when catching is disabled (classic-mode final stretch, waves 190-200)."""
+        self._wave_no = wave
+        self._is_classic = is_classic
+
+    def _catching_disabled(self) -> bool:
+        return (self._is_classic and self._wave_no is not None
+                and 190 <= self._wave_no <= 200)
+
+    def receive_opponent_unlock(self, slot: int, new_hidden: bool) -> None:
+        """Dispatcher flag: catching this wild mon would unlock a new hidden ability."""
+        if new_hidden == self._slot_new_hidden[slot]:
+            return
+        self._slot_new_hidden[slot] = new_hidden
+        if self._slot_data[slot] is not None and self._battle_type == 0:
+            threading.Thread(
+                target=self._compute_recommendation, args=(slot,), daemon=True
+            ).start()
+
     def _compute_recommendation(self, slot: int) -> None:
         """Background thread: analyse enemy vs party, emit rec_ready."""
-        if self._battle_type != 0:
+        # No catching in the classic-mode final stretch (waves 190-200) — and you
+        # can't catch in trainer battles either. Hide every catch/replace banner.
+        if self._battle_type != 0 or self._catching_disabled():
             self._signals.rec_ready.emit((slot, None))
             return
 
@@ -1213,6 +1264,22 @@ class OverlayPanel(QWidget):
             self._signals.rec_ready.emit((slot, None))
             return
         pokemon, _ = slot_data
+
+        # ── Hidden-ability unlock ─────────────────────────────────────────
+        # Worth catching for the permanent account unlock even if it's a poor
+        # team fit — takes priority over (and runs even without) impact data.
+        if self._slot_new_hidden[slot]:
+            nm = pokemon.name.lower()
+            final = impact_db._final_evo_for(nm)
+            entry = impact_db.get(nm) or impact_db.get(final)
+            self._signals.rec_ready.emit((slot, {
+                'kind':            'catch_hidden',
+                'name':            pokemon.name.replace('-', ' ').title(),
+                'ability':         self._last_abilities[slot][0],
+                'candidate_score': impact_db.impact_score(final) if entry else 0,
+                'moves':           entry.get('moves', []) if entry else [],
+            }))
+            return
 
         enemy_bst_pct = self._slot_bst_pcts[slot]
         if enemy_bst_pct is None:
@@ -1251,6 +1318,15 @@ class OverlayPanel(QWidget):
         team_full  = party_size >= 6
         team_names = [n for n in self._party_names if n]
 
+        # ── Duplicate line guard ──────────────────────────────────────────
+        # A second copy of an evolution line already on the team adds no
+        # coverage — don't recommend catching/replacing for it.
+        cand_final = impact_db._final_evo_for(cand_name)
+        team_finals = {impact_db._final_evo_for(n) for n in team_names}
+        if cand_final in team_finals:
+            self._signals.rec_ready.emit((slot, None))
+            return
+
         # ── Party not full ────────────────────────────────────────────────
         if not team_full:
             if wild_ai is not None and wild_ai >= 75:
@@ -1282,29 +1358,34 @@ class OverlayPanel(QWidget):
         swap = impact_db.best_coverage_swap(team_names, cand_name)
 
         if swap is not None:
-            contributing = self._ti_contributing_moves(slot, swap['slot'], wild_entry)
             replaced_name = swap['replaced_name']
             replaced_final = impact_db._final_evo_for(replaced_name.lower())
             replaced_entry = impact_db.get(replaced_final)
             replaced_ai = replaced_entry['percentile'] if replaced_entry else 0
             replaced_score = impact_db.impact_score(replaced_final) if replaced_entry else 0
-            self._signals.rec_ready.emit((slot, {
-                'kind':             'replace',
-                'name':             replaced_name.replace('-', ' ').title(),
-                'candidate_ai':     wild_ai or 0,
-                'candidate_score':  wild_score or 0,
-                'replaced_ai':      replaced_ai,
-                'replaced_score':   replaced_score,
-                'delta_checks':     swap['delta_checks'],
-                'delta_counters':   swap['delta_counters'],
-                'newly_covered':    swap['newly_covered'][:5],
-                'newly_lost':       swap['newly_lost'][:5],
-                'newly_countered':  swap['newly_countered'][:5],
-                'lost_counters':    swap['lost_counters'][:5],
-                'moves':            wild_moves,
-                'ti_contributing':  contributing,
-            }))
-            return
+            # Only recommend the swap if the candidate isn't a raw-power downgrade.
+            # Coverage breadth alone doesn't justify trading a much stronger
+            # Pokémon for a weaker one — keep the higher-impact mon. (Falls through
+            # to the "consider"/context branch below when the candidate is weaker.)
+            if (wild_score or 0) >= replaced_score:
+                contributing = self._ti_contributing_moves(slot, swap['slot'], wild_entry)
+                self._signals.rec_ready.emit((slot, {
+                    'kind':             'replace',
+                    'name':             replaced_name.replace('-', ' ').title(),
+                    'candidate_ai':     wild_ai or 0,
+                    'candidate_score':  wild_score or 0,
+                    'replaced_ai':      replaced_ai,
+                    'replaced_score':   replaced_score,
+                    'delta_checks':     swap['delta_checks'],
+                    'delta_counters':   swap['delta_counters'],
+                    'newly_covered':    swap['newly_covered'][:5],
+                    'newly_lost':       swap['newly_lost'][:5],
+                    'newly_countered':  swap['newly_countered'][:5],
+                    'lost_counters':    swap['lost_counters'][:5],
+                    'moves':            wild_moves,
+                    'ti_contributing':  contributing,
+                }))
+                return
 
         # ── No positive coverage swap — context for the player ─────────────
         if wild_ai is None:
@@ -1371,7 +1452,27 @@ class OverlayPanel(QWidget):
         kind = rec['kind']
         contributing = rec.get('ti_contributing') or set()
 
-        if kind == 'catch':
+        if kind == 'catch_hidden':
+            ability   = rec.get('ability')
+            score     = rec.get('candidate_score', 0)
+            move_line = _moves_html(rec.get('moves', []))
+            ab_txt = f"Hidden: {ability}" if ability else "Hidden ability"
+            extra  = f" · Impact {score}" if score else ""
+            html = (
+                f"<span style='font-size:20px; font-weight:bold; color:#f5c2e7'>"
+                f"Catch {rec['name']} — {ab_txt}!</span><br>"
+                f"<span style='font-size:13px; color:#a6adc8'>New account unlock{extra}</span><br>"
+                f"<br>{move_line}"
+            )
+            lbl.setStyleSheet(
+                "QLabel { background:#2a0a25; border-left:4px solid #f5c2e7;"
+                " border-radius:4px; padding:8px 10px; margin-top:2px; }"
+            )
+            lbl.setText(html)
+            lbl.setVisible(True)
+            if pulse: pulse.start()
+
+        elif kind == 'catch':
             score     = rec.get('candidate_score', rec.get('candidate_ai', 0))
             d_checks   = rec.get('delta_checks', 0)
             d_counters = rec.get('delta_counters', 0)
@@ -1672,7 +1773,12 @@ class OverlayPanel(QWidget):
     def _fetch_evolutions(self, slot: int, pokemon_name: str):
         try:
             finals = fetch_final_evolutions(pokemon_name)
-            targets = [f for f in finals if f != pokemon_name]
+            pn = pokemon_name.lower()
+            # If this mon is itself a final evolution (a leaf of its chain), it has
+            # no evolutions — the other leaves are siblings (e.g. the Eeveelutions),
+            # not evolutions of it. Don't show them or override its impact.
+            targets = [] if pn in [f.lower() for f in finals] else \
+                [f for f in finals if f.lower() != pn]
             if not targets:
                 self._signals.evo_ready.emit((slot, []))
                 return

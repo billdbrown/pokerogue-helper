@@ -284,6 +284,7 @@ class EmbeddedMainWindow(QMainWindow):
 
         self._inject_video_patch()
         self._inject_phaser_capture()
+        self._inject_refresh_hotkey()
         self._web.load(QUrl("https://pokerogue.net"))
         self._web.loadStarted.connect(self._on_load_started)
         self._web.loadFinished.connect(self._on_load_finished)
@@ -339,6 +340,28 @@ class EmbeddedMainWindow(QMainWindow):
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         self._web.page().scripts().insert(script)
 
+    def _inject_refresh_hotkey(self):
+        """Reload the page on Page Down while the browser has focus. Uses a
+        capture-phase window listener so it fires before Phaser's own keyboard
+        handlers can swallow the key, and only when the page (not a helper panel)
+        holds keyboard focus."""
+        script = QWebEngineScript()
+        script.setName("refresh_hotkey")
+        script.setSourceCode(r"""
+            (function () {
+                window.addEventListener('keydown', function (e) {
+                    if (e.key === 'PageDown') {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                        location.reload();
+                    }
+                }, true);
+            })();
+        """)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        self._web.page().scripts().insert(script)
+
     # ── Navbar ────────────────────────────────────────────────────────────────
 
     def _build_navbar(self) -> QWidget:
@@ -351,28 +374,20 @@ class EmbeddedMainWindow(QMainWindow):
         row.setContentsMargins(6, 4, 6, 4)
         row.setSpacing(4)
 
-        back_btn = QPushButton("◀")
-        back_btn.setFixedWidth(30)
-        back_btn.clicked.connect(self._web.back)
-        row.addWidget(back_btn)
-
-        fwd_btn = QPushButton("▶")
-        fwd_btn.setFixedWidth(30)
-        fwd_btn.clicked.connect(self._web.forward)
-        row.addWidget(fwd_btn)
-
         reload_btn = QPushButton("↺")
         reload_btn.setFixedWidth(30)
+        reload_btn.setToolTip("Refresh  (Page Down while in browser)")
         reload_btn.clicked.connect(self._web.reload)
         row.addWidget(reload_btn)
 
         self._url_bar = QLineEdit()
         self._url_bar.setPlaceholderText("https://")
+        self._url_bar.setFixedWidth(150)
         self._url_bar.returnPressed.connect(self._navigate_to_url)
-        row.addWidget(self._url_bar, 1)
+        row.addWidget(self._url_bar)
 
-        self._wave.setFixedWidth(630)
-        row.addWidget(self._wave)
+        self._wave.setMinimumWidth(630)
+        row.addWidget(self._wave, 1)
 
         self._status_lbl = QLabel("")
         self._status_lbl.setObjectName("status")
@@ -466,6 +481,7 @@ class EmbeddedMainWindow(QMainWindow):
             self._check_rival_warning(wave)
             self._prev_wave = wave
         self._wave.set_biome(biome_id)
+        self._enemy.set_wave(wave, bool(snap.get('isClassic')))
 
         # Pre-populate the full team (all 6 slots) — HP, level, types, abilities,
         # moves, plus auto-fetch + form override per slot.
@@ -515,6 +531,7 @@ class EmbeddedMainWindow(QMainWindow):
                 self._enemy.receive_type_sample(slot, 1, types[1] if len(types) >= 2 else None)
                 self._enemy.receive_opponent_abilities(slot, e.get('ability'), e.get('passive'),
                                                        e.get('abilityIndex'), e.get('nature'))
+                self._enemy.receive_opponent_unlock(slot, bool(e.get('newHiddenUnlock')))
                 self._enemy.receive_opponent_moves(slot, e.get('moves') or [])
                 # Biome rarity — wild encounters only; trainer mons aren't drawn
                 # from the biome's wild pool.

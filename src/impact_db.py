@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import statistics
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
@@ -133,6 +134,18 @@ _EFF: dict[tuple, float] = {}
 _db_noegg: dict[str, dict] = {}
 _db_egg:   dict[str, dict] = {}
 _use_egg:  bool = False
+
+_nonleg_median: float | None = None  # memoized non-legendary impact median (cap/egg-aware)
+
+# Owned-egg-aware scoring (team builder). Independent of the egg cache / egg slider.
+_EGG_ORDER_FILE    = data_path("egg_moves_ordered.json")   # species_slug -> ordered move slugs
+_RUNTIME_MOVES_FILE = data_path("runtime_egg_moves.json")  # move_slug   -> battle move dict
+_egg_order:          dict[str, list[str]] | None = None
+_runtime_move_cache: dict[str, dict | None] | None = None
+_battle_targets_cache: list[dict] | None = None
+_noegg_median:       float | None = None   # median noegg battle score (leg+paradox excluded)
+_egg_aware_memo:     dict[tuple, tuple] = {}
+_eff_memo_runtime:   dict = {}
 
 _OHKO_K: float = 22.0 / 50.0  # level-50 game damage formula constant
 _IMMUNE_CAP: int = 50          # hits-to-KO cap for immune matchups in bulk scoring
@@ -705,14 +718,16 @@ def is_egg_ready() -> bool:
 
 def set_include_egg(value: bool) -> None:
     """Switch the active database. Egg db must be ready before enabling."""
-    global _use_egg
+    global _use_egg, _nonleg_median
     _use_egg = value and _ready_egg
+    _nonleg_median = None  # active pool changed — recompute median lazily
 
 
 def set_egg_cap(cap: int) -> None:
     """Set max egg moves allowed in the optimal 4-move set (1–4)."""
-    global _egg_cap
+    global _egg_cap, _nonleg_median
     _egg_cap = max(1, min(4, cap))
+    _nonleg_median = None  # capped impacts changed — recompute median lazily
 
 
 def get_egg_cap() -> int:
@@ -822,6 +837,252 @@ def top_n(n: int = 20, exclude_legendary: bool = False) -> list[tuple[str, float
         ]
     items.sort(key=lambda x: x[1], reverse=True)
     return items[:n]
+
+
+def _nonleg_median_impact() -> float:
+    """Median impact across the non-legendary pool in the active db (cap/egg-aware).
+
+    Memoized; invalidated by set_include_egg / set_egg_cap. This is the same
+    denominator the Impact-Score browser uses to normalize its 'Impact' column.
+    """
+    global _nonleg_median
+    if _nonleg_median is None:
+        use_cap = _use_egg and _egg_cap < 4
+        with _lock:
+            vals = []
+            for v in _active_db().values():
+                if v.get("legendary") or v.get("paradox"):
+                    continue
+                imp = (v["impact_caps"][_egg_cap - 1]
+                       if use_cap and v.get("impact_caps") else v.get("impact", 0))
+                if imp > 0:
+                    vals.append(imp)
+        _nonleg_median = statistics.median(vals) if vals else 1.0
+    return _nonleg_median
+
+
+def impact_score(name: str) -> int:
+    """Median-normalized battle score — the number shown in the browser 'Impact' column.
+
+    impact / non-legendary-median * 100, so 100 = a typical non-legendary and
+    e.g. Delphox Mega reads ~174. Egg-cap aware via get() and _nonleg_median_impact().
+    """
+    entry = get(name)
+    if not entry or not entry.get("impact"):
+        return 0
+    med = _nonleg_median_impact()
+    return round(entry["impact"] / med * 100) if med > 0 else 0
+
+
+# ── Owned-egg-aware scoring ────────────────────────────────────────────────────
+# Computes a true Impact battle score for a starter given the *specific* egg moves
+# the player owns (a subset, per the game's eggMoves bitmask) — not zero, not all.
+# Sourced lazily at runtime so no cache rebuild is needed.
+
+def _egg_move_order() -> dict[str, list[str]]:
+    """species_slug -> ordered egg-move slugs (index = bitmask bit). Memoized + side-cached."""
+    global _egg_order
+    if _egg_order is not None:
+        return _egg_order
+    if os.path.exists(_EGG_ORDER_FILE):
+        try:
+            with open(_EGG_ORDER_FILE) as f:
+                _egg_order = json.load(f)
+                return _egg_order
+        except Exception:
+            pass
+    order: dict[str, list[str]] = {}
+    try:
+        r = requests.get(_POKEROGUE_EGG_MOVES_URL, timeout=30)
+        r.raise_for_status()
+        for line in r.text.splitlines():
+            sm = re.search(r'\[SpeciesId\.(\w+)\]', line)
+            if not sm:
+                continue
+            species = sm.group(1).lower().replace("_", "-")
+            moves = [mm.group(1).lower().replace("_", "-")
+                     for mm in re.finditer(r'MoveId\.(\w+)', line)]
+            moves = [m for m in moves if m != "none"]
+            if moves:
+                order[species] = moves
+        with open(_EGG_ORDER_FILE, "w") as f:
+            json.dump(order, f)
+    except Exception as e:
+        print(f"[impact_db] egg-move order fetch failed: {e}")
+    _egg_order = order
+    return _egg_order
+
+
+def _owned_egg_move_names(species_slug: str, bitmask: int) -> list[str]:
+    """Resolve an eggMoves bitmask to the owned move slugs for a species."""
+    order = _egg_move_order().get((species_slug or "").lower(), [])
+    return [order[i] for i in range(len(order)) if bitmask & (1 << i)]
+
+
+def _runtime_move(name: str) -> dict | None:
+    """Battle-ready move dict for an egg move (PokéAPI), matching _to_move_dict format.
+
+    Memoized in-memory and persisted to a side file so repeat lookups are free.
+    """
+    global _runtime_move_cache
+    if _runtime_move_cache is None:
+        _runtime_move_cache = {}
+        if os.path.exists(_RUNTIME_MOVES_FILE):
+            try:
+                with open(_RUNTIME_MOVES_FILE) as f:
+                    _runtime_move_cache = json.load(f)
+            except Exception:
+                _runtime_move_cache = {}
+    if name in _runtime_move_cache:
+        return _runtime_move_cache[name]
+
+    md: dict | None = None
+    try:
+        r = requests.get(f"{BASE_URL}/move/{name}", timeout=10)
+        if r.status_code != 404:
+            r.raise_for_status()
+            d = r.json()
+            meta   = d.get("meta") or {}
+            effect = next((e["short_effect"] for e in d.get("effect_entries", [])
+                           if e["language"]["name"] == "en"), "")
+            recharge = _is_recharge(effect)
+            two_turn = _is_two_turn(name, effect, recharge)
+            raw      = d.get("power") or 0
+            cat      = d.get("damage_class", {}).get("name")
+            if (raw and cat != "status" and name not in _EXCLUDED_MOVES
+                    and not _is_always_skip(effect)):
+                pwr = float(raw)
+                if recharge or two_turn:
+                    pwr /= 2.0
+                min_h, max_h = meta.get("min_hits") or 0, meta.get("max_hits") or 0
+                if min_h and max_h:
+                    pwr_max = float(raw) * max_h
+                    pwr *= (min_h + max_h) / 2.0
+                else:
+                    pwr_max = pwr
+                md = {"name": name, "type": d["type"]["name"], "power": pwr,
+                      "power_max": pwr_max, "base_power": raw,
+                      "accuracy": d["accuracy"], "category": cat}
+    except Exception:
+        md = None
+
+    _runtime_move_cache[name] = md
+    try:
+        with open(_RUNTIME_MOVES_FILE, "w") as f:
+            json.dump(_runtime_move_cache, f)
+    except Exception:
+        pass
+    return md
+
+
+def _reset_runtime_egg_caches() -> None:
+    """Invalidate caches derived from the noegg db when it (re)loads."""
+    global _battle_targets_cache, _noegg_median
+    _battle_targets_cache = None
+    _noegg_median = None
+    _egg_aware_memo.clear()
+
+
+def _battle_targets() -> list[dict]:
+    """The opponent pool _compute_battle_score scores against — reconstructed from the
+    noegg cache (non-legendary, non-paradox, has moves), matching the cache-build pool."""
+    global _battle_targets_cache
+    if _battle_targets_cache is None:
+        with _lock:
+            t = []
+            for name, v in _db_noegg.items():
+                if v.get("legendary") or v.get("paradox") or not v.get("moves"):
+                    continue
+                t.append({
+                    "name": name, "types": v["types"], "hp": float(v["hp"]),
+                    "def": float(v["defense"]), "sp_def": float(v["sp_def"]),
+                    "atk": float(v["atk"]), "sp_atk": float(v["sp_atk"]),
+                    "speed": v["speed"], "moves": v["moves"],
+                })
+        _battle_targets_cache = t
+    return _battle_targets_cache
+
+
+def _noegg_battle_median() -> float:
+    """Median noegg battle score (leg+paradox excluded) — the denominator for the
+    Impact display number. Toggle-independent so team-builder numbers stay comparable."""
+    global _noegg_median
+    if _noegg_median is None:
+        with _lock:
+            vals = [v["impact"] for v in _db_noegg.values()
+                    if not v.get("legendary") and not v.get("paradox")
+                    and v.get("impact", 0) > 0]
+        _noegg_median = statistics.median(vals) if vals else 1.0
+    return _noegg_median
+
+
+def _select_egg_aware_moves(entry: dict, candidates: list[dict]) -> list[dict]:
+    """Pick the best ≤4 moves (by SE coverage) from candidates — same greedy/brute-force
+    objective the cache build uses to choose optimal movesets. candidates ≤ 8 → C(8,4)."""
+    types, atk, sp_atk = entry["types"], entry["atk"], entry["sp_atk"]
+
+    def _pv(m: dict) -> dict | None:
+        if not (m and (m.get("power") or 0) > 0 and m.get("category") != "status"
+                and (m.get("drain") or 0) >= 0 and m.get("name") not in _EXCLUDED_MOVES):
+            return None
+        mtype = m["type"]
+        stat  = atk if m["category"] == "physical" else sp_atk
+        stab  = 1.5 if mtype in types else 1.0
+        acc   = (m["accuracy"] or 100) / 100.0
+        base  = stat * m["power"] * acc * stab
+        pv: dict = {}
+        for p in ALL_PAIRINGS:
+            se = _EFF.get((mtype, p), 0.0)
+            if se > 1.0:
+                pv[p] = base * se
+        return pv or None
+
+    items = [(m, pv) for m in candidates if (pv := _pv(m))]
+    if not items:
+        return candidates[:4]
+    k = min(4, len(items))
+    best_score, best_combo = -1.0, ()
+    for combo in combinations(range(len(items)), k):
+        curr: dict = {}
+        for idx in combo:
+            for p, v in items[idx][1].items():
+                if v > curr.get(p, 0.0):
+                    curr[p] = v
+        s = sum(curr.values())
+        if s > best_score:
+            best_score, best_combo = s, combo
+    return [items[idx][0] for idx in best_combo]
+
+
+def egg_aware_score(final_name: str, species_slug: str, egg_bitmask: int) -> tuple[int, float, bool]:
+    """Impact for `final_name` using the egg moves owned for `species_slug` (per bitmask).
+
+    Returns (display_score, raw_battle_score, boosted). When no egg moves are owned the
+    base noegg impact is returned (boosted=False). Memoized per (form, owned-set).
+    """
+    with _lock:
+        entry = _db_noegg.get((final_name or "").lower())
+    if not entry or not entry.get("moves"):
+        return (0, 0.0, False)
+
+    owned = _owned_egg_move_names(species_slug, egg_bitmask) if egg_bitmask else []
+    med = _noegg_battle_median()
+    if not owned:
+        raw = entry.get("impact", 0.0)
+        return (round(raw / med * 100) if med > 0 else 0, raw, False)
+
+    key = ((final_name or "").lower(), frozenset(owned))
+    if key in _egg_aware_memo:
+        return _egg_aware_memo[key]
+
+    move_dicts = [md for n in owned if (md := _runtime_move(n))]
+    candidates = list(entry["moves"]) + move_dicts
+    selected   = _select_egg_aware_moves(entry, candidates)
+    raw = _compute_battle_score(entry, _battle_targets(), _eff_memo_runtime,
+                                moves_override=selected)[0]
+    result = (round(raw / med * 100) if med > 0 else 0, raw, True)
+    _egg_aware_memo[key] = result
+    return result
 
 
 def impact_percentile(score: float, exclude_legendary: bool = False) -> int:
@@ -948,22 +1209,53 @@ def team_score(names: list[str]) -> float:
     return sum(best.values())
 
 
+_final_evo_memo: dict[str, str] = {}
+
+
 def _final_evo_for(name: str) -> str:
     """Return the cache key for this pokemon's final evolution.
 
-    If the name is already in the cache (i.e. it is a final evo), return it
-    directly. Otherwise scan the starters index for a starter that resolves to
-    this name and use its final_evo. Falls back to the raw name so callers
-    receive an empty pairing_vector rather than crashing.
+    Resolves at any evolution stage:
+      1. Already a final evo (in the cache) → return it.
+      2. A starter base form → use the starters index final_evo.
+      3. An intermediate stage (e.g. Fletchinder) → resolve via the evolution
+         chain and pick the final evo present in the cache.
+    Falls back to the raw name so callers receive an empty pairing_vector rather
+    than crashing. Results are memoized (chain lookups can hit the network once).
     """
-    n = name.lower()
+    # Normalize the live game's display name (e.g. "Iron Treads") to the cache's
+    # slug form ("iron-treads"); otherwise multi-word mons miss the cache and get
+    # scored as zero coverage/impact.
+    n = name.lower().strip()
+    for ch in (".", "'", "’", ":"):
+        n = n.replace(ch, "")
+    n = n.replace(" ", "-")
     with _lock:
         if n in _db_noegg:
             return n
+    if n in _final_evo_memo:
+        return _final_evo_memo[n]
+
     for info in starters_index().values():
         if info["name"] == n:
+            _final_evo_memo[n] = info["final_evo"]
             return info["final_evo"]
-    return n
+
+    # Intermediate stage — walk the evolution chain (cached after first lookup).
+    resolved = n
+    try:
+        import pokemon_api
+        finals = [f.lower() for f in pokemon_api.fetch_final_evolutions(n)]
+        with _lock:
+            in_cache = [f for f in finals if f in _db_noegg]
+            if in_cache:
+                resolved = max(in_cache, key=lambda f: _db_noegg[f].get("bst", 0))
+        if resolved == n and finals:
+            resolved = finals[0]
+    except Exception:
+        pass
+    _final_evo_memo[n] = resolved
+    return resolved
 
 
 def potential_team_score(names: list[str]) -> float:
@@ -1229,6 +1521,78 @@ def team_coverage(team_names: list[str]) -> dict:
         "pool_size":  n,
         "per_member": per_member,
     }
+
+
+_runtime_targets: list[dict] | None = None
+
+
+def _get_runtime_targets() -> list[dict]:
+    """Opponent pool as target dicts for runtime battle sims, aligned to
+    _target_order_list. Built once from the no-egg cache and memoized."""
+    global _runtime_targets
+    if _runtime_targets is not None:
+        return _runtime_targets
+    targets: list[dict] = []
+    with _lock:
+        for name in _target_order_list:
+            e = _db_noegg.get(name)
+            if not e:
+                continue
+            targets.append({
+                "name":   name,
+                "types":  e["types"],
+                "atk":    e["atk"],
+                "sp_atk": e["sp_atk"],
+                "speed":  e["speed"],
+                "hp":     e["hp"],
+                "def":    e["defense"],
+                "sp_def": e["sp_def"],
+                "moves":  e.get("moves", []),
+            })
+    _runtime_targets = targets
+    return targets
+
+
+def team_current_counters(team_moves: list[tuple[str, list[dict]]]) -> int:
+    """Opponents the team counters (clean win, Z) using each member's *current*
+    equipped moves rather than its cached optimal moveset.
+
+    Each member is resolved to its projected (final-evo) stats/types/abilities —
+    the only difference from `team_coverage`'s counters is the moveset. An
+    opponent counts if at least one member cleanly wins (Z) against it.
+
+    team_moves: list of (member_name, current_move_dicts). A move dict needs
+    keys: name, type, category, power, accuracy (base_power/power_max optional).
+    """
+    if not _ready or not _target_order_list:
+        return 0
+    targets = _get_runtime_targets()
+    if not targets:
+        return 0
+    countered = [False] * len(targets)
+    eff_memo: dict = {}
+    for name, moves in team_moves:
+        n = (name or "").lower()
+        if not n or not moves:
+            continue
+        final = _final_evo_for(n)
+        with _lock:
+            attacker = _db_noegg.get(final)
+        if not attacker:
+            continue
+        # Keep only damaging moves and coerce numeric fields — status moves carry
+        # power/accuracy = None, which the damage math can't multiply.
+        atk_moves = [
+            {**mv, "power": p, "accuracy": mv.get("accuracy") or 0}
+            for mv in moves if mv and (p := (mv.get("power") or 0)) > 0
+        ]
+        if not atk_moves:
+            continue
+        vec = _compute_battle_score(attacker, targets, eff_memo, moves_override=atk_moves)[6]
+        for j, c in enumerate(vec):
+            if c == 'Z':
+                countered[j] = True
+    return sum(countered)
 
 
 def swap_coverage_delta(
@@ -2065,6 +2429,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                     _ready_egg = True
                 else:
                     _ready = True
+                    _reset_runtime_egg_caches()
                 if on_ready:
                     on_ready()
                 return
@@ -2592,6 +2957,7 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
         _ready_egg = True
     else:
         _ready = True
+        _reset_runtime_egg_caches()
     if on_ready:
         on_ready()
     _prog(on_progress, f"Done — {len(db)} forms scored ({label}).")

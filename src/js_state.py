@@ -53,6 +53,22 @@ EXTRACTOR_JS = r"""
                 ability: tryGet(() => p.getAbility() && p.getAbility().name),
                 abilityIndex: tryGet(() => p.abilityIndex),
                 passive: tryGet(() => p.hasPassive() && p.getPassiveAbility() && p.getPassiveAbility().name) || null,
+                // True when catching this exact wild Pokémon would unlock its
+                // hidden ability for the account (it currently has the hidden
+                // ability AND the starter line hasn't unlocked it yet). Mirrors
+                // PokeRogue's setPokemonSpeciesCaught: idx!==1 || ability2 ? 1<<idx : 4.
+                newHiddenUnlock: tryGet(() => {
+                    const sp = p.species;
+                    if (!sp) return false;
+                    const starterId = (typeof sp.getRootSpeciesId === 'function')
+                        ? sp.getRootSpeciesId(true) : sp.speciesId;
+                    const sd = battle.gameData && battle.gameData.starterData
+                        && battle.gameData.starterData[starterId];
+                    const abilityAttr = sd ? (sd.abilityAttr || 0) : 0;
+                    const idx = p.abilityIndex;
+                    const toUnlock = (idx !== 1 || sp.ability2) ? (1 << idx) : 4;
+                    return toUnlock === 4 && !(abilityAttr & 4);
+                }) || false,
                 moves: (p.moveset || []).map(m => m && m.getName ? m.getName() : null),
                 ivs: p.ivs,
                 nature: p.nature,
@@ -186,7 +202,8 @@ EXTRACTOR_JS = r"""
         return {
             wave: battle.currentBattle ? battle.currentBattle.waveIndex : null,
             battleType: tryGet(() => battle.currentBattle && battle.currentBattle.battleType) || 0,
-            biome: tryGet(() => battle.arena && battle.arena.biomeType),
+            biome: tryGet(() => battle.arena && (battle.arena.biomeId != null ? battle.arena.biomeId : battle.arena.biomeType)),
+            isClassic: tryGet(() => battle.gameMode && battle.gameMode.isClassic) || false,
             weather: tryGet(() => battle.arena.weather && battle.arena.weather.weatherType),
             terrain: tryGet(() => battle.arena.terrain && battle.arena.terrain.terrainType),
             trickRoom: trickRoom,

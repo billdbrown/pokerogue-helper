@@ -126,6 +126,7 @@ class _Signals(QObject):
     result_ready          = pyqtSignal(object)  # (slot, PokemonData, weaknesses)
     move_ready            = pyqtSignal(object)  # (slot, mi, MoveData)
     analysis_ready        = pyqtSignal(object)  # (full, partial, gaps, suggestions, danger, slot_stats, weakest_slot, replace_sugg, pref_type)
+    current_ready         = pyqtSignal(object)  # (sig, current_counters, pool_size) — async "Current" counters result
     team_changed          = pyqtSignal()        # fires whenever the team file is rewritten — listeners can refresh derived displays
     error                 = pyqtSignal(object)
     ability_tooltip_ready = pyqtSignal(int, str)
@@ -181,6 +182,10 @@ class TeamPanel(QWidget):
         self._unique_lbls: list[QLabel | None] = [None] * TEAM_SIZE
         self._last_potential: float = 0.0
         self._last_impact:    float = 0.0
+        self._last_cov_sig = None       # sig of the displayed "Current" value
+        self._cur_inflight_sig = None   # sig of the in-flight async compute
+        self._last_pool: int = 0
+        self._cur_debounce_timer: QTimer | None = None
         self._potential_pulse_timer: QTimer | None = None
         self._impact_pulse_timer:    QTimer | None = None
         self._potential_delta_lbl: QLabel | None = None
@@ -193,6 +198,7 @@ class TeamPanel(QWidget):
         self._signals.result_ready.connect(self._on_result)
         self._signals.move_ready.connect(self._on_move_ready)
         self._signals.analysis_ready.connect(self._on_analysis_ready)
+        self._signals.current_ready.connect(self._on_current_ready)
         self._signals.error.connect(lambda p: (
             self._pending_lookups.discard(p[0]),
             self._pending_lookup_names.pop(p[0], None),
@@ -265,7 +271,7 @@ class TeamPanel(QWidget):
         inner.addLayout(title_row)
 
         scores_row = QHBoxLayout()
-        pot_hdr = QLabel("Checks")
+        pot_hdr = QLabel("Potential")
         pot_hdr.setStyleSheet("color:#6c7086; font-size:14px;")
         self._potential_lbl = QLabel("—")
         self._potential_lbl.setStyleSheet("color:#cba6f7; font-size:39px; font-weight:bold;")
@@ -278,7 +284,7 @@ class TeamPanel(QWidget):
         scores_row.addSpacing(6)
         scores_row.addWidget(self._potential_delta_lbl)
         scores_row.addStretch()
-        imp_hdr = QLabel("Counters")
+        imp_hdr = QLabel("Current")
         imp_hdr.setStyleSheet("color:#6c7086; font-size:14px;")
         self._impact_lbl = QLabel("—")
         self._impact_lbl.setStyleSheet("color:#a6e3a1; font-size:39px; font-weight:bold;")
@@ -368,40 +374,8 @@ class TeamPanel(QWidget):
         root.setContentsMargins(6, 4, 6, 4)
         root.setSpacing(3)
 
-        hdr_row = QHBoxLayout()
-        hdr_row.setContentsMargins(0, 0, 0, 0)
-        pot_hdr_s = QLabel("Checks")
-        pot_hdr_s.setStyleSheet("color:#6c7086; font-size:14px;")
-        self._potential_lbl = QLabel("—")
-        self._potential_lbl.setStyleSheet("color:#cba6f7; font-size:33px; font-weight:bold;")
-        self._potential_delta_lbl = QLabel("")
-        self._potential_delta_lbl.setStyleSheet("color:#cba6f7; font-size:13px;")
-        self._potential_delta_lbl.setVisible(False)
-        hdr_row.addWidget(pot_hdr_s)
-        hdr_row.addSpacing(3)
-        hdr_row.addWidget(self._potential_lbl)
-        hdr_row.addSpacing(4)
-        hdr_row.addWidget(self._potential_delta_lbl)
-        hdr_row.addStretch(1)
-        self._uncovered_lbl = QLabel("")
-        self._uncovered_lbl.setStyleSheet("color:#6c7086; font-size:11px;")
-        self._uncovered_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hdr_row.addWidget(self._uncovered_lbl)
-        hdr_row.addStretch(1)
-        imp_hdr_s = QLabel("Counters")
-        imp_hdr_s.setStyleSheet("color:#6c7086; font-size:14px;")
-        self._impact_lbl = QLabel("—")
-        self._impact_lbl.setStyleSheet("color:#a6e3a1; font-size:33px; font-weight:bold;")
-        self._impact_delta_lbl = QLabel("")
-        self._impact_delta_lbl.setStyleSheet("color:#a6e3a1; font-size:13px;")
-        self._impact_delta_lbl.setVisible(False)
-        hdr_row.addWidget(self._impact_delta_lbl)
-        hdr_row.addSpacing(4)
-        hdr_row.addWidget(self._impact_lbl)
-        hdr_row.addSpacing(3)
-        hdr_row.addWidget(imp_hdr_s)
-        root.addLayout(hdr_row)
-
+        # Checks/Counters totals now live at the top of the Analysis tab
+        # (see AnalysisPanel.update_coverage) so the slots get the full height here.
         slots_row = QHBoxLayout()
         slots_row.setContentsMargins(0, 0, 0, 0)
         slots_row.setSpacing(4)
@@ -1572,37 +1546,99 @@ class TeamPanel(QWidget):
                 self._uncovered_lbl.setText("")
                 self._uncovered_lbl.setToolTip("")
             self._update_per_slot_unique([0] * TEAM_SIZE)
+            if self._analysis_panel is not None:
+                self._analysis_panel.update_coverage(0, 0, None)
+            self._last_cov_sig = None
+            self._cur_inflight_sig = None
             return
 
-        # Projected team coverage — checks (W or Z) and counters (Z) against
-        # the impact opponent pool. Uses each member's final-evo + cached optimal moveset.
+        # Projected team coverage against the impact opponent pool.
+        #   Potential = counters (clean win, Z) with each member's ideal moveset.
+        #   Current   = counters (Z) with each member's *currently equipped* moves.
+        # Both resolve members to their final evo — the only difference is the moveset.
         team_names = [p.name.lower() if p is not None else "" for p in self._team_data]
-        cov = impact_db.team_coverage(team_names)
-        new_checks   = float(cov["checks"])
-        new_counters = float(cov["counters"])
 
-        # Update the "Checks" label (formerly Potential — purple).
+        cov = impact_db.team_coverage(team_names)  # cheap (~0.5 ms)
+        new_potential = float(cov["counters"])
+        pool = cov.get("pool_size", 0)
+        self._last_pool = pool
+
+        # "Potential" label (purple) — cheap, update immediately.
         if self._potential_lbl:
-            self._potential_lbl.setText(self._fmt_score(new_checks) if new_checks > 0 else "—")
-            if new_checks > self._last_potential + 0.5:
-                delta = new_checks - self._last_potential
+            self._potential_lbl.setText(self._fmt_score(new_potential) if new_potential > 0 else "—")
+            if new_potential > self._last_potential + 0.5:
+                delta = new_potential - self._last_potential
                 self._pulse_label(self._potential_lbl, "potential")
                 self._show_delta(self._potential_delta_lbl, delta, "potential",
                                  "#cba6f7")
-            self._last_potential = new_checks
-
-        # Update the "Counters" label (formerly Team Impact — green).
-        if self._impact_lbl:
-            self._impact_lbl.setText(self._fmt_score(new_counters) if new_counters > 0 else "—")
-            if new_counters > self._last_impact + 0.5:
-                delta = new_counters - self._last_impact
-                self._pulse_label(self._impact_lbl, "impact")
-                self._show_delta(self._impact_delta_lbl, delta, "impact",
-                                 "#a6e3a1")
-            self._last_impact = new_counters
+            self._last_potential = new_potential
 
         self._update_uncovered_display(cov["uncovered"])
         self._update_per_slot_unique([m["unique_checks"] for m in cov["per_member"]])
+        if self._analysis_panel is not None:
+            self._analysis_panel.update_coverage(
+                int(new_potential), int(self._last_impact), cov["uncovered"], pool)
+
+        # "Current" counters is expensive (~33 ms) — compute off the main thread so
+        # swapping a Pokémon in (which streams its moves in one at a time) never
+        # blocks the UI. An order-independent signature avoids recomputes when only
+        # the party order changed.
+        if self._cur_debounce_timer is None:
+            self._cur_debounce_timer = QTimer(self)
+            self._cur_debounce_timer.setSingleShot(True)
+            self._cur_debounce_timer.timeout.connect(self._spawn_current_compute)
+        self._cur_debounce_timer.start(300)
+
+    def _spawn_current_compute(self):
+        """Fire the debounced background compute of the 'Current' counters value."""
+        if not impact_db.is_ready():
+            return
+        team_names = [p.name.lower() if p is not None else "" for p in self._team_data]
+        cur_sig = frozenset(
+            (team_names[i], tuple(sorted(
+                m.name.lower() for m in self._team_moves[i] if m is not None)))
+            for i in range(TEAM_SIZE) if self._team_data[i] is not None
+        )
+        if cur_sig == self._last_cov_sig or cur_sig == self._cur_inflight_sig:
+            return  # already displayed, or a compute for this exact team is in flight
+        self._cur_inflight_sig = cur_sig
+        team_moves = []
+        for i in range(TEAM_SIZE):
+            if self._team_data[i] is None:
+                continue
+            moves = [
+                {"name": m.name, "type": m.type, "category": m.category,
+                 "power": m.power, "accuracy": m.accuracy}
+                for m in self._team_moves[i] if m is not None
+            ]
+            team_moves.append((self._team_data[i].name.lower(), moves))
+        pool = self._last_pool
+
+        def _compute(sig=cur_sig, tm=team_moves, pl=pool):
+            try:
+                val = float(impact_db.team_current_counters(tm))
+            except Exception:
+                val = 0.0
+            self._signals.current_ready.emit((sig, val, pl))
+
+        threading.Thread(target=_compute, daemon=True).start()
+
+    def _on_current_ready(self, payload):
+        """Main-thread slot: apply an async 'Current' counters result if still current."""
+        sig, val, pool = payload
+        if sig != self._cur_inflight_sig:
+            return  # team changed again before this finished — discard stale result
+        self._cur_inflight_sig = None
+        self._last_cov_sig = sig
+        if self._impact_lbl:
+            self._impact_lbl.setText(self._fmt_score(val) if val > 0 else "—")
+            if val > self._last_impact + 0.5:
+                delta = val - self._last_impact
+                self._pulse_label(self._impact_lbl, "impact")
+                self._show_delta(self._impact_delta_lbl, delta, "impact", "#a6e3a1")
+        self._last_impact = val
+        if self._analysis_panel is not None:
+            self._analysis_panel.set_current(val, pool)
 
     def _update_uncovered_display(self, uncovered: list[str]) -> None:
         """Refresh the 'Uncovered: N' label and its tooltip listing the species."""

@@ -10,6 +10,7 @@ Two modes:
 """
 
 import itertools
+import re
 import threading
 
 from PyQt6.QtWidgets import (
@@ -19,11 +20,18 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QObject, QMetaObject, Q_ARG
 
 import impact_db
+from overlay import _pct_color, _impact_tooltip
 
 _BUDGET_DEFAULT = 10
 _MAX_TEAM      = 6
 _SEARCH_TOP_N  = 25
 _SHOW_TEAMS    = 5
+_MAX_MEGAS     = 1    # only one Pokémon can hold a Mega Stone per battle
+_MEGA_TOP_N    = 8    # strongest Megas to seed the coverage search with
+
+
+def _is_mega(name: str) -> bool:
+    return "-mega" in (name or "")
 
 _COST_COLORS = {1: "#a6e3a1", 2: "#a6e3a1", 3: "#f9e2af", 4: "#f9e2af",
                 5: "#fab387", 6: "#fab387", 7: "#f38ba8", 8: "#f38ba8",
@@ -59,7 +67,7 @@ class _Worker(QObject):
     done = pyqtSignal(list, str)   # results, mode
 
     def __init__(self, unlocked_ids, won_ids, exclude_beaten, budget, mode, fixed_infos,
-                 incl_legendary=False, value_reductions=None):
+                 incl_legendary=False, value_reductions=None, egg_moves_owned=None):
         super().__init__()
         self._unlocked        = set(unlocked_ids) if unlocked_ids else set()
         self._won             = set(won_ids)
@@ -69,75 +77,105 @@ class _Worker(QObject):
         self._fixed           = fixed_infos   # already-selected starters (locked in)
         self._incl_legendary  = incl_legendary
         self._value_reductions = value_reductions or {}
+        self._egg_moves_owned  = egg_moves_owned or {}
+        # Megas the player has already pinned count against the one-mega cap.
+        self._fixed_mega = sum(1 for f in self._fixed if _is_mega(f.get("final_evo", "")))
 
     # ── pool ──────────────────────────────────────────────────────────────────
 
     def _build_pool(self) -> list[dict]:
         idx = impact_db.starters_index()
         fixed_evos = {f["final_evo"] for f in self._fixed}
+        fixed_sids = {f.get("sid") for f in self._fixed}
         pool = []
         for sid, info in idx.items():
             if self._unlocked and sid not in self._unlocked:
                 continue
             if self._exclude and sid in self._won:
                 continue
+            if sid in fixed_sids:
+                continue   # species already locked in (in any form)
             if info["cost"] > self._budget:
                 continue
             final = info["final_evo"]
             if final in fixed_evos:
                 continue   # already locked in
-            entry = impact_db.get(final)
-            if not entry:
-                continue
-            if not self._incl_legendary and entry.get("legendary"):
-                continue
             base_cost  = info["cost"]
             reduction  = self._value_reductions.get(sid, 0)
             eff_cost   = max(1, base_cost - reduction)
-            pool.append({
-                "sid":        sid,
-                "name":       info["name"],
-                "final_evo":  final,
-                "cost":       eff_cost,
-                "discounted": reduction > 0,
-                "impact":     entry.get("impact", 0.0),
-                "percentile": entry.get("percentile", 0),
-            })
+            bitmask    = self._egg_moves_owned.get(sid, 0)
+            # starters_index picks the strongest final evo, which is the Mega when
+            # one exists. Offer the non-mega form alongside it so the species can
+            # still be fielded once the team's single Mega slot is spoken for.
+            forms = [final]
+            if _is_mega(final):
+                base_form = re.sub(r"-mega.*$", "", final)
+                if base_form and base_form != final:
+                    forms.append(base_form)
+            for form in forms:
+                entry = impact_db.get(form)
+                if not entry:
+                    continue
+                if not self._incl_legendary and entry.get("legendary"):
+                    continue
+                # Egg-aware Impact: factor in the specific egg moves the player owns.
+                disp, raw, boosted = impact_db.egg_aware_score(form, info["name"], bitmask)
+                pool.append({
+                    "sid":        sid,
+                    "name":       info["name"],
+                    "final_evo":  form,
+                    "cost":       eff_cost,
+                    "discounted": reduction > 0,
+                    "impact":     raw,            # raw battle score (egg-aware) — drives ranking
+                    "score":      disp,           # display Impact number
+                    "egg_boosted": boosted,
+                    "percentile": entry.get("percentile", 0),
+                    "is_mega":    _is_mega(form),
+                })
         pool.sort(key=lambda x: x["impact"], reverse=True)
         return pool
 
     # ── coverage mode ─────────────────────────────────────────────────────────
 
     def run(self):
+        # Compute results inside the guard, but emit OUTSIDE it. The done signal is
+        # delivered on this thread (DirectConnection), so emit() synchronously runs
+        # the panel's card rendering — keeping it in the try would mask any render
+        # error as a worker failure and wrongly fall back to an empty result.
         try:
-            if not impact_db.is_ready():
+            if not impact_db.is_ready() or not impact_db.starters_index():
                 self.done.emit([], self._mode)
                 return
-            if not impact_db.starters_index():
-                self.done.emit([], self._mode)
-                return
-
             pool = self._build_pool()
             if not pool and not self._fixed:
                 self.done.emit([], self._mode)
                 return
-
-            if self._mode == "quality":
-                self.done.emit(self._run_quality(pool), "quality")
-            else:
-                self.done.emit(self._run_coverage(pool), "coverage")
+            results = (self._run_quality(pool) if self._mode == "quality"
+                       else self._run_coverage(pool))
         except Exception as e:
             print(f"[team_builder] worker error: {e}")
             import traceback; traceback.print_exc()
             self.done.emit([], self._mode)
+            return
+
+        self.done.emit(results, self._mode)
 
     def _run_coverage(self, pool: list) -> list:
-        candidates = pool[:_SEARCH_TOP_N]
+        # Seed the search with the strongest non-mega forms plus a handful of the
+        # best Megas. Keeping non-mega forms in the slice guarantees there are
+        # legal fills once the one allowed Mega is placed (an all-Mega slice would
+        # leave nothing to build a valid >1-member team from).
+        bases = [p for p in pool if not p["is_mega"]]
+        megas = [p for p in pool if p["is_mega"]]
+        candidates = sorted(bases[:_SEARCH_TOP_N] + megas[:_MEGA_TOP_N],
+                            key=lambda x: x["impact"], reverse=True)
         fixed_names = [f["final_evo"] for f in self._fixed]
         results = []
 
         for size in range(1, 4):
             for combo in itertools.combinations(candidates, size):
+                if not self._combo_ok(combo):
+                    continue
                 total_cost = sum(c["cost"] for c in combo)
                 if total_cost > self._budget:
                     continue
@@ -163,29 +201,55 @@ class _Worker(QObject):
             for seed_combo in itertools.islice(
                 itertools.combinations(candidates[:20], seed_size), 30
             ):
+                if not self._combo_ok(seed_combo):
+                    continue
                 seed_cost = sum(c["cost"] for c in seed_combo)
                 if seed_cost > self._budget:
                     continue
-                team = list(seed_combo)
-                remaining = self._budget - seed_cost
-                available = [c for c in candidates if c not in team]
-                while len(team) < _MAX_TEAM and available:
-                    base = fixed_names + [c["final_evo"] for c in team]
-                    curr = impact_db.team_score(base)
-                    best_gain, best_pick = 0.0, None
-                    for c in available:
-                        if c["cost"] > remaining:
-                            continue
-                        gain = impact_db.team_score(base + [c["final_evo"]]) - curr
-                        if gain > best_gain:
-                            best_gain, best_pick = gain, c
-                    if best_pick is None:
-                        break
-                    team.append(best_pick)
-                    remaining -= best_pick["cost"]
-                    available = [c for c in available if c is not best_pick]
+                available = [c for c in candidates if c not in seed_combo]
+                team, _ = self._greedy_fill(list(seed_combo),
+                                            self._budget - seed_cost,
+                                            available, fixed_names)
                 score = impact_db.team_score(fixed_names + [c["final_evo"] for c in team])
                 results.append((score, tuple(team)))
+
+    # ── Constraints & greedy fill ──────────────────────────────────────────────
+
+    def _combo_ok(self, members) -> bool:
+        """A combo is legal if it adds at most one Mega (counting pinned Megas)
+        and never uses the same species (sid) twice."""
+        megas = self._fixed_mega + sum(1 for m in members if m["is_mega"])
+        if megas > _MAX_MEGAS:
+            return False
+        sids = [m["sid"] for m in members]
+        return len(sids) == len(set(sids))
+
+    def _greedy_fill(self, team, remaining, available, fixed_names):
+        """Greedily add the highest team_score-gain candidate until the team is
+        full or the budget runs out, respecting the one-Mega and one-form-per-
+        species caps. Returns (team, remaining)."""
+        while remaining > 0 and len(team) < _MAX_TEAM and available:
+            base = fixed_names + [c["final_evo"] for c in team]
+            curr = impact_db.team_score(base)
+            team_sids = {t["sid"] for t in team}
+            mega_full = self._fixed_mega + sum(1 for t in team if t["is_mega"]) >= _MAX_MEGAS
+            best_gain, best_pick = 0.0, None
+            for c in available:
+                if c["cost"] > remaining:
+                    continue
+                if c["sid"] in team_sids:
+                    continue
+                if c["is_mega"] and mega_full:
+                    continue
+                gain = impact_db.team_score(base + [c["final_evo"]]) - curr
+                if gain > best_gain:
+                    best_gain, best_pick = gain, c
+            if best_pick is None:
+                break
+            team.append(best_pick)
+            remaining -= best_pick["cost"]
+            available = [c for c in available if c is not best_pick]
+        return team, remaining
 
     # ── quality mode ──────────────────────────────────────────────────────────
 
@@ -205,26 +269,11 @@ class _Worker(QObject):
         for anchor in pool[:_SHOW_TEAMS * 2]:  # try enough anchors to fill the display
             if anchor["cost"] > self._budget:
                 continue
-            team      = [anchor]
-            remaining = self._budget - anchor["cost"]
+            if not self._combo_ok([anchor]):
+                continue   # e.g. anchor is a Mega but a pinned starter already is
             available = [p for p in pool if p is not anchor]
-
-            while remaining > 0 and len(team) < _MAX_TEAM and available:
-                base      = fixed_names + [c["final_evo"] for c in team]
-                curr      = impact_db.team_score(base)
-                best_gain, best_pick = 0.0, None
-                for c in available:
-                    if c["cost"] > remaining:
-                        continue
-                    gain = impact_db.team_score(base + [c["final_evo"]]) - curr
-                    if gain > best_gain:
-                        best_gain, best_pick = gain, c
-                if best_pick is None:
-                    break
-                team.append(best_pick)
-                remaining -= best_pick["cost"]
-                available = [c for c in available if c is not best_pick]
-
+            team, _ = self._greedy_fill([anchor], self._budget - anchor["cost"],
+                                        available, fixed_names)
             score = impact_db.team_score(fixed_names + [c["final_evo"] for c in team])
             results.append((score, tuple(team)))
 
@@ -258,6 +307,7 @@ class TeamBuilderPanel(QWidget):
         self._won_ids:         list[int] = []
         self._selected_ids:    list[int] = []
         self._value_reductions: dict[int, int] = {}  # {sid: reduction_amount}
+        self._egg_moves_owned:  dict[int, int] = {}  # {sid: eggMoves bitmask}
         self._budget = _BUDGET_DEFAULT
         self._mode   = "quality"
 
@@ -357,18 +407,22 @@ class TeamBuilderPanel(QWidget):
         won        = snapshot.get("won_ids") or []
         selected   = snapshot.get("selected_ids") or []
         reductions = snapshot.get("value_reductions") or {}
+        egg_owned  = snapshot.get("egg_moves_owned") or {}
         # snapshot keys are strings (JSON); convert to int
         reductions = {int(k): v for k, v in reductions.items()}
+        egg_owned  = {int(k): v for k, v in egg_owned.items()}
 
         changed = (unlocked != self._unlocked_ids
                    or won != self._won_ids
                    or selected != self._selected_ids
-                   or reductions != self._value_reductions)
+                   or reductions != self._value_reductions
+                   or egg_owned != self._egg_moves_owned)
 
         self._unlocked_ids     = unlocked
         self._won_ids          = won
         self._selected_ids     = selected
         self._value_reductions = reductions
+        self._egg_moves_owned  = egg_owned
 
         if changed:
             self._recompute()
@@ -436,7 +490,9 @@ class TeamBuilderPanel(QWidget):
         exclude      = self._excl_cb.isChecked()
         won_set      = set(self._won_ids)
 
-        # Resolve locked-in starters (selected in game UI)
+        # Resolve locked-in starters (selected in game UI). Apply the same value
+        # reduction the pool uses so locked starters show their true reduced cost
+        # and the budget isn't over-counted.
         fixed_infos = []
         fixed_cost  = 0
         for sid in self._selected_ids:
@@ -444,8 +500,16 @@ class TeamBuilderPanel(QWidget):
                 continue
             info = idx.get(sid)
             if info:
+                reduction = self._value_reductions.get(sid, 0)
+                eff_cost  = max(1, info["cost"] - reduction)
+                bitmask   = self._egg_moves_owned.get(sid, 0)
+                disp, raw, boosted = impact_db.egg_aware_score(
+                    info["final_evo"], info["name"], bitmask)
+                info = {**info, "sid": sid, "cost": eff_cost,
+                        "discounted": reduction > 0,
+                        "impact": raw, "score": disp, "egg_boosted": boosted}
                 fixed_infos.append(info)
-                fixed_cost += info["cost"]
+                fixed_cost += eff_cost
 
         fill_budget = self._budget - fixed_cost
 
@@ -464,6 +528,7 @@ class TeamBuilderPanel(QWidget):
             exclude, fill_budget, self._mode, fixed_infos,
             incl_legendary=self._leg_cb.isChecked(),
             value_reductions=self._value_reductions,
+            egg_moves_owned=self._egg_moves_owned,
         )
         worker.done.connect(lambda results, mode: self._on_results(results, mode, fixed_infos))
         t = threading.Thread(target=worker.run, daemon=True)
@@ -476,14 +541,6 @@ class TeamBuilderPanel(QWidget):
             self._rebuild_coverage(results, fixed_infos)
 
     # ── Coverage display ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _fmt_score(score: float) -> str:
-        if score >= 1_000_000:
-            return f"{score / 1_000_000:.1f}M"
-        if score >= 1_000:
-            return f"{score / 1_000:.0f}k"
-        return f"{score:.0f}"
 
     def _rebuild_coverage(self, teams: list, fixed_infos: list):
         self._clear_content()
@@ -527,9 +584,19 @@ class TeamBuilderPanel(QWidget):
         cost_lbl = QLabel(f"{total_cost}/{self._budget}pts")
         cost_lbl.setStyleSheet(f"color:{cost_color}; font-size:11px;")
         hdr_hl.addWidget(cost_lbl)
-        score_lbl = QLabel(f"impact {self._fmt_score(score)}")
-        score_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
-        hdr_hl.addWidget(score_lbl)
+        # Share of the opponent pool this team has a direct counter (Z) against.
+        # Kept defensive: a coverage hiccup should drop the badge, not the card.
+        try:
+            cov  = impact_db.team_coverage([m["final_evo"] for m in all_members])
+            pool = cov.get("pool_size", 0)
+            ctr_pct = round(cov["counters"] / pool * 100) if pool else None
+        except Exception as e:
+            print(f"[team_builder] counter%% badge failed: {e}")
+            ctr_pct = None
+        if ctr_pct is not None:
+            score_lbl = QLabel(f"counter {ctr_pct}%")
+            score_lbl.setStyleSheet("color:#a6e3a1; font-size:10px;")
+            hdr_hl.addWidget(score_lbl)
         hdr_hl.addStretch()
         vl.addLayout(hdr_hl)
 
@@ -570,11 +637,18 @@ class TeamBuilderPanel(QWidget):
 
         entry = impact_db.get(final)
         if entry:
-            pct = entry.get("percentile", 0)
-            pct_color = "#a6e3a1" if pct >= 90 else "#f9e2af" if pct >= 70 else "#a6adc8"
-            pct_lbl = QLabel(f"p{pct}")
-            pct_lbl.setStyleSheet(f"color:{pct_color}; font-size:10px;")
-            row.addWidget(pct_lbl)
+            pct   = entry.get("percentile", 0)
+            # Egg-aware Impact when the worker computed one; else fall back to base.
+            score   = info["score"] if "score" in info else impact_db.impact_score(final)
+            boosted = info.get("egg_boosted", False)
+            egg_tag = " 🥚" if boosted else ""
+            score_lbl = QLabel(f"Impact {score}{egg_tag}")
+            score_lbl.setStyleSheet(f"color:{_pct_color(pct)}; font-size:10px;")
+            tip = _impact_tooltip(entry)
+            if boosted:
+                tip += "\n(includes your owned egg moves)"
+            score_lbl.setToolTip(tip)
+            row.addWidget(score_lbl)
 
         cost = info["cost"]
         if info.get("discounted"):

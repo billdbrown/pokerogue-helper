@@ -188,6 +188,7 @@ class WavePanel(QWidget):
 
         self._biome_lbl = QLabel("")
         self._biome_lbl.setStyleSheet("color:#94e2d5; font-size:10px; font-weight:bold;")
+        self._biome_lbl.setMinimumWidth(250)
         self._biome_lbl.setVisible(False)
         root.addWidget(self._biome_lbl)
 
@@ -198,7 +199,7 @@ class WavePanel(QWidget):
         root.addWidget(sep2)
 
         self._event_rows = []
-        for _ in range(5):
+        for _ in range(3):
             w_lbl = QLabel("")
             w_lbl.setStyleSheet("color:#6c7086; font-size:10px; font-weight:bold;")
             n_lbl = QLabel("")
