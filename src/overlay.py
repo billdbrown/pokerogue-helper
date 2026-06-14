@@ -341,6 +341,7 @@ class OverlayPanel(QWidget):
         self._rec_anims: list                        = [None] * NUM_SLOTS
         self._slot_bst_pcts: list[float | None]      = [None] * NUM_SLOTS
         self._party_names: list[str]                 = []
+        self._locked_names: set[str]                 = set()  # species the player won't swap out
         self._party_current_moves: list[list[str]]   = []  # currently equipped move names
         self._party_stat_totals: list[int | None]    = []  # sum of all 6 live stats per member
         self._party_snapshot: list[dict]             = []  # full party snapshot (live stats + nature)
@@ -1137,6 +1138,19 @@ class OverlayPanel(QWidget):
                     target=self._compute_recommendation, args=(slot,), daemon=True
                 ).start()
 
+    def set_locked_names(self, names) -> None:
+        """Party species the player has locked. A locked Pokémon is never named as
+        the one to drop in a replace/consider suggestion. Recomputes live banners."""
+        new = {(n or '').lower() for n in (names or [])}
+        if new == self._locked_names:
+            return
+        self._locked_names = new
+        for slot in range(NUM_SLOTS):
+            if self._enemy_moves[slot]:
+                threading.Thread(
+                    target=self._compute_recommendation, args=(slot,), daemon=True
+                ).start()
+
     def _build_team_coverage(self, exclude_slot: int | None) -> dict:
         """Per-pairing best SE damage for the current party, optionally skipping one slot."""
         best: dict = {}
@@ -1355,7 +1369,13 @@ class OverlayPanel(QWidget):
             self._signals.rec_ready.emit((slot, None))
             return
 
-        swap = impact_db.best_coverage_swap(team_names, cand_name)
+        # max_replaced_score keeps us from ever proposing to drop a Pokémon stronger
+        # than the candidate, evaluated across all slots — not just the top swap — so
+        # locking a strong member can't surface a swap that was otherwise suppressed.
+        swap = impact_db.best_coverage_swap(
+            team_names, cand_name, locked=self._locked_names,
+            max_replaced_score=(wild_score or 0),
+        )
 
         if swap is not None:
             replaced_name = swap['replaced_name']
@@ -1392,37 +1412,35 @@ class OverlayPanel(QWidget):
             self._signals.rec_ready.emit((slot, None))
             return
 
-        # Best swap allowing negative deltas — show the player what would happen.
+        # Best swap allowing negative deltas — names the *least valuable* slot to
+        # drop for this candidate. This is coverage-contribution based: a member
+        # whose typing is redundant (e.g. a second Electric) is a better drop than
+        # one carrying unique coverage, even if its standalone impact is higher.
         consider_swap = impact_db.best_coverage_swap(
-            team_names, cand_name, require_positive=False
+            team_names, cand_name, require_positive=False, locked=self._locked_names
         )
-        consider_delta_checks   = consider_swap['delta_checks']   if consider_swap else 0
-        consider_delta_counters = consider_swap['delta_counters'] if consider_swap else 0
+        replaced_name = replaced_ai = replaced_score = None
+        if consider_swap is not None:
+            replaced_name  = consider_swap['replaced_name']
+            replaced_final = impact_db._final_evo_for(replaced_name.lower())
+            replaced_entry = impact_db.get(replaced_final)
+            replaced_ai    = replaced_entry['percentile'] if replaced_entry else 0
+            replaced_score = impact_db.impact_score(replaced_final) if replaced_entry else 0
 
-        team_ais: list[tuple[str, int, int]] = []
-        for n in self._party_names:
-            if not n:
-                continue
-            lookup = n if impact_db.get(n) else impact_db._final_evo_for(n)
-            e = impact_db.get(lookup)
-            if e:
-                team_ais.append((n.replace('-', ' ').title(), e['percentile'],
-                                 impact_db.impact_score(lookup)))
-
-        weakest = min(team_ais, key=lambda x: x[1]) if team_ais else None
-
-        if weakest and wild_ai > weakest[1]:
+        # Only float it as a "consider" if the candidate isn't a raw-power
+        # downgrade on the slot it'd drop (same guard as the replace branch).
+        if replaced_name and (wild_score or 0) >= replaced_score:
             self._signals.rec_ready.emit((slot, {
                 'kind':            'consider',
                 'name':            cand_name.replace('-', ' ').title(),
                 'candidate_ai':    wild_ai,
                 'candidate_score': wild_score,
-                'weakest_name':    weakest[0],
-                'weakest_ai':      weakest[1],
-                'weakest_score':   weakest[2],
+                'weakest_name':    replaced_name.replace('-', ' ').title(),
+                'weakest_ai':      replaced_ai,
+                'weakest_score':   replaced_score,
                 'moves':           wild_moves,
-                'delta_checks':    consider_delta_checks,
-                'delta_counters':  consider_delta_counters,
+                'delta_checks':    consider_swap['delta_checks'],
+                'delta_counters':  consider_swap['delta_counters'],
             }))
         elif wild_ai > 0:
             self._signals.rec_ready.emit((slot, {

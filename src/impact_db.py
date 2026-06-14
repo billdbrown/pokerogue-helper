@@ -29,7 +29,7 @@ from weakness_calc import ALL_TYPES, _effectiveness
 BASE_URL = "https://pokeapi.co/api/v2"
 CACHE_FILE     = data_path("impact_cache.json")
 CACHE_FILE_EGG = data_path("impact_cache_egg.json")
-CACHE_VERSION  = 43
+CACHE_VERSION  = 45
 
 # Forms omitted from all scoring (duplicates or Pokerogue-unavailable mechanics).
 _EXCLUDED_FORMS: frozenset[str] = frozenset({
@@ -874,6 +874,54 @@ def impact_score(name: str) -> int:
     return round(entry["impact"] / med * 100) if med > 0 else 0
 
 
+# ── Growth-rate early-game weighting ───────────────────────────────────────────
+# A faster-levelling Pokémon comes online sooner on the early floors, so it's worth
+# more there than its raw Impact implies; a slow leveller (Beldum → Metagross is the
+# canonical case) is worth less. Factors below up-weight Impact by leveling speed,
+# with Medium-slow as the 0% baseline. Keys are PokéAPI growth_rate names; unknown
+# or missing → neutral 1.0.
+_GROWTH_FACTORS = {
+    "fast":                1.15,  # +15%
+    "medium":              1.10,  # Medium-fast  +10%
+    "fast-then-very-slow": 1.10,  # Fluctuating  +10%
+    "slow-then-very-fast": 1.05,  # Erratic       +5%
+    "medium-slow":         1.00,  # baseline       0%
+    "slow":                0.90,  # -10%
+}
+
+# Display names for tooltips, keyed by PokéAPI growth_rate name.
+_GROWTH_NAMES = {
+    "fast":                "Fast",
+    "medium":              "Medium-fast",
+    "fast-then-very-slow": "Fluctuating",
+    "slow-then-very-fast": "Erratic",
+    "medium-slow":         "Medium-slow",
+    "slow":                "Slow",
+}
+
+
+def growth_factor(growth_rate: str | None) -> float:
+    """Early-game Impact multiplier for a PokéAPI growth_rate name (1.0 if unknown)."""
+    return _GROWTH_FACTORS.get(growth_rate or "", 1.0)
+
+
+def growth_badge(growth_rate: str | None):
+    """(emoji, label, color) for a known growth rate, else None.
+
+    The emoji is '' for near-baseline rates — the card shows no glyph for them but
+    the tooltip still reports the leveling speed. Only the clear movers get ⚡/🐢.
+    """
+    gf = _GROWTH_FACTORS.get(growth_rate or "")
+    if gf is None:
+        return None
+    label = f"{_GROWTH_NAMES.get(growth_rate, growth_rate)} leveling"
+    if gf >= 1.10:
+        return ("⚡", label, "#a6e3a1")
+    if gf <= 0.95:
+        return ("🐢", label, "#f38ba8")
+    return ("", label, "#a6adc8")
+
+
 # ── Owned-egg-aware scoring ────────────────────────────────────────────────────
 # Computes a true Impact battle score for a starter given the *specific* egg moves
 # the player owns (a subset, per the game's eggMoves bitmask) — not zero, not all.
@@ -1430,6 +1478,23 @@ def best_swap_pi(
 _CHECK_CHARS = frozenset({'Z', 'W'})
 _COUNTER_CHARS = frozenset({'Z'})
 
+# Per-matchup "win quality" q = (a_final − b_final + 1) / 2 ∈ [0, 1] — exactly the
+# term summed into the battle score. q > 0.5 ⟺ win, and its magnitude says how
+# dominant the win is, so it ranks which member is the *strongest* answer to a given
+# opponent. Stored as one printable char per target (94 levels) in quality_vec,
+# aligned to _target_order_list just like outcomes_vec.
+_QUALITY_LEVELS = 93  # chr(33)='!' .. chr(126)='~'
+
+
+def _quality_char(q: float) -> str:
+    lvl = round(max(0.0, min(1.0, q)) * _QUALITY_LEVELS)
+    return chr(33 + lvl)
+
+
+def _quality_level(c: str) -> int:
+    """Decode a quality_vec char back to its 0.._QUALITY_LEVELS integer level."""
+    return ord(c) - 33
+
 
 def _team_outcomes_vectors(team_names: list[str]) -> tuple[list[str], list[str]]:
     """Resolve each team member to its projected (final-evo) outcomes_vec.
@@ -1521,6 +1586,136 @@ def team_coverage(team_names: list[str]) -> dict:
         "pool_size":  n,
         "per_member": per_member,
     }
+
+
+def _assign_from_vectors(team_names, projected, vectors, qvectors, impacts, opp_names) -> dict:
+    """Shared partition: assign each opponent to its single strongest team member.
+
+    vectors/qvectors/opp_names must all align to the same opponent ordering.
+    """
+    per_member = [
+        {"name": team_names[i] or "", "projected_name": projected[i],
+         "wins": 0, "owned": 0, "owned_names": []}
+        for i in range(len(team_names))
+    ]
+    no_one_wins = 0
+    gaps: list[str] = []
+    n = len(opp_names)
+
+    for i in range(n):
+        best_key = None
+        best_m   = -1
+        for m_idx, v in enumerate(vectors):
+            if i >= len(v):
+                continue
+            c = v[i]
+            is_win = c in _CHECK_CHARS
+            if is_win:
+                per_member[m_idx]["wins"] += 1
+            qv = qvectors[m_idx]
+            qlvl = _quality_level(qv[i]) if i < len(qv) else 0
+            # Sort key: any winner outranks any non-winner; among winners rank by
+            # quality, then prefer a clean counter (Z), then higher overall Impact.
+            key = (1 if is_win else 0, qlvl, 1 if c == 'Z' else 0, impacts[m_idx])
+            if best_key is None or key > best_key:
+                best_key = key
+                best_m   = m_idx
+
+        opp = opp_names[i]
+        if best_m >= 0 and best_key[0] == 1:   # the strongest member actually wins
+            per_member[best_m]["owned"] += 1
+            per_member[best_m]["owned_names"].append(opp)
+        else:
+            no_one_wins += 1
+            gaps.append(opp)
+
+    return {
+        "pool_size":   n,
+        "no_one_wins": no_one_wins,
+        "gaps":        gaps,
+        "per_member":  per_member,
+    }
+
+
+def team_counter_assignment(team_names: list[str],
+                            team_moves: list[list[dict]] | None = None) -> dict:
+    """Partition the opponent pool by which team member is the *strongest* answer.
+
+    For every opponent each member is scored by win quality (quality_vec); the
+    opponent is assigned to the single member whose win is strongest. Opponents no
+    member beats (no Z/W from anyone) fall into the 'no one wins' bucket. The
+    per-member owned counts plus no_one_wins sum to pool_size — a clean partition,
+    unlike team_coverage's overlapping checks/counters tallies.
+
+    By default each member is scored with its cached *optimal* moveset. Pass
+    `team_moves` (parallel to team_names; each a list of current move dicts with
+    keys name/type/category/power/accuracy) to score members by their *currently
+    equipped* moves instead — a member with no damaging current moves falls back to
+    its optimal moveset so it isn't dropped to zero before moves have loaded.
+
+    Degrades gracefully before a cache rebuild: if quality_vec is absent the ranking
+    falls back to outcome category (Z>W) then member Impact.
+
+    Returns:
+      pool_size:    int
+      no_one_wins:  int — opponents beaten by no member
+      gaps:         list[str] — those opponent form names
+      per_member:   list[dict] parallel to team_names; each:
+                    {name, projected_name, wins, owned, owned_names}
+                    wins         = opponents this member beats on its own (Z or W)
+                    owned/_names = opponents this member is the strongest answer to
+                                   (its exclusive, best-on-team coverage)
+    """
+    if not _ready or not _target_order_list:
+        return {"pool_size": 0, "no_one_wins": 0, "gaps": [], "per_member": []}
+
+    if team_moves is None:
+        projected, vectors = _team_outcomes_vectors(team_names)
+        qvectors: list[str] = []
+        impacts:  list[float] = []
+        for final in projected:
+            with _lock:
+                entry = _db_noegg.get(final) if final else None
+            qvectors.append(entry.get("quality_vec", "") if entry else "")
+            impacts.append(entry.get("impact", 0.0) if entry else 0.0)
+        return _assign_from_vectors(team_names, projected, vectors, qvectors,
+                                    impacts, _target_order_list)
+
+    # Current-moveset path: recompute each member's outcome/quality vectors against
+    # the runtime opponent pool using its equipped moves.
+    targets = _get_runtime_targets()
+    eff_memo: dict = {}
+    projected: list[str] = []
+    vectors:   list[str] = []
+    qvectors:  list[str] = []
+    impacts:   list[float] = []
+    for i, name in enumerate(team_names):
+        nm = (name or "").lower()
+        if not nm:
+            projected.append(""); vectors.append(""); qvectors.append(""); impacts.append(0.0)
+            continue
+        final = _final_evo_for(nm)
+        with _lock:
+            attacker = _db_noegg.get(final)
+        projected.append(final)
+        if not attacker:
+            vectors.append(""); qvectors.append(""); impacts.append(0.0)
+            continue
+        impacts.append(attacker.get("impact", 0.0))
+        cur = team_moves[i] if i < len(team_moves) else None
+        if cur:
+            atk_moves = [
+                {**mv, "power": p, "accuracy": mv.get("accuracy") or 0}
+                for mv in cur if mv and (p := (mv.get("power") or 0)) > 0
+            ]
+        else:
+            atk_moves = attacker.get("moves", [])  # no current data → optimal fallback
+        res = _compute_battle_score(attacker, targets, eff_memo, moves_override=atk_moves)
+        vectors.append(res[6])
+        qvectors.append(res[7])
+
+    opp_names = [t["name"] for t in targets]
+    return _assign_from_vectors(team_names, projected, vectors, qvectors, impacts, opp_names)
 
 
 _runtime_targets: list[dict] | None = None
@@ -1677,7 +1872,8 @@ def swap_coverage_delta(
 
 
 def best_coverage_swap(
-    team_names: list[str], candidate_name: str, require_positive: bool = True
+    team_names: list[str], candidate_name: str, require_positive: bool = True,
+    locked: set[str] | None = None, max_replaced_score: float | None = None,
 ) -> dict | None:
     """Find the team slot to replace with candidate_name that maximises Δchecks.
 
@@ -1685,6 +1881,15 @@ def best_coverage_swap(
     plus 'slot' (the index to replace) and 'replaced_name', or None if no
     candidate slot can be evaluated (or, when require_positive, no positive
     Δchecks swap exists).
+
+    `locked` is a set of lowercased species names the player has marked as keepers;
+    those slots are never offered as the one to drop.
+
+    `max_replaced_score`, when given, skips any slot whose final-evo Impact score
+    exceeds it — i.e. never suggest dropping a Pokémon stronger than the candidate.
+    Folding this guard into the search (rather than only checking the single top
+    swap) keeps the suggestion stable: removing a too-strong slot from contention
+    no longer flips a different, valid swap into view.
     """
     if not _ready or not _target_order_list:
         return None
@@ -1695,6 +1900,11 @@ def best_coverage_swap(
     best_key = (0, 0) if require_positive else (-(10 ** 9), -(10 ** 9))
     for i, name in enumerate(team_names):
         if not name:
+            continue
+        if locked and name.lower() in locked:
+            continue
+        if max_replaced_score is not None and \
+                impact_score(_final_evo_for(name.lower())) > max_replaced_score:
             continue
         delta = swap_coverage_delta(team_names, i, candidate_name)
         key = (delta["delta_checks"], delta["delta_counters"])
@@ -2111,13 +2321,15 @@ def _compute_battle_score(
 ) -> tuple[float, int, int, int, int, dict, str]:
     """Σ (A_final_hp − B_final_hp + 1) / 2 across all target matchups.
 
-    Returns (total_score, zdw, dw, dl, zdl, move_usage, outcome_vec) where:
+    Returns (total_score, zdw, dw, dl, zdl, move_usage, outcome_vec, quality_vec) where:
       ZDW = won without taking any damage
       DW  = won but took some damage en route
       DL  = hit B at least once but couldn't KO before B KO'd A
       ZDL = A never dealt any damage to B before being KO'd
       move_usage = {move_name: count} — how many targets each move was best against
       outcome_vec = string of one char per target (Z=ZDW, W=DW, L=DL, l=ZDL, -=draw)
+      quality_vec = string of one char per target encoding win quality q∈[0,1]
+                    via _quality_char (q>0.5 ⟺ win) — for ranking strongest member
     attacker fields used: types, atk, sp_atk, speed, hp, defense, sp_def, moves, ability_used.
     target fields used:   types, atk, sp_atk, speed, hp, def, sp_def, moves.
     """
@@ -2152,6 +2364,7 @@ def _compute_battle_score(
     zdw = dw = dl = zdl = 0
     move_usage: dict[str, int] = {}
     outcome_chars: list[str] = []
+    quality_chars: list[str] = []
     total = 0.0
     for tgt in targets:
         analytic_mult = 1.3 if _analytic and a_speed < tgt["speed"] else 1.0
@@ -2221,7 +2434,9 @@ def _compute_battle_score(
                     pohko_b = pohko
 
         a_final, b_final = _simulate_battle(pohko_a, pohko_b, 0 if _always_last else a_speed, tgt["speed"])
-        total += (a_final - b_final + 1.0) / 2.0
+        q = (a_final - b_final + 1.0) / 2.0
+        total += q
+        quality_chars.append(_quality_char(q))
 
         if b_final < _EPS:          # A wins (B KO'd)
             if a_final >= 1.0 - _EPS:
@@ -2240,7 +2455,7 @@ def _compute_battle_score(
         else:                       # draw (0.5, 0.5) — both had no moves
             outcome_chars.append('-')
 
-    return total, zdw, dw, dl, zdl, move_usage, ''.join(outcome_chars)
+    return total, zdw, dw, dl, zdl, move_usage, ''.join(outcome_chars), ''.join(quality_chars)
 
 
 def _is_legendary(species: str, form: str, legendary_set: set[str]) -> bool:
@@ -2802,12 +3017,13 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             eff_memo,
             defender_abilities=def_abs,
         )
-        score, zdw, dw, dl, zdl, move_usage, outcome_vec = _compute_battle_score(
+        score, zdw, dw, dl, zdl, move_usage, outcome_vec, quality_vec = _compute_battle_score(
             entry, filtered_targets, eff_memo
         )
         entry["impact"]       = score
         entry["outcomes"]     = {"zdw": zdw, "dw": dw, "dl": dl, "zdl": zdl}
         entry["outcomes_vec"] = outcome_vec
+        entry["quality_vec"]  = quality_vec
         entry["move_usage"]   = move_usage
 
         score_clean, *_ = _compute_battle_score(
@@ -2894,24 +3110,25 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
             starter_costs = _fetch_starter_costs()
             _prog(on_progress, f"Starter costs: {len(starter_costs)} entries. Fetching evo chains…")
 
-            def _fetch_starter_info(species_name: str) -> tuple[str, int | None, list[str]]:
+            def _fetch_starter_info(species_name: str) -> tuple[str, int | None, list[str], str | None]:
                 try:
                     r = requests.get(f"{BASE_URL}/pokemon-species/{species_name}", timeout=10)
                     if r.status_code == 404:
-                        return species_name, None, [species_name]
+                        return species_name, None, [species_name], None
                     r.raise_for_status()
                     d = r.json()
                     sid = d["id"]
+                    growth = (d.get("growth_rate") or {}).get("name")  # free — already fetched
                     chain_url = d["evolution_chain"]["url"]
                     r2 = requests.get(chain_url, timeout=10)
                     r2.raise_for_status()
                     finals = _evo_finals(r2.json()["chain"])
-                    return species_name, sid, finals
+                    return species_name, sid, finals, growth
                 except Exception:
-                    return species_name, None, [species_name]
+                    return species_name, None, [species_name], None
 
             with ThreadPoolExecutor(max_workers=10) as pool:
-                for sname, sid, finals in pool.map(_fetch_starter_info, sorted(starter_costs.keys())):
+                for sname, sid, finals, growth in pool.map(_fetch_starter_info, sorted(starter_costs.keys())):
                     if sid is None:
                         continue
                     cost = starter_costs[sname]
@@ -2925,7 +3142,8 @@ def _build_or_load(on_progress, on_ready, include_egg: bool = False):
                                 if s > best_score:
                                     best_score = s
                                     best_final = form_name
-                    _si[sid] = {"name": sname, "cost": cost, "final_evo": best_final}
+                    _si[sid] = {"name": sname, "cost": cost, "final_evo": best_final,
+                                "growth": growth}
 
             _starters = _si
             _prog(on_progress, f"Starters index: {len(_si)} entries.")

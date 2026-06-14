@@ -7,6 +7,17 @@ from weakness_calc import ALL_TYPES
 
 TEAM_SIZE = 6
 
+
+def _fmt_opp_list(names: list, per_line: int = 6, cap: int = 90) -> str:
+    """Pretty, wrapped 'Charizard, Blastoise, …' opponent list for a tooltip."""
+    pretty = [n.replace("-", " ").title() for n in names]
+    overflow = ""
+    if cap and len(pretty) > cap:
+        overflow = f"\n…and {len(pretty) - cap} more"
+        pretty = pretty[:cap]
+    lines = [", ".join(pretty[i:i + per_line]) for i in range(0, len(pretty), per_line)]
+    return "\n".join(lines) + overflow
+
 TYPE_COLORS = {
     "normal":   ("#A8A878", "#000"),
     "fire":     ("#F08030", "#fff"),
@@ -144,17 +155,17 @@ class AnalysisPanel(QWidget):
     def update_coverage(self, checks, counters, uncovered, pool_size=None):
         """Set the team checks/counters coverage (computed and pushed by the team panel).
 
-        checks/counters are absolute opponent counts; pool_size is the total
-        opponent pool so they can be shown as a percentage of all opponents.
+        checks/counters are absolute opponent counts shown as raw counts; pool_size
+        is the total opponent pool, surfaced in the tooltip for context.
         Pass uncovered=None (with falsy checks/counters) to clear for an empty team.
         """
-        def _pct(n):
-            if not n or not pool_size:
-                return "—"
-            return f"{round(n / pool_size * 100)}%"
-
-        self._checks_lbl.setText(_pct(checks))
-        self._counters_lbl.setText(_pct(counters))
+        suffix = f" of {pool_size}" if pool_size else ""
+        self._checks_lbl.setText(str(int(checks)) if checks else "—")
+        self._checks_lbl.setToolTip(f"Team beats {int(checks)}{suffix} opponents "
+                                    "with ideal movesets" if checks else "")
+        self._counters_lbl.setText(str(int(counters)) if counters else "—")
+        self._counters_lbl.setToolTip(f"Team beats {int(counters)}{suffix} opponents "
+                                      "with currently equipped moves" if counters else "")
 
         if not checks and not counters and not uncovered:
             self._uncovered_lbl.setText("")
@@ -178,10 +189,14 @@ class AnalysisPanel(QWidget):
 
     def set_current(self, current, pool_size):
         """Update only the 'Current' counters label (async result from the team panel)."""
-        if not current or not pool_size:
+        if not current:
             self._counters_lbl.setText("—")
+            self._counters_lbl.setToolTip("")
         else:
-            self._counters_lbl.setText(f"{round(current / pool_size * 100)}%")
+            self._counters_lbl.setText(str(int(current)))
+            suffix = f" of {pool_size}" if pool_size else ""
+            self._counters_lbl.setToolTip(
+                f"Team beats {int(current)}{suffix} opponents with currently equipped moves")
 
     def on_analysis_ready(self, payload):
         (full, partial, gaps, suggestions, danger,
@@ -199,27 +214,46 @@ class AnalysisPanel(QWidget):
             self._weak_link_area.addWidget(self._placeholder("Add Pokémon to see coverage distribution"))
             return
 
-        total_covered = sum(st[2] for _, st in filled) or 1
-        ranked = sorted(filled, key=lambda x: x[1][2], reverse=True)
-        for s, (bst, bst_pct, matchup, unique) in ranked:
+        # Legend so the two counts are self-explanatory.
+        legend = QLabel("✓ wins · ⚔ exclusive (best on team)")
+        legend.setStyleSheet("color:#6c7086; font-size:11px; background:transparent;")
+        self._weak_link_area.addWidget(legend)
+
+        # Rank by exclusive coverage, then total wins.
+        total_excl = sum(st[3] for _, st in filled) or 1
+        ranked = sorted(filled, key=lambda x: (x[1][3], x[1][2]), reverse=True)
+        for s, (bst, bst_pct, wins, owned, owned_names) in ranked:
             name = (team_names[s] or f"Slot {s + 1}").capitalize()
 
+            # Colour by share of the team's total exclusive coverage:
+            # blue (carries the team) > green > yellow > red (weak link).
+            excl_pct = round(owned / total_excl * 100)
+            cov_color = ("#38bdf8" if excl_pct >= 30 else
+                         "#a6e3a1" if excl_pct >= 15 else
+                         "#f9e2af" if excl_pct >= 10 else
+                         "#f38ba8")
+
             row = QHBoxLayout()
-            row.setSpacing(4)
+            row.setSpacing(6)
 
-            mu_pct = round(matchup / total_covered * 100)
-            mu_color = ("#38bdf8" if mu_pct >= 30 else
-                        "#a6e3a1" if mu_pct >= 15 else
-                        "#f9e2af" if mu_pct >= 10 else
-                        "#f38ba8")
             name_lbl = QLabel(name)
-            name_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px; font-weight:bold;")
+            name_lbl.setStyleSheet(f"color:{cov_color}; font-size:18px; font-weight:bold;")
 
-            cov_lbl = QLabel(f"{mu_pct}%")
-            cov_lbl.setStyleSheet(f"color:{mu_color}; font-size:18px; font-weight:bold;")
+            wins_lbl = QLabel(f"✓{wins}")
+            wins_lbl.setStyleSheet("color:#a6adc8; font-size:18px;")
+            wins_lbl.setToolTip(f"Wins vs {wins} opponents in simulation (this member alone).")
+
+            cov_lbl = QLabel(f"⚔{owned}")
+            cov_lbl.setStyleSheet(f"color:{cov_color}; font-size:18px; font-weight:bold;")
+            if owned_names:
+                tip = (f"Best on the team vs {owned} opponent(s) — {excl_pct}% of the "
+                       f"team's exclusive coverage:\n" + _fmt_opp_list(owned_names))
+                name_lbl.setToolTip(tip)
+                cov_lbl.setToolTip(tip)
 
             row.addWidget(name_lbl)
             row.addStretch()
+            row.addWidget(wins_lbl)
             row.addWidget(cov_lbl)
             self._weak_link_area.addLayout(row)
 

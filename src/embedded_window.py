@@ -186,6 +186,10 @@ class EmbeddedMainWindow(QMainWindow):
         # When the team's moves change, re-render the SEND IN matchups so
         # recommendations stay in sync with the team list.
         self._team.team_changed.connect(self._enemy.refresh_matchups)
+        # Locked party members are never floated as a swap-out target in the
+        # enemy panel's catch/replace banners.
+        self._team.locked_changed.connect(self._enemy.set_locked_names)
+        self._enemy.set_locked_names(self._team.get_locked_names())
 
         # ── Title bar ─────────────────────────────────────────────────────
         title_bar = QWidget()

@@ -33,6 +33,17 @@ _MEGA_TOP_N    = 8    # strongest Megas to seed the coverage search with
 def _is_mega(name: str) -> bool:
     return "-mega" in (name or "")
 
+
+def _fmt_opp_list(names: list[str], per_line: int = 6, cap: int = 90) -> str:
+    """Pretty, wrapped 'Charizard, Blastoise, …' opponent list for a tooltip."""
+    pretty = [n.replace("-", " ").title() for n in names]
+    overflow = ""
+    if cap and len(pretty) > cap:
+        overflow = f"\n…and {len(pretty) - cap} more"
+        pretty = pretty[:cap]
+    lines = [", ".join(pretty[i:i + per_line]) for i in range(0, len(pretty), per_line)]
+    return "\n".join(lines) + overflow
+
 _COST_COLORS = {1: "#a6e3a1", 2: "#a6e3a1", 3: "#f9e2af", 4: "#f9e2af",
                 5: "#fab387", 6: "#fab387", 7: "#f38ba8", 8: "#f38ba8",
                 9: "#f38ba8", 10: "#f38ba8"}
@@ -120,14 +131,22 @@ class _Worker(QObject):
                     continue
                 # Egg-aware Impact: factor in the specific egg moves the player owns.
                 disp, raw, boosted = impact_db.egg_aware_score(form, info["name"], bitmask)
+                # Early-game growth weighting: a slow leveller is worth less on the
+                # early floors than its raw Impact implies, so fold the growth factor
+                # into both the ranking key and the displayed number.
+                growth = info.get("growth")
+                gf     = impact_db.growth_factor(growth)
                 pool.append({
                     "sid":        sid,
                     "name":       info["name"],
                     "final_evo":  form,
                     "cost":       eff_cost,
                     "discounted": reduction > 0,
-                    "impact":     raw,            # raw battle score (egg-aware) — drives ranking
-                    "score":      disp,           # display Impact number
+                    "impact":     raw * gf,       # growth-weighted battle score — drives ranking
+                    "score":      round(disp * gf),  # growth-weighted display Impact
+                    "base_score": disp,           # pre-growth Impact, for the tooltip
+                    "growth":     growth,
+                    "growth_factor": gf,
                     "egg_boosted": boosted,
                     "percentile": entry.get("percentile", 0),
                     "is_mega":    _is_mega(form),
@@ -505,9 +524,12 @@ class TeamBuilderPanel(QWidget):
                 bitmask   = self._egg_moves_owned.get(sid, 0)
                 disp, raw, boosted = impact_db.egg_aware_score(
                     info["final_evo"], info["name"], bitmask)
+                gf = impact_db.growth_factor(info.get("growth"))
                 info = {**info, "sid": sid, "cost": eff_cost,
                         "discounted": reduction > 0,
-                        "impact": raw, "score": disp, "egg_boosted": boosted}
+                        "impact": raw * gf, "score": round(disp * gf),
+                        "base_score": disp, "growth_factor": gf,
+                        "egg_boosted": boosted}
                 fixed_infos.append(info)
                 fixed_cost += eff_cost
 
@@ -584,34 +606,45 @@ class TeamBuilderPanel(QWidget):
         cost_lbl = QLabel(f"{total_cost}/{self._budget}pts")
         cost_lbl.setStyleSheet(f"color:{cost_color}; font-size:11px;")
         hdr_hl.addWidget(cost_lbl)
-        # Share of the opponent pool this team has a direct counter (Z) against.
-        # Kept defensive: a coverage hiccup should drop the badge, not the card.
+        # Partition the opponent pool by strongest answer (per member), and surface
+        # the count no member beats. Kept defensive: a hiccup drops the badge, not
+        # the card, and leaves per-member coverage empty so rows still render.
+        per_member: list = []
+        pool_size = 0
         try:
-            cov  = impact_db.team_coverage([m["final_evo"] for m in all_members])
-            pool = cov.get("pool_size", 0)
-            ctr_pct = round(cov["counters"] / pool * 100) if pool else None
+            assign     = impact_db.team_counter_assignment([m["final_evo"] for m in all_members])
+            per_member = assign.get("per_member", [])
+            pool_size  = assign.get("pool_size", 0)
+            no_win     = assign.get("no_one_wins")
+            gaps       = assign.get("gaps", [])
         except Exception as e:
-            print(f"[team_builder] counter%% badge failed: {e}")
-            ctr_pct = None
-        if ctr_pct is not None:
-            score_lbl = QLabel(f"counter {ctr_pct}%")
-            score_lbl.setStyleSheet("color:#a6e3a1; font-size:10px;")
-            hdr_hl.addWidget(score_lbl)
+            print(f"[team_builder] counter assignment failed: {e}")
+            no_win = None
+        if no_win is not None:
+            gap_lbl = QLabel(f"{no_win} unbeaten")
+            gap_lbl.setStyleSheet(
+                f"color:{'#f38ba8' if no_win > 0 else '#a6e3a1'}; font-size:10px;")
+            gap_lbl.setToolTip("No team member wins against:\n" + _fmt_opp_list(gaps)
+                               if gaps else "Every opponent is beaten by someone.")
+            hdr_hl.addWidget(gap_lbl)
         hdr_hl.addStretch()
         vl.addLayout(hdr_hl)
 
         for i, info in enumerate(all_members):
             is_fixed  = info in fixed
             is_anchor = quality and not fixed and not is_fixed and i == 0
+            cov = None
+            if i < len(per_member):
+                cov = {**per_member[i], "pool": pool_size}
             vl.addLayout(self._make_member_row(info, is_fixed=is_fixed, is_anchor=is_anchor,
-                                               font_size=12))
+                                               font_size=12, coverage=cov))
 
         return card
 
     # ── Shared helpers ────────────────────────────────────────────────────────
 
     def _make_member_row(self, info: dict, is_fixed: bool, font_size: int,
-                         is_anchor: bool = False) -> QHBoxLayout:
+                         is_anchor: bool = False, coverage: dict | None = None) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(4)
 
@@ -635,6 +668,36 @@ class TeamBuilderPanel(QWidget):
 
         row.addStretch()
 
+        # Two coverage numbers for this member:
+        #   wins  — opponents it beats on its own (simulation Z or W)
+        #   best  — opponents it's the team's strongest answer to (exclusive coverage)
+        # The exclusive list is the hover tooltip, mirrored onto the name.
+        cov = coverage or {}
+        owned = cov.get("owned")
+        if owned is not None:
+            wins        = cov.get("wins", 0)
+            pool        = cov.get("pool", 0)
+            owned_names = cov.get("owned_names") or []
+
+            wins_lbl = QLabel(f"✓{wins}")
+            wins_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
+            wins_lbl.setToolTip(
+                f"Wins vs {wins}" + (f" of {pool}" if pool else "")
+                + " opponents in simulation (this member alone)")
+            row.addWidget(wins_lbl)
+
+            best_lbl = QLabel(f"⚔{owned}")
+            best_lbl.setStyleSheet("color:#89b4fa; font-size:10px; font-weight:bold;")
+            if owned_names:
+                plural = "s" if owned != 1 else ""
+                best_tip = (f"Best on the team vs {owned} opponent{plural} "
+                            f"(exclusive coverage):\n" + _fmt_opp_list(owned_names))
+            else:
+                best_tip = "Not the strongest answer to any opponent in the pool."
+            best_lbl.setToolTip(best_tip)
+            name_lbl.setToolTip(best_tip)
+            row.addWidget(best_lbl)
+
         entry = impact_db.get(final)
         if entry:
             pct   = entry.get("percentile", 0)
@@ -642,11 +705,22 @@ class TeamBuilderPanel(QWidget):
             score   = info["score"] if "score" in info else impact_db.impact_score(final)
             boosted = info.get("egg_boosted", False)
             egg_tag = " 🥚" if boosted else ""
-            score_lbl = QLabel(f"Impact {score}{egg_tag}")
+            # Growth-rate badge: marks Impact numbers re-weighted for the early game
+            # (faster levellers up, slow ones down). Emoji only for the clear movers;
+            # the tooltip reports leveling speed for every known rate.
+            badge      = impact_db.growth_badge(info.get("growth"))
+            growth_tag = f" {badge[0]}" if badge and badge[0] else ""
+            score_lbl = QLabel(f"Impact {score}{egg_tag}{growth_tag}")
             score_lbl.setStyleSheet(f"color:{_pct_color(pct)}; font-size:10px;")
             tip = _impact_tooltip(entry)
             if boosted:
                 tip += "\n(includes your owned egg moves)"
+            if badge:
+                gf   = info.get("growth_factor", 1.0)
+                base = info.get("base_score")
+                tip += f"\n{badge[1]} (×{gf:.2f} early-game)"
+                if base is not None and base != score:
+                    tip += f" — adjusted from Impact {base}"
             score_lbl.setToolTip(tip)
             row.addWidget(score_lbl)
 

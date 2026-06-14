@@ -25,12 +25,13 @@ import requests
 
 from app_dirs import data_path
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_FILE = data_path("biome_cache.json")
 
 _REPO = "https://raw.githubusercontent.com/pagefaultgames/pokerogue/main"
 _BIOME_ID_URL  = f"{_REPO}/src/enums/biome-id.ts"
 _SPECIES_ID_URL = f"{_REPO}/src/enums/species-id.ts"
+_EVOLUTIONS_URL = f"{_REPO}/src/data/balance/pokemon-evolutions.ts"
 _BIOMES_DIR_URL = f"{_REPO}/src/data/balance/biomes"
 _BIOMES_API = (
     "https://api.github.com/repos/pagefaultgames/pokerogue/contents/"
@@ -54,6 +55,7 @@ _FALLBACK_FILES = [
 
 _db: dict[int, dict] = {}
 _norm_name_to_id: dict[str, int] = {}
+_prevo: dict[int, int] = {}   # evolved species id -> its immediate pre-evolution id
 _ready = False
 _lock = threading.Lock()
 
@@ -100,6 +102,29 @@ def _parse_species_ids(text: str) -> dict[str, int]:
             counter += 1
             ids[m.group(1)] = counter
     return ids
+
+
+def _parse_prevolutions(text: str, species_ids: dict[str, int]) -> dict[int, int]:
+    """Parse pokemon-evolutions.ts into {evolved_id: pre_evolution_id}.
+
+    Format: `[SpeciesId.PARENT]: [ new SpeciesEvolution(SpeciesId.CHILD, ...), ... ]`.
+    Wild biome pools list base species, but higher waves spawn evolved forms — this
+    lets a lookup walk an encountered evolution back to a species in the pool.
+    """
+    prevo: dict[int, int] = {}
+    parent: int | None = None
+    for line in text.splitlines():
+        hm = re.search(r"\[SpeciesId\.(\w+)\]\s*:", line)
+        if hm:
+            parent = species_ids.get(hm.group(1))
+            continue
+        if parent is None:
+            continue
+        for cm in re.finditer(r"new SpeciesEvolution\(\s*SpeciesId\.(\w+)", line):
+            child = species_ids.get(cm.group(1))
+            if child is not None:
+                prevo[child] = parent
+    return prevo
 
 
 # ── Biome file parser ─────────────────────────────────────────────────────────
@@ -188,6 +213,13 @@ def _build() -> dict:
     species_text.raise_for_status()
     species_ids = _parse_species_ids(species_text.text)
 
+    try:
+        evo_text = requests.get(_EVOLUTIONS_URL, timeout=30)
+        evo_text.raise_for_status()
+        prevo = _parse_prevolutions(evo_text.text, species_ids)
+    except Exception:
+        prevo = {}
+
     out: dict = {}
     for fname in _fetch_biome_files():
         try:
@@ -202,13 +234,14 @@ def _build() -> dict:
 
     out["_version"] = CACHE_VERSION
     out["_species"] = species_ids
+    out["_prevo"] = {str(k): v for k, v in prevo.items()}
     return out
 
 
 # ── Load / accessors ──────────────────────────────────────────────────────────
 
 def _install(cached: dict) -> None:
-    global _db, _norm_name_to_id
+    global _db, _norm_name_to_id, _prevo
     species = cached.get("_species") or {}
     db: dict[int, dict] = {}
     for k, v in cached.items():
@@ -220,9 +253,11 @@ def _install(cached: dict) -> None:
             "boss": set(v.get("boss") or []),
         }
     norm = {_norm(name): sid for name, sid in species.items()}
+    prevo = {int(k): int(v) for k, v in (cached.get("_prevo") or {}).items()}
     with _lock:
         _db = db
         _norm_name_to_id = norm
+        _prevo = prevo
 
 
 def _build_or_load(on_progress=None, on_ready=None) -> None:
@@ -297,7 +332,9 @@ def rarity_for(biome_id, species_id, species_name: str | None = None
     """(wild_tier, is_boss_pool) for a species in a biome.
 
     wild_tier is one of _WILD_TIERS, or None if not a wild encounter there.
-    Matches on species_id, falling back to a normalized-name lookup.
+    Matches on species_id (falling back to a normalized-name lookup), then walks
+    the pre-evolution chain — biome pools list base species but higher waves spawn
+    evolved forms (e.g. Onix is in the pool but you encounter Steelix).
     """
     if biome_id is None:
         return (None, False)
@@ -315,4 +352,22 @@ def rarity_for(biome_id, species_id, species_name: str | None = None
             sid = _norm_name_to_id.get(_norm(species_name))
         if sid is None:
             return (None, False)
-        return (entry["wild"].get(sid), sid in entry["boss"])
+
+        # Walk the encountered species and its pre-evolutions; return the first
+        # match found in the biome's wild / boss pools.
+        wild_tier = None
+        is_boss = False
+        seen = set()
+        cur = sid
+        for _ in range(6):  # cap to avoid any pathological cycle
+            if cur is None or cur in seen:
+                break
+            seen.add(cur)
+            if wild_tier is None:
+                wild_tier = entry["wild"].get(cur)
+            if cur in entry["boss"]:
+                is_boss = True
+            if wild_tier is not None:
+                break
+            cur = _prevo.get(cur)
+        return (wild_tier, is_boss)
